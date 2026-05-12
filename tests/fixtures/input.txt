@@ -1,0 +1,3 @@
+hello world this is a tiny training fixture for the runtime smoke test.
+it is deliberately longer than the default block size so the data loader can
+construct at least one shifted next-token batch during the binary smoke test.

@@ -1,0 +1,23 @@
+[package]
+name = "rusty-gpt"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+cuda = ["burn/cuda"]
+
+[dependencies]
+burn = { version = "0.21", features = ["train", "ndarray", "wgpu"] }
+burn-ndarray = "0.21"
+rand = "0.10.1"
+anyhow = "1"
+
+axum = "0.8.9"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6.10", features = ["cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
