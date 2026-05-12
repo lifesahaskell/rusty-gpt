@@ -4,20 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Single-binary Rust crate that trains and runs a character-level GPT from scratch on top of the [Burn](https://burn.dev) deep-learning framework. The Shakespeare-style corpus at `data/input.txt` is the default training input. Edition 2024.
+Single-binary Rust crate that trains and runs a character-level GPT from scratch on top of the [Burn](https://burn.dev) 0.21 deep-learning framework. The Shakespeare-style corpus at `data/input.txt` is the default training input. Edition 2024.
+
+Published at https://github.com/lifesahaskell/rusty-gpt. See `README.md` for the user-facing quick start; this file is the architectural memo for Claude Code.
 
 ## Common commands
 
-Run all commands from the crate root (`/home/rakdos/repos/rusty-gpt`).
+Run all commands from the crate root.
 
 ```bash
-# Build / lint / format
+# Build / lint / format (CPU build; cuda is opt-in via --features cuda)
 cargo build
 cargo build --release
-cargo clippy --all-targets
-cargo fmt
+cargo clippy --all-targets          # has known pre-existing warnings, see Gotchas
+cargo fmt --all -- --check
+cargo check --features cuda         # verify the cuda gate still compiles
 
-# Run the unit test suite + integration test
+# Run the unit test suite + integration test (70 unit tests + 1 integration test)
 cargo test
 
 # Run a single unit test by path (filter is a substring match)
@@ -64,15 +67,18 @@ The model-shape hyperparameters (`BLOCK_SIZE`, `BATCH_SIZE`, `EMBED_DIM`, `NUM_H
 
 ```
 src/
-  main.rs              entry point, CLI/env parsing, demo + training + interactive dispatch
-  tokenizer/char.rs    deterministic char-level tokenizer (sorted-unique chars ⇒ id)
-  loader/data.rs       random-window batch sampler producing (x, y) where y is x shifted by 1
-  model/mod.rs         all four model variants + shared loss/logging helpers
-  model/persistence.rs save/load wrappers around burn's NamedMpkFileRecorder (.mpk files)
-  server/mod.rs        Axum HTTP router (POST /generate, GET /info) — defined but NOT wired up from main yet
+  main.rs                       entry point, CLI/env parsing, demo + training + interactive dispatch
+  tokenizer/{mod,char}.rs       deterministic char-level tokenizer (sorted-unique chars ⇒ id)
+  loader/{mod,data}.rs          random-window batch sampler producing (x, y) where y is x shifted by 1
+  model/mod.rs                  all four model variants + shared loss/logging helpers
+  model/persistence.rs          save/load wrappers around burn's NamedMpkFileRecorder (.mpk files)
+  server/mod.rs                 Axum HTTP router (POST /generate, GET /info) — defined but NOT wired up from main yet
 tests/
-  default_runtime.rs   binary-level smoke test asserting CPU default does not load libcuda
-  fixtures/input.txt   small corpus used by the integration test
+  default_runtime.rs            binary-level smoke test asserting CPU default does not load libcuda
+  fixtures/input.txt            small corpus used by the integration test
+.github/workflows/ci.yml        GitHub Actions: cargo fmt --check, cargo clippy, cargo test on push/PR
+data/input.txt                  ~1 MB Shakespeare-style training corpus (committed)
+.gitignore                      excludes /target/ and /checkpoints/
 ```
 
 ### The model progression in `src/model/mod.rs`
@@ -93,7 +99,7 @@ Every model is generic over `B: Backend`; training impls additionally require `B
 - `BackendChoice::Cpu` ⇒ `NdArray<f32, i64>` for inference demo, `Autodiff<NdArray<f32, i64>>` for training and interactive generation.
 - `BackendChoice::Cuda` ⇒ `Cuda` backend, training only (interactive generation rejects CUDA). Only present when built with `--features cuda`.
 
-The `cuda` Cargo feature (`rusty-gpt`'s `cuda` ⇒ `burn/cuda`) is **off by default**. All cuda-touching code in `main.rs` — the `Cuda`/`CudaDevice` imports, the `BackendChoice::Cuda` enum variant, the cuda branch in `main`, the `"cuda"` arm in `parse_backend_name`, and the cuda-specific unit test — is gated on `#[cfg(feature = "cuda")]`. Add new cuda references behind the same gate or CI (which builds CPU-only) will fail.
+The `cuda` Cargo feature (`rusty-gpt`'s `cuda` ⇒ `burn/cuda`) is **off by default**. All cuda-touching code in `main.rs` — the `Cuda`/`CudaDevice` imports, the `BackendChoice::Cuda` enum variant, the cuda branch in `main`, the `"cuda"` arm in `parse_backend_name`, and the `backend_can_be_selected_from_args` test — is gated on `#[cfg(feature = "cuda")]`. A complementary `backend_cuda_arg_requires_feature` test under `#[cfg(not(feature = "cuda"))]` locks in the "rebuild with `--features cuda`" error message. Add new cuda references behind the same gate or CI (which builds CPU-only) will fail.
 
 The integration test `default_runtime.rs` additionally asserts that a default-config run does **not** load `libcuda` — keep the CPU codepath free of CUDA backend instantiation even when the feature is enabled.
 
@@ -123,9 +129,9 @@ Train/value split: `split_training_and_value_tokens` reserves the **last 10%** f
 
 ## Gotchas
 
-- **Checkpoints**: Burn's `NamedMpkFileRecorder` appends `.mpk` automatically. Pass the path **without** the extension (e.g. `checkpoints/mini_gpt`); the actual file is `checkpoints/mini_gpt.mpk`. `--checkpoint` and `RUSTY_GPT_MINIGPT_CHECKPOINT` follow the same convention.
+- **Checkpoints**: Burn's `NamedMpkFileRecorder` appends `.mpk` automatically. Pass the path **without** the extension (e.g. `checkpoints/mini_gpt`); the actual file is `checkpoints/mini_gpt.mpk`. `--checkpoint` and `RUSTY_GPT_MINIGPT_CHECKPOINT` follow the same convention. The `checkpoints/` directory is gitignored.
 - **Interactive mode constraints**: `--interactive-generate` requires both `--backend cpu` and `--model minigpt`; any other combination errors out in `run_cpu_demo` / `main`.
 - **CPU default must stay CUDA-free**: `tests/default_runtime.rs` greps stderr/stdout for `libcuda` and fails if it appears. Keep `BackendChoice::Cpu` away from CUDA types.
 - **`compare` is a pseudo-variant**: it is expanded to the four real models via `ModelChoice::comparison_models()` before forward/training dispatch. The forward and training match statements on `ModelChoice::Compare` are `unreachable!()` and must stay that way.
 - **Env-mutating tests use `unsafe`**: Rust 2024 makes `env::set_var` / `env::remove_var` unsafe. Existing tests in `main.rs` wrap them in `unsafe { ... }` blocks with a SAFETY comment — follow the same pattern when adding more.
-- **No README, no CI config**: there is currently no README.md, no `.github/`, and no top-level docs other than this file. Document new conventions here.
+- **Clippy has known pre-existing warnings**: `cargo clippy --all-targets` currently reports ~7 style lints in `src/model/mod.rs` (too-many-args, manual-is-multiple-of, complex-type, etc.). The CI workflow runs clippy without `-D warnings` for that reason. If you tighten CI, fix those lints first.
