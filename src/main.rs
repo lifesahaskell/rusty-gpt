@@ -27,6 +27,7 @@ use std::sync::Arc;
 const DEFAULT_INPUT_PATH: &str = "data/input.txt";
 const DEFAULT_MINIGPT_CHECKPOINT_PATH: &str = "checkpoints/mini_gpt";
 const DEFAULT_BPE_TOKENIZER_PATH: &str = "checkpoints/tokenizer.json";
+const BPE_TOKENIZER_ENV: &str = "RUSTY_GPT_BPE_TOKENIZER";
 const DEFAULT_CHECKPOINT_DIR: &str = "checkpoints";
 const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:8787";
 
@@ -444,9 +445,11 @@ fn tokenizer_for_model(text: &str, model_choice: ModelChoice) -> Result<RuntimeT
 }
 
 fn load_minigpt_tokenizer() -> Result<RuntimeTokenizer> {
-    RuntimeTokenizer::load_bpe(Path::new(DEFAULT_BPE_TOKENIZER_PATH)).with_context(|| {
+    let tokenizer_path =
+        env::var(BPE_TOKENIZER_ENV).unwrap_or_else(|_| DEFAULT_BPE_TOKENIZER_PATH.to_string());
+    RuntimeTokenizer::load_bpe(Path::new(&tokenizer_path)).with_context(|| {
         format!(
-            "failed to load default MiniGPT BPE tokenizer from {DEFAULT_BPE_TOKENIZER_PATH}; train one with `cargo run --bin train-tokenizer -- --corpus data/fafolang.txt --vocab-size 2048 --output {DEFAULT_BPE_TOKENIZER_PATH}`"
+            "failed to load MiniGPT BPE tokenizer from {tokenizer_path}; train one with `cargo run --bin train-tokenizer -- --corpus data/fafolang.txt --vocab-size 2048 --output {DEFAULT_BPE_TOKENIZER_PATH}`"
         )
     })
 }
@@ -1132,6 +1135,12 @@ mod tests {
         };
         let text = "abcdefghijklmnopqrstuvwxyz ".repeat(8);
 
+        // SAFETY: This test mutates process environment before running any
+        // threaded code and restores it before returning.
+        unsafe {
+            env::set_var(BPE_TOKENIZER_ENV, "tests/fixtures/tokenizer.json");
+        }
+
         run_training_demo::<TestBackend>(
             &text,
             hyperparameters,
@@ -1145,6 +1154,11 @@ mod tests {
             },
         )
         .unwrap();
+
+        // SAFETY: See note above.
+        unsafe {
+            env::remove_var(BPE_TOKENIZER_ENV);
+        }
 
         assert!(
             saved_path.is_file(),
