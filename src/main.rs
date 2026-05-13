@@ -1,18 +1,3 @@
-mod loader;
-pub mod model;
-pub mod server;
-mod tokenizer;
-pub mod utils;
-
-use crate::loader::data::DataLoader;
-use crate::model::persistence::{load_model, save_model};
-use crate::model::{
-    MiniGpt, MiniGptConfig, MultiAttentionModel, SingleAttentionModel, TrainingLogContext,
-    TrainingLogFormat, TrainingParams, TrivialModel,
-};
-use crate::server::ServerState;
-use crate::tokenizer::char::CharTokenizer;
-use crate::utils::benchmark_generation;
 use anyhow::{Context, Result, bail};
 use axum::Router;
 use burn::backend::Autodiff;
@@ -22,6 +7,16 @@ use burn::backend::Cuda;
 use burn::backend::cuda::CudaDevice;
 use burn::backend::ndarray::{NdArray, NdArrayDevice};
 use burn::tensor::backend::Backend;
+use rusty_gpt::loader::data::DataLoader;
+use rusty_gpt::model::persistence::{load_model, save_model};
+use rusty_gpt::model::{
+    MiniGpt, MiniGptConfig, MultiAttentionModel, SingleAttentionModel, TrainingLogContext,
+    TrainingLogFormat, TrainingParams, TrivialModel,
+};
+use rusty_gpt::server;
+use rusty_gpt::server::ServerState;
+use rusty_gpt::tokenizer::char::CharTokenizer;
+use rusty_gpt::utils::benchmark_generation;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
