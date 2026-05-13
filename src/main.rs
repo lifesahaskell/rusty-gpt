@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 const DEFAULT_INPUT_PATH: &str = "data/input.txt";
 const DEFAULT_MINIGPT_CHECKPOINT_PATH: &str = "checkpoints/mini_gpt";
+const DEFAULT_CHECKPOINT_DIR: &str = "checkpoints";
 const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:8787";
 
 const BLOCK_SIZE: usize = 128; // context length, start with 64 or 128
@@ -192,6 +193,7 @@ fn main() -> Result<()> {
                 config.server_addr,
                 &config.checkpoint_path,
                 config.load_checkpoint,
+                config.load_latest_checkpoint,
                 &NdArrayDevice::Cpu,
             ),
             #[cfg(feature = "cuda")]
@@ -201,6 +203,7 @@ fn main() -> Result<()> {
                 config.server_addr,
                 &config.checkpoint_path,
                 config.load_checkpoint,
+                config.load_latest_checkpoint,
                 &CudaDevice::default(),
             ),
         };
@@ -283,6 +286,7 @@ fn run_http_server_with_runtime<B>(
     server_addr: SocketAddr,
     checkpoint_path: &Path,
     load_checkpoint_enabled: bool,
+    load_latest_checkpoint_enabled: bool,
     device: &B::Device,
 ) -> Result<()>
 where
@@ -300,6 +304,7 @@ where
         server_addr,
         checkpoint_path,
         load_checkpoint_enabled,
+        load_latest_checkpoint_enabled,
         device,
     ))
 }
@@ -310,6 +315,7 @@ async fn run_http_server<B>(
     server_addr: SocketAddr,
     checkpoint_path: &Path,
     load_checkpoint_enabled: bool,
+    load_latest_checkpoint_enabled: bool,
     device: &B::Device,
 ) -> Result<()>
 where
@@ -318,7 +324,10 @@ where
 {
     let tokenizer = CharTokenizer::from_text(text);
     let template = new_minigpt::<B>(tokenizer.vocab_size(), hyperparameters, device);
-    let model = if load_checkpoint_enabled {
+    let model = if load_latest_checkpoint_enabled {
+        let latest_checkpoint = latest_checkpoint_path(Path::new(DEFAULT_CHECKPOINT_DIR))?;
+        load_minigpt_checkpoint(template, &latest_checkpoint, device)?
+    } else if load_checkpoint_enabled {
         load_minigpt_checkpoint(template, checkpoint_path, device)?
     } else {
         template
@@ -428,6 +437,41 @@ fn load_minigpt_checkpoint<B: Backend>(
     );
 
     Ok(model)
+}
+
+fn latest_checkpoint_path(checkpoint_dir: &Path) -> Result<PathBuf> {
+    let mut latest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in fs::read_dir(checkpoint_dir)
+        .with_context(|| format!("failed to read checkpoint directory {:?}", checkpoint_dir))?
+    {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to read checkpoint directory entry in {:?}",
+                checkpoint_dir
+            )
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("mpk") {
+            continue;
+        }
+
+        let modified = entry
+            .metadata()
+            .with_context(|| format!("failed to read checkpoint metadata for {:?}", path))?
+            .modified()
+            .with_context(|| format!("failed to read checkpoint modified time for {:?}", path))?;
+        if latest
+            .as_ref()
+            .map(|(latest_modified, _)| modified > *latest_modified)
+            .unwrap_or(true)
+        {
+            latest = Some((modified, path.with_extension("")));
+        }
+    }
+
+    latest
+        .map(|(_, path)| path)
+        .with_context(|| format!("no .mpk checkpoints found in {:?}", checkpoint_dir))
 }
 
 fn interactive_generation_loop<B: Backend>(
@@ -762,6 +806,7 @@ struct RuntimeConfig {
     interactive: bool,
     benchmark_generation: bool,
     load_checkpoint: bool,
+    load_latest_checkpoint: bool,
     serve: bool,
     server_addr: SocketAddr,
 }
@@ -808,6 +853,7 @@ where
     let mut interactive = false;
     let mut benchmark_generation = false;
     let mut load_checkpoint = false;
+    let mut load_latest_checkpoint = false;
     let mut serve = false;
     let mut index = 0;
 
@@ -860,12 +906,20 @@ where
                 load_checkpoint = true;
                 index += 1;
             }
+            "--load-latest-checkpoint" => {
+                load_latest_checkpoint = true;
+                index += 1;
+            }
             "--serve" => {
                 serve = true;
                 index += 1;
             }
             other => bail!("unsupported argument: {other}"),
         }
+    }
+
+    if load_checkpoint && load_latest_checkpoint {
+        bail!("--load-checkpoint and --load-latest-checkpoint are mutually exclusive");
     }
 
     let server_addr_text = arg_server_addr
@@ -887,6 +941,7 @@ where
         interactive,
         benchmark_generation,
         load_checkpoint,
+        load_latest_checkpoint,
         serve,
         server_addr,
     })
@@ -934,6 +989,7 @@ mod tests {
         assert!(!config.serve);
         assert!(!config.benchmark_generation);
         assert!(!config.load_checkpoint);
+        assert!(!config.load_latest_checkpoint);
         assert_eq!(
             DEFAULT_SERVER_ADDR.parse::<SocketAddr>().unwrap(),
             config.server_addr
@@ -1325,6 +1381,56 @@ mod tests {
             parse_runtime_config(["--load-checkpoint".to_string()], None, None, None).unwrap();
 
         assert!(config.load_checkpoint);
+    }
+
+    #[test]
+    fn latest_checkpoint_loading_can_be_selected_from_args() {
+        let config =
+            parse_runtime_config(["--load-latest-checkpoint".to_string()], None, None, None)
+                .unwrap();
+
+        assert!(config.load_latest_checkpoint);
+    }
+
+    #[test]
+    fn checkpoint_loading_modes_are_mutually_exclusive() {
+        let err = parse_runtime_config(
+            [
+                "--load-checkpoint".to_string(),
+                "--load-latest-checkpoint".to_string(),
+            ],
+            None,
+            None,
+            None,
+        )
+        .expect_err("checkpoint loading modes should conflict");
+
+        assert!(
+            err.to_string()
+                .contains("--load-checkpoint and --load-latest-checkpoint are mutually exclusive")
+        );
+    }
+
+    #[test]
+    fn latest_checkpoint_path_uses_newest_mpk_file_without_extension() {
+        let dir = std::env::temp_dir().join(format!(
+            "rusty-gpt-latest-checkpoint-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("old.mpk");
+        let new = dir.join("new.mpk");
+        fs::write(&old, b"old").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&new, b"new").unwrap();
+
+        let latest = latest_checkpoint_path(&dir).unwrap();
+
+        assert_eq!(dir.join("new"), latest);
+
+        let _ = fs::remove_file(old);
+        let _ = fs::remove_file(new);
+        let _ = fs::remove_dir(dir);
     }
 
     #[test]

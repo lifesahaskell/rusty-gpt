@@ -90,7 +90,7 @@ where
         .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
     let generated_tokens = state
         .model
-        .generate(&prompt_tokens, request.max_tokens, &state.device)
+        .generate_with_cache(&prompt_tokens, request.max_tokens, &state.device)
         .map_err(bad_request)?;
     let attention_tokens = context_window(&generated_tokens, state.model.block_size());
     let attention = attention_for_tokens(&state, attention_tokens)?;

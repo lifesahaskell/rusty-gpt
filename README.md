@@ -26,7 +26,10 @@ cargo run -- --model minigpt --interactive-generate --checkpoint checkpoints/min
 # Serve the GPT HTTP API on http://127.0.0.1:8787/api
 cargo run -- --serve --input data/input.txt
 
-# Serve the API with pretrained MiniGPT weights from checkpoints/mini_gpt.mpk
+# Serve the API with the newest trained MiniGPT checkpoint from checkpoints/*.mpk
+cargo run -- --serve --input data/input.txt --load-latest-checkpoint
+
+# Serve the API with a specific pretrained MiniGPT checkpoint
 cargo run -- --serve --input data/input.txt --checkpoint checkpoints/mini_gpt --load-checkpoint
 
 # Serve the GPT HTTP API on CUDA
@@ -78,6 +81,7 @@ CLI flags and `RUSTY_GPT_*` environment variables can both drive runtime behavio
 | `--interactive-generate` | — | off | Requires `--backend cpu` and `--model minigpt`. |
 | `--serve` | — | off | Starts the HTTP API under `/api`; supports `cpu` and compiled-in `cuda` backends. |
 | `--load-checkpoint` | — | off | With `--serve`, loads MiniGPT API weights from `--checkpoint`. The checkpoint must match the model shape and tokenizer vocabulary from `--input`. |
+| `--load-latest-checkpoint` | — | off | With `--serve`, loads the newest `.mpk` file in `checkpoints/` as the MiniGPT API weights. |
 | `--server-addr <host:port>` | `RUSTY_GPT_SERVER_ADDR` | `127.0.0.1:8787` | Address used by `--serve`. |
 | — | `RUSTY_GPT_TRAIN_STEPS` | `1000` | |
 | — | `RUSTY_GPT_EVAL_INTERVAL` | `100` | `0` ⇒ log only the final step. |

@@ -832,15 +832,7 @@ impl<B: Backend> MiniGpt<B> {
         max_new_tokens: usize,
         device: &B::Device,
     ) -> Result<Vec<usize>, String> {
-        if prompt.is_empty() {
-            return Err("prompt must contain at least one token".to_string());
-        }
-        if let Some(token) = prompt.iter().find(|&&token| token >= self.vocab_size) {
-            return Err(format!(
-                "prompt token {token} is outside the model vocab size {}",
-                self.vocab_size
-            ));
-        }
+        self.validate_generation_prompt(prompt)?;
 
         let mut output = prompt.to_vec();
         for _ in 0..max_new_tokens {
@@ -886,6 +878,47 @@ impl<B: Backend> MiniGpt<B> {
         }
 
         generated
+    }
+
+    pub fn generate_with_cache(
+        &self,
+        prompt: &[usize],
+        max_new_tokens: usize,
+        device: &B::Device,
+    ) -> Result<Vec<usize>, String> {
+        self.validate_generation_prompt(prompt)?;
+
+        let mut output = prompt.to_vec();
+        let mut remaining = max_new_tokens;
+        while remaining > 0 {
+            let context_start = output.len().saturating_sub(self.max_position_embeddings);
+            let context = &output[context_start..];
+            let available_positions = self.max_position_embeddings.saturating_sub(context.len());
+            let chunk_len = remaining.min(available_positions.max(1));
+            let prompt_data: Vec<i64> = context.iter().map(|&token| token as i64).collect();
+            let prompt_tensor =
+                Tensor::from_data(TensorData::new(prompt_data, [1, context.len()]), device);
+            let generated = self.generate_cached(prompt_tensor, chunk_len);
+
+            remaining -= generated.len();
+            output.extend(generated);
+        }
+
+        Ok(output)
+    }
+
+    fn validate_generation_prompt(&self, prompt: &[usize]) -> Result<(), String> {
+        if prompt.is_empty() {
+            return Err("prompt must contain at least one token".to_string());
+        }
+        if let Some(token) = prompt.iter().find(|&&token| token >= self.vocab_size) {
+            return Err(format!(
+                "prompt token {token} is outside the model vocab size {}",
+                self.vocab_size
+            ));
+        }
+
+        Ok(())
     }
 
     fn greedy_last_token(logits: Tensor<B, 3>) -> usize {
@@ -1401,6 +1434,34 @@ mod tests {
         let uncached = model.generate(&prompt, 3, &device).unwrap();
 
         assert_eq!(uncached[prompt.len()..], generated);
+    }
+
+    #[test]
+    fn minigpt_generate_with_cache_preserves_prompt_and_appends_tokens() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let model = MiniGpt::<TestBackend>::new(7, 8, 1, 6, 2, &device);
+
+        let generated = model.generate_with_cache(&[0, 1, 2], 3, &device).unwrap();
+
+        assert_eq!(6, generated.len());
+        assert_eq!(&[0, 1, 2], &generated[..3]);
+        assert!(generated.iter().all(|&token| token < 7));
+    }
+
+    #[test]
+    fn minigpt_generate_with_cache_handles_full_context_windows() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let model = MiniGpt::<TestBackend>::new(7, 8, 1, 4, 2, &device);
+
+        let generated = model
+            .generate_with_cache(&[0, 1, 2, 3], 2, &device)
+            .unwrap();
+
+        assert_eq!(6, generated.len());
+        assert_eq!(&[0, 1, 2, 3], &generated[..4]);
+        assert!(generated.iter().all(|&token| token < 7));
     }
 
     #[test]
