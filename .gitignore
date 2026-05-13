@@ -1,2 +1,8 @@
 /target/
 /checkpoints/
+.codex
+.vscode/
+.idea/
+.log/
+.agents/
+.claude/
