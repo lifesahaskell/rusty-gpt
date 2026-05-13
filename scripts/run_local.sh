@@ -32,7 +32,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 cd "$ROOT_DIR"
-cargo run "${CARGO_FEATURE_ARGS[@]}" -- --serve --input "$RUSTY_GPT_INPUT" --server-addr "$API_ADDR" "${API_BACKEND_ARGS[@]}" &
+cargo run "${CARGO_FEATURE_ARGS[@]}" --bin rusty-gpt -- --serve --input "$RUSTY_GPT_INPUT" --server-addr "$API_ADDR" "${API_BACKEND_ARGS[@]}" &
 API_PID="$!"
 
 cd "$ROOT_DIR/mini-gpt-ui"

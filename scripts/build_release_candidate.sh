@@ -23,7 +23,7 @@ else
 fi
 
 cd "$ROOT_DIR"
-cargo build --release "${CARGO_FEATURE_ARGS[@]}"
+cargo build --release "${CARGO_FEATURE_ARGS[@]}" --bin "$APP_NAME"
 
 cd "$ROOT_DIR/mini-gpt-ui"
 npm run build

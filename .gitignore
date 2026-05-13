@@ -6,3 +6,4 @@
 .log/
 .agents/
 .claude/
+data-secret/

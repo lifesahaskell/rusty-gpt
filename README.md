@@ -1,18 +1,18 @@
 # rusty-gpt
 
-A character-level GPT built from scratch in Rust on top of the [Burn](https://burn.dev) deep-learning framework. The crate trains four progressively richer models — from a plain embedding-plus-linear baseline up to a multi-block transformer — on a Shakespeare-style corpus, and can serve MiniGPT interactively at the terminal or over HTTP for the React UI.
+A GPT playground built from scratch in Rust on top of the [Burn](https://burn.dev) deep-learning framework. The crate trains four progressively richer models — from a plain embedding-plus-linear baseline up to a multi-block transformer — and can serve MiniGPT interactively at the terminal or over HTTP for the React UI. MiniGPT uses the saved BPE tokenizer at `checkpoints/tokenizer.json` by default; the smaller baseline models still use the character tokenizer.
 
 ## Quick start
 
 ```bash
 # Default: CPU, trivial model, data/input.txt
-cargo run
+cargo run --bin rusty-gpt
 
 # Train the full MiniGPT (CPU)
-cargo run --release -- --model minigpt
+cargo run --release --bin rusty-gpt -- --model minigpt
 
 # Train on CUDA (requires the CUDA toolkit installed; opt in via the `cuda` Cargo feature)
-cargo run --release --features cuda -- --backend cuda --model minigpt
+cargo run --release --features cuda --bin rusty-gpt -- --backend cuda --model minigpt
 
 # Train from a file on CUDA via the helper script
 ./scripts/run_training.sh --backend cuda --checkpoint checkpoints/mini_gpt data/input.txt
@@ -20,26 +20,29 @@ cargo run --release --features cuda -- --backend cuda --model minigpt
 # Train a BPE tokenizer from a corpus
 cargo run --bin train-tokenizer -- --corpus data/repo-source.txt --vocab-size 2048 --output checkpoints/tokenizer.json
 
+# Train the full MiniGPT against checkpoints/tokenizer.json
+cargo run --release --bin rusty-gpt -- --model minigpt --input data/repo-source.txt
+
 # Collect source files from another repository into data/<name>.txt
 cargo run --bin collect-source -- --repo /path/to/repo --output repo-source.txt
 
 # Compare all four model variants on the same batch
-cargo run -- --model compare
+cargo run --bin rusty-gpt -- --model compare
 
 # Chat with a saved MiniGPT checkpoint
-cargo run -- --model minigpt --interactive-generate --checkpoint checkpoints/mini_gpt
+cargo run --bin rusty-gpt -- --model minigpt --interactive-generate --checkpoint checkpoints/mini_gpt
 
 # Serve the GPT HTTP API on http://127.0.0.1:8787/api
-cargo run -- --serve --input data/input.txt
+cargo run --bin rusty-gpt -- --serve --input data/input.txt
 
 # Serve the API with the newest trained MiniGPT checkpoint from checkpoints/*.mpk
-cargo run -- --serve --input data/input.txt --load-latest-checkpoint
+cargo run --bin rusty-gpt -- --serve --input data/input.txt --load-latest-checkpoint
 
 # Serve the API with a specific pretrained MiniGPT checkpoint
-cargo run -- --serve --input data/input.txt --checkpoint checkpoints/mini_gpt --load-checkpoint
+cargo run --bin rusty-gpt -- --serve --input data/input.txt --checkpoint checkpoints/mini_gpt --load-checkpoint
 
 # Serve the GPT HTTP API on CUDA
-cargo run --features cuda -- --serve --backend cuda --input data/input.txt
+cargo run --features cuda --bin rusty-gpt -- --serve --backend cuda --input data/input.txt
 
 # Start the local React UI dev server
 ./scripts/run_local.sh
@@ -95,6 +98,8 @@ CLI flags and `RUSTY_GPT_*` environment variables can both drive runtime behavio
 | — | `RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM` | `1.0` | Must be > 0. |
 
 Model-shape hyperparameters (`BLOCK_SIZE`, `BATCH_SIZE`, `EMBED_DIM`, `NUM_HEADS`, `NUM_LAYERS`, `DROPOUT`, `LEARNING_RATE`) are compile-time constants at the top of `src/main.rs`.
+
+MiniGPT and `compare` runs load the BPE tokenizer from `checkpoints/tokenizer.json`. Train or replace that file before training/loading MiniGPT checkpoints if the corpus vocabulary changes, because checkpoint tensor shapes must match the tokenizer vocabulary size.
 
 ## Tools
 

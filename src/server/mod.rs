@@ -8,18 +8,18 @@ use burn::tensor::{Int, Tensor, TensorData};
 use serde::{Deserialize, Serialize};
 
 use crate::model::MiniGpt;
-use crate::tokenizer::char::CharTokenizer;
+use crate::tokenizer::RuntimeTokenizer;
 
 pub type SharedServerState<B> = Arc<ServerState<B>>;
 
 pub struct ServerState<B: Backend> {
     model: MiniGpt<B>,
-    tokenizer: CharTokenizer,
+    tokenizer: RuntimeTokenizer,
     device: B::Device,
 }
 
 impl<B: Backend> ServerState<B> {
-    pub fn new(model: MiniGpt<B>, tokenizer: CharTokenizer, device: B::Device) -> Self {
+    pub fn new(model: MiniGpt<B>, tokenizer: RuntimeTokenizer, device: B::Device) -> Self {
         Self {
             model,
             tokenizer,
@@ -191,7 +191,7 @@ mod tests {
         type TestBackend = NdArray<f32, i64>;
         let device = NdArrayDevice::Cpu;
         let model = MiniGpt::<TestBackend>::new(7, 8, 2, 6, 2, &device);
-        let tokenizer = CharTokenizer::from_text("abcdefg");
+        let tokenizer = RuntimeTokenizer::char_from_text("abcdefg");
         let state = ServerState::new(model, tokenizer, device);
 
         assert_eq!(7, state.model.vocab_size());
@@ -205,7 +205,7 @@ mod tests {
         type TestBackend = NdArray<f32, i64>;
         let device = NdArrayDevice::Cpu;
         let model = MiniGpt::<TestBackend>::new(7, 8, 2, 6, 2, &device);
-        let tokenizer = CharTokenizer::from_text("abcdefg");
+        let tokenizer = RuntimeTokenizer::char_from_text("abcdefg");
         let state = ServerState::new(model, tokenizer, device);
 
         let attention = attention_for_tokens(&state, &[0, 1, 2]).unwrap();

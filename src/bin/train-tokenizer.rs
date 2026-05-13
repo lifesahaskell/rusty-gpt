@@ -5,6 +5,14 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use rusty_gpt::tokenizer::Tokenizer;
 use rusty_gpt::tokenizer::bpe::BpeTrainer;
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct TokenizerSavedEvent {
+    event: &'static str,
+    vocab_size: usize,
+    output: String,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct Config {
@@ -17,7 +25,9 @@ fn main() -> Result<()> {
     let config = parse_args(env::args().skip(1))?;
     let corpus = fs::read_to_string(&config.corpus)
         .with_context(|| format!("failed to read corpus from {:?}", config.corpus))?;
-    let tokenizer = BpeTrainer::new(config.vocab_size).train(&corpus);
+    let tokenizer = BpeTrainer::new(config.vocab_size).train_with_observer(&corpus, |event| {
+        log_json(&event);
+    });
 
     if let Some(parent) = config.output.parent()
         && !parent.as_os_str().is_empty()
@@ -29,13 +39,20 @@ fn main() -> Result<()> {
     tokenizer
         .save(&config.output)
         .with_context(|| format!("failed to save tokenizer to {:?}", config.output))?;
-    println!(
-        "Saved BPE tokenizer with vocab_size={} to {:?}",
-        tokenizer.vocab_size(),
-        config.output
-    );
+    log_json(&TokenizerSavedEvent {
+        event: "tokenizer_saved",
+        vocab_size: tokenizer.vocab_size(),
+        output: config.output.display().to_string(),
+    });
 
     Ok(())
+}
+
+fn log_json(event: &impl Serialize) {
+    match serde_json::to_string(event) {
+        Ok(line) => println!("{line}"),
+        Err(err) => eprintln!(r#"{{"event":"structured_log_error","error":"{err}"}}"#),
+    }
 }
 
 fn parse_args<I, S>(args: I) -> Result<Config>

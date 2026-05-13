@@ -15,7 +15,7 @@ use rusty_gpt::model::{
 };
 use rusty_gpt::server;
 use rusty_gpt::server::ServerState;
-use rusty_gpt::tokenizer::char::CharTokenizer;
+use rusty_gpt::tokenizer::RuntimeTokenizer;
 use rusty_gpt::utils::benchmark_generation;
 use std::env;
 use std::fs;
@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 const DEFAULT_INPUT_PATH: &str = "data/input.txt";
 const DEFAULT_MINIGPT_CHECKPOINT_PATH: &str = "checkpoints/mini_gpt";
+const DEFAULT_BPE_TOKENIZER_PATH: &str = "checkpoints/tokenizer.json";
 const DEFAULT_CHECKPOINT_DIR: &str = "checkpoints";
 const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:8787";
 
@@ -305,7 +306,7 @@ where
 }
 
 async fn run_http_server<B>(
-    text: &str,
+    _text: &str,
     hyperparameters: Hyperparameters,
     server_addr: SocketAddr,
     checkpoint_path: &Path,
@@ -317,7 +318,7 @@ where
     B: Backend + Send + Sync + 'static,
     B::Device: Send + Sync + 'static,
 {
-    let tokenizer = CharTokenizer::from_text(text);
+    let tokenizer = load_minigpt_tokenizer()?;
     let template = new_minigpt::<B>(tokenizer.vocab_size(), hyperparameters, device);
     let model = if load_latest_checkpoint_enabled {
         let latest_checkpoint = latest_checkpoint_path(Path::new(DEFAULT_CHECKPOINT_DIR))?;
@@ -347,7 +348,7 @@ fn run_demo<B: Backend>(
     model_choice: ModelChoice,
     device: &B::Device,
 ) -> Result<()> {
-    let tokenizer = CharTokenizer::from_text(text);
+    let tokenizer = tokenizer_for_model(text, model_choice)?;
     let encoded = tokenizer.encode(text);
     println!("Vocab size: {}", tokenizer.vocab_size());
     println!("Input chars: {}", text.chars().count());
@@ -403,12 +404,12 @@ fn run_demo<B: Backend>(
 }
 
 fn run_interactive_minigpt_generation<B: burn::tensor::backend::AutodiffBackend>(
-    text: &str,
+    _text: &str,
     hyperparameters: Hyperparameters,
     device: &B::Device,
     checkpoint_path: &Path,
 ) -> Result<()> {
-    let tokenizer = CharTokenizer::from_text(text);
+    let tokenizer = load_minigpt_tokenizer()?;
     let template = new_minigpt::<B>(tokenizer.vocab_size(), hyperparameters, device);
     let model = load_minigpt_checkpoint(template, checkpoint_path, device)?;
 
@@ -432,6 +433,22 @@ fn load_minigpt_checkpoint<B: Backend>(
     );
 
     Ok(model)
+}
+
+fn tokenizer_for_model(text: &str, model_choice: ModelChoice) -> Result<RuntimeTokenizer> {
+    if model_choice.includes_minigpt() {
+        load_minigpt_tokenizer()
+    } else {
+        Ok(RuntimeTokenizer::char_from_text(text))
+    }
+}
+
+fn load_minigpt_tokenizer() -> Result<RuntimeTokenizer> {
+    RuntimeTokenizer::load_bpe(Path::new(DEFAULT_BPE_TOKENIZER_PATH)).with_context(|| {
+        format!(
+            "failed to load default MiniGPT BPE tokenizer from {DEFAULT_BPE_TOKENIZER_PATH}; train one with `cargo run --bin train-tokenizer -- --corpus data/fafolang.txt --vocab-size 2048 --output {DEFAULT_BPE_TOKENIZER_PATH}`"
+        )
+    })
 }
 
 fn latest_checkpoint_path(checkpoint_dir: &Path) -> Result<PathBuf> {
@@ -471,7 +488,7 @@ fn latest_checkpoint_path(checkpoint_dir: &Path) -> Result<PathBuf> {
 
 fn interactive_generation_loop<B: Backend>(
     model: &MiniGpt<B>,
-    tokenizer: &CharTokenizer,
+    tokenizer: &RuntimeTokenizer,
     generate_tokens: usize,
     device: &B::Device,
 ) -> Result<()> {
@@ -610,7 +627,7 @@ fn run_training_demo<B: burn::tensor::backend::AutodiffBackend>(
         bail!("generation benchmarks require --model minigpt or compare");
     }
 
-    let tokenizer = CharTokenizer::from_text(text);
+    let tokenizer = tokenizer_for_model(text, model_choice)?;
     let encoded = tokenizer.encode(text);
     let (training_tokens, value_tokens, value_block_size) =
         split_training_and_value_tokens(&encoded, hyperparameters.block_size)?;

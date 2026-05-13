@@ -11,12 +11,54 @@ pub struct BpeTrainer {
     vocab_size: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum BpeTrainingEvent {
+    #[serde(rename = "bpe_training_started")]
+    Started {
+        target_vocab_size: usize,
+        initial_vocab_size: usize,
+        word_count: usize,
+    },
+    #[serde(rename = "bpe_training_merge")]
+    Merge {
+        merge_index: usize,
+        vocab_size: usize,
+        pair: (u32, u32),
+        new_token_id: u32,
+        count: usize,
+    },
+    #[serde(rename = "bpe_training_completed")]
+    Completed {
+        target_vocab_size: usize,
+        final_vocab_size: usize,
+        merge_count: usize,
+        reason: BpeTrainingStopReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BpeTrainingStopReason {
+    TargetVocabSizeReached,
+    NoPairs,
+    NoRepeatedPairs,
+}
+
 impl BpeTrainer {
     pub fn new(vocab_size: usize) -> Self {
         Self { vocab_size }
     }
 
     pub fn train(&self, corpus: &str) -> BpeTokenizer {
+        self.train_with_observer(corpus, |_| {})
+    }
+
+    pub fn train_with_observer(
+        &self,
+        corpus: &str,
+        mut observer: impl FnMut(BpeTrainingEvent),
+    ) -> BpeTokenizer {
         // 1. Initialize: each word becomes Vec<u32> of byte IDs.
         let mut words: Vec<Vec<u32>> = corpus
             .split_whitespace()
@@ -25,6 +67,13 @@ impl BpeTrainer {
 
         let mut vocab: Vec<Vec<u8>> = (0..256u32).map(|i| vec![i as u8]).collect();
         let mut merges = Vec::new();
+        let mut stop_reason = BpeTrainingStopReason::TargetVocabSizeReached;
+
+        observer(BpeTrainingEvent::Started {
+            target_vocab_size: self.vocab_size,
+            initial_vocab_size: vocab.len(),
+            word_count: words.len(),
+        });
 
         while vocab.len() < self.vocab_size {
             // 2. Count all adjacent pairs across all words.
@@ -37,9 +86,11 @@ impl BpeTrainer {
 
             // 3. Find the most frequent pair. Stop if no pair appears > 1 times.
             let Some((&best_pair, &count)) = pair_counts.iter().max_by_key(|(_, c)| *c) else {
+                stop_reason = BpeTrainingStopReason::NoPairs;
                 break;
             };
             if count < 2 {
+                stop_reason = BpeTrainingStopReason::NoRepeatedPairs;
                 break;
             }
 
@@ -54,6 +105,14 @@ impl BpeTrainer {
             for word in &mut words {
                 Self::merge_in_place(word, best_pair, new_id);
             }
+
+            observer(BpeTrainingEvent::Merge {
+                merge_index: merges.len() - 1,
+                vocab_size: vocab.len(),
+                pair: best_pair,
+                new_token_id: new_id,
+                count,
+            });
         }
 
         let merge_ranks = merges
@@ -61,6 +120,13 @@ impl BpeTrainer {
             .enumerate()
             .map(|(i, &(pair, _))| (pair, i as u32))
             .collect();
+
+        observer(BpeTrainingEvent::Completed {
+            target_vocab_size: self.vocab_size,
+            final_vocab_size: vocab.len(),
+            merge_count: merges.len(),
+            reason: stop_reason,
+        });
 
         BpeTokenizer {
             merges,
@@ -91,6 +157,7 @@ struct BpeTokenizerData {
     vocab: Vec<Vec<u8>>,
 }
 
+#[derive(Clone)]
 pub struct BpeTokenizer {
     // Ordered list of merges: (token_a, token_b) -> new_token_id
     merges: Vec<((u32, u32), u32)>,
@@ -204,6 +271,42 @@ mod tests {
 
         assert_eq!(256, tokenizer.vocab_size());
         assert!(tokenizer.merges.is_empty());
+    }
+
+    #[test]
+    fn train_with_observer_emits_structured_events() {
+        let mut events = Vec::new();
+        let tokenizer = BpeTrainer::new(258)
+            .train_with_observer("banana banana banana", |event| events.push(event));
+
+        assert_eq!(258, tokenizer.vocab_size());
+        assert_eq!(
+            Some(&BpeTrainingEvent::Started {
+                target_vocab_size: 258,
+                initial_vocab_size: 256,
+                word_count: 3,
+            }),
+            events.first()
+        );
+        assert!(matches!(
+            events.get(1),
+            Some(BpeTrainingEvent::Merge {
+                merge_index: 0,
+                vocab_size: 257,
+                new_token_id: 256,
+                count,
+                ..
+            }) if *count >= 2
+        ));
+        assert_eq!(
+            Some(&BpeTrainingEvent::Completed {
+                target_vocab_size: 258,
+                final_vocab_size: 258,
+                merge_count: 2,
+                reason: BpeTrainingStopReason::TargetVocabSizeReached,
+            }),
+            events.last()
+        );
     }
 
     #[test]

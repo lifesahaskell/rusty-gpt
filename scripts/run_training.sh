@@ -109,7 +109,7 @@ fi
 cd "$ROOT_DIR"
 mkdir -p "$(dirname "$RUSTY_GPT_MINIGPT_CHECKPOINT")"
 
-cargo run "${CARGO_FEATURE_ARGS[@]}" -- \
+cargo run "${CARGO_FEATURE_ARGS[@]}" --bin rusty-gpt -- \
   --input "$TRAINING_FILE" \
   --model "$RUSTY_GPT_MODEL" \
   --checkpoint "$RUSTY_GPT_MINIGPT_CHECKPOINT" \
