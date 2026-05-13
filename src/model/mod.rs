@@ -97,6 +97,27 @@ fn log_training_progress<B: Backend>(
     );
 }
 
+pub struct LayerCache<B: Backend> {
+    pub keys: Tensor<B, 4>,   // [B, NUM_HEADS, T_cached, HEAD_DIM]
+    pub values: Tensor<B, 4>, // [B, NUM_HEADS, T_cached, HEAD_DIM]
+}
+
+pub struct KvCache<B: Backend> {
+    pub layers: Vec<Option<LayerCache<B>>>,
+}
+
+impl<B: Backend> KvCache<B> {
+    pub fn new(layers: Vec<Option<LayerCache<B>>>) -> Self {
+        Self { layers }
+    }
+
+    pub fn empty(num_layers: usize) -> Self {
+        Self {
+            layers: (0..num_layers).map(|_| None).collect(),
+        }
+    }
+}
+
 #[derive(Module, Debug)]
 pub struct TrivialModel<B: Backend> {
     pub embedding: Embedding<B>,
@@ -374,12 +395,88 @@ impl<B: Backend> MultiHeadAttention<B> {
         )
     }
 
+    pub fn forward_with_cache(
+        &self,
+        x: Tensor<B, 3>,
+        cache: Option<LayerCache<B>>,
+    ) -> (Tensor<B, 3>, LayerCache<B>) {
+        let embed_dim = self.num_heads * self.head_dim;
+        let (q, k, v) = self.project_qkv(x);
+        let [batch_size, _, new_seq_len, _] = q.shape().dims();
+
+        let (full_k, full_v) = match cache {
+            Some(cache) => (
+                Tensor::cat(vec![cache.keys, k], 2),
+                Tensor::cat(vec![cache.values, v], 2),
+            ),
+            None => (k, v),
+        };
+
+        let [_batch_size, _num_heads, total_seq_len, _head_dim] = full_k.shape().dims();
+        let scores = q.matmul(full_k.clone().swap_dims(2, 3)) / (self.head_dim as f32).sqrt();
+        let scores = if new_seq_len > 1 || new_seq_len == total_seq_len {
+            let mask = Self::causal_cache_mask(
+                batch_size,
+                self.num_heads,
+                new_seq_len,
+                total_seq_len,
+                &scores.device(),
+            );
+            scores.mask_fill(mask, f32::NEG_INFINITY)
+        } else {
+            scores
+        };
+        let attn_weights = softmax(scores, 3);
+        let context = attn_weights
+            .matmul(full_v.clone())
+            .swap_dims(1, 2)
+            .reshape([batch_size, new_seq_len, embed_dim]);
+
+        (
+            self.output.forward(context),
+            LayerCache {
+                keys: full_k,
+                values: full_v,
+            },
+        )
+    }
+
     fn forward_inner(
         &self,
         x: Tensor<B, 3>,
         return_weights: bool,
     ) -> (Tensor<B, 3>, Option<Tensor<B, 4>>) {
         let embed_dim = self.num_heads * self.head_dim;
+        let (q, k, v) = self.project_qkv(x);
+        let [batch_size, _, seq_len, _] = q.shape().dims();
+
+        let scores = q.matmul(k.swap_dims(2, 3)) / (self.head_dim as f32).sqrt();
+        let mask = Self::causal_mask(batch_size, self.num_heads, seq_len, &scores.device());
+        let scores = scores.mask_fill(mask, f32::NEG_INFINITY);
+        let attn_weights = softmax(scores, 3);
+        let (context, attn_weights) = if return_weights {
+            (
+                attn_weights
+                    .clone()
+                    .matmul(v)
+                    .swap_dims(1, 2)
+                    .reshape([batch_size, seq_len, embed_dim]),
+                Some(attn_weights),
+            )
+        } else {
+            (
+                attn_weights
+                    .matmul(v)
+                    .swap_dims(1, 2)
+                    .reshape([batch_size, seq_len, embed_dim]),
+                None,
+            )
+        };
+
+        (self.output.forward(context), attn_weights)
+    }
+
+    fn project_qkv(&self, x: Tensor<B, 3>) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>) {
         let qkv = self.qkv.forward(x);
         let [batch_size, seq_len, _] = qkv.shape().dims();
         let qkv = qkv.reshape([batch_size, seq_len, 3, self.num_heads, self.head_dim]);
@@ -416,30 +513,7 @@ impl<B: Backend> MultiHeadAttention<B> {
             .reshape([batch_size, seq_len, self.num_heads, self.head_dim])
             .swap_dims(1, 2);
 
-        let scores = q.matmul(k.swap_dims(2, 3)) / (self.head_dim as f32).sqrt();
-        let mask = Self::causal_mask(batch_size, self.num_heads, seq_len, &scores.device());
-        let scores = scores.mask_fill(mask, f32::NEG_INFINITY);
-        let attn_weights = softmax(scores, 3);
-        let (context, attn_weights) = if return_weights {
-            (
-                attn_weights
-                    .clone()
-                    .matmul(v)
-                    .swap_dims(1, 2)
-                    .reshape([batch_size, seq_len, embed_dim]),
-                Some(attn_weights),
-            )
-        } else {
-            (
-                attn_weights
-                    .matmul(v)
-                    .swap_dims(1, 2)
-                    .reshape([batch_size, seq_len, embed_dim]),
-                None,
-            )
-        };
-
-        (self.output.forward(context), attn_weights)
+        (q, k, v)
     }
 
     fn causal_mask(
@@ -452,6 +526,33 @@ impl<B: Backend> MultiHeadAttention<B> {
             .reshape([1, 1, seq_len, seq_len])
             .repeat_dim(0, batch_size)
             .repeat_dim(1, num_heads)
+    }
+
+    fn causal_cache_mask(
+        batch_size: usize,
+        num_heads: usize,
+        new_seq_len: usize,
+        total_seq_len: usize,
+        device: &B::Device,
+    ) -> Tensor<B, 4, Bool> {
+        let cached_seq_len = total_seq_len - new_seq_len;
+        let mut mask = Vec::with_capacity(batch_size * num_heads * new_seq_len * total_seq_len);
+
+        for _batch in 0..batch_size {
+            for _head in 0..num_heads {
+                for query_pos in 0..new_seq_len {
+                    let max_visible_key = cached_seq_len + query_pos;
+                    for key_pos in 0..total_seq_len {
+                        mask.push(key_pos > max_visible_key);
+                    }
+                }
+            }
+        }
+
+        Tensor::<B, 4, Bool>::from_data(
+            TensorData::new(mask, [batch_size, num_heads, new_seq_len, total_seq_len]),
+            device,
+        )
     }
 }
 
@@ -510,6 +611,19 @@ impl<B: Backend> Block<B> {
 
     pub fn forward_with_attention(&self, x: Tensor<B, 3>) -> (Tensor<B, 3>, Tensor<B, 4>) {
         self.forward_with_weights(x)
+    }
+
+    pub fn forward_with_cache(
+        &self,
+        x: Tensor<B, 3>,
+        cache: Option<LayerCache<B>>,
+    ) -> (Tensor<B, 3>, LayerCache<B>) {
+        let (attn_output, cache) = self
+            .attn
+            .forward_with_cache(self.ln1.forward(x.clone()), cache);
+        let x = x + attn_output;
+        let x = x.clone() + self.mlp.forward(self.ln2.forward(x));
+        (x, cache)
     }
 
     pub fn num_heads(&self) -> usize {
@@ -602,6 +716,46 @@ impl<B: Backend> MiniGpt<B> {
         self.lm_head.forward(x)
     }
 
+    pub fn forward_with_cache(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        mut cache: KvCache<B>,
+    ) -> (Tensor<B, 3>, KvCache<B>) {
+        assert_eq!(
+            self.blocks.len(),
+            cache.layers.len(),
+            "KV cache must have one entry per transformer block"
+        );
+
+        let [_batch_size, seq_len] = tokens.dims();
+        let cache_len = cache
+            .layers
+            .first()
+            .and_then(|layer| layer.as_ref())
+            .map(|c| c.keys.dims()[2])
+            .unwrap_or(0);
+
+        let positions = Tensor::arange(
+            cache_len as i64..(cache_len + seq_len) as i64,
+            &tokens.device(),
+        )
+        .unsqueeze();
+        let tok = self.token_embed.forward(tokens);
+        let pos = self.position_embed.forward(positions);
+        let mut x = tok + pos;
+
+        for (i, block) in self.blocks.iter().enumerate() {
+            let layer_cache = cache.layers[i].take();
+            let (new_x, new_layer_cache) = block.forward_with_cache(x, layer_cache);
+            x = new_x;
+            cache.layers[i] = Some(new_layer_cache);
+        }
+
+        let x = self.ln_final.forward(x);
+        let logits = self.lm_head.forward(x);
+        (logits, cache)
+    }
+
     pub fn forward_with_attention(&self, mut x: Tensor<B, 3>) -> (Tensor<B, 3>, Vec<Tensor<B, 4>>) {
         let mut attentions = Vec::with_capacity(self.blocks.len());
         for block in &self.blocks {
@@ -651,6 +805,41 @@ impl<B: Backend> MiniGpt<B> {
         }
 
         Ok(output)
+    }
+
+    pub fn generate_cached(&self, prompt: Tensor<B, 2, Int>, max_new: usize) -> Vec<usize> {
+        if max_new == 0 {
+            return Vec::new();
+        }
+
+        let device = prompt.device();
+        let mut cache = KvCache::empty(self.num_layers());
+        let (logits, new_cache) = self.forward_with_cache(prompt, cache);
+        cache = new_cache;
+        let mut next_token = Self::greedy_last_token(logits);
+        let mut generated = vec![next_token];
+
+        for _ in 1..max_new {
+            let next_input = Tensor::from_data([[next_token as i64]], &device);
+            let (logits, new_cache) = self.forward_with_cache(next_input, cache);
+            cache = new_cache;
+            next_token = Self::greedy_last_token(logits);
+            generated.push(next_token);
+        }
+
+        generated
+    }
+
+    fn greedy_last_token(logits: Tensor<B, 3>) -> usize {
+        let [_batch_size, seq_len, vocab_size] = logits.shape().dims();
+        let logits = logits.into_data().to_vec::<f32>().unwrap();
+        let last_position_start = (seq_len - 1) * vocab_size;
+        logits[last_position_start..last_position_start + vocab_size]
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(token, _)| token)
+            .expect("vocab size should be greater than zero")
     }
 }
 
@@ -1027,6 +1216,71 @@ mod tests {
     }
 
     #[test]
+    fn minigpt_forward_with_cache_matches_forward_tokens_without_cache() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let model = MiniGpt::<TestBackend>::new(7, 8, 2, 6, 2, &device);
+        let input = Tensor::<TestBackend, 2, Int>::from_data([[0, 1, 2]], &device);
+
+        let expected = model
+            .forward_tokens(input.clone())
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let (actual, cache) = model.forward_with_cache(input, KvCache::empty(model.num_layers()));
+
+        assert_eq!([1, 3, 7], actual.shape().dims());
+        assert_eq!(2, cache.layers.len());
+        for layer_cache in cache.layers {
+            let layer_cache = layer_cache.expect("layer cache should be populated");
+            assert_eq!([1, 2, 3, 4], layer_cache.keys.shape().dims());
+            assert_eq!([1, 2, 3, 4], layer_cache.values.shape().dims());
+        }
+        assert_eq!(expected, actual.into_data().to_vec::<f32>().unwrap());
+    }
+
+    #[test]
+    fn minigpt_forward_with_cache_extends_cache_for_incremental_token() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let model = MiniGpt::<TestBackend>::new(7, 8, 2, 6, 2, &device);
+        let prompt = Tensor::<TestBackend, 2, Int>::from_data([[0, 1, 2]], &device);
+        let next_token = Tensor::<TestBackend, 2, Int>::from_data([[3]], &device);
+
+        let (_prompt_logits, cache) =
+            model.forward_with_cache(prompt, KvCache::empty(model.num_layers()));
+        let (next_logits, next_cache) = model.forward_with_cache(next_token, cache);
+
+        assert_eq!([1, 1, 7], next_logits.shape().dims());
+        assert_eq!(2, next_cache.layers.len());
+        for layer_cache in next_cache.layers {
+            let layer_cache = layer_cache.expect("layer cache should be populated");
+            assert_eq!([1, 2, 4, 4], layer_cache.keys.shape().dims());
+            assert_eq!([1, 2, 4, 4], layer_cache.values.shape().dims());
+        }
+    }
+
+    #[test]
+    fn minigpt_forward_with_cache_incremental_logits_match_full_forward_last_token() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let model = MiniGpt::<TestBackend>::new(7, 8, 2, 6, 2, &device);
+        let prompt = Tensor::<TestBackend, 2, Int>::from_data([[0, 1, 2]], &device);
+        let next_token = Tensor::<TestBackend, 2, Int>::from_data([[3]], &device);
+        let full = Tensor::<TestBackend, 2, Int>::from_data([[0, 1, 2, 3]], &device);
+
+        let (_prompt_logits, cache) =
+            model.forward_with_cache(prompt, KvCache::empty(model.num_layers()));
+        let (next_logits, _next_cache) = model.forward_with_cache(next_token, cache);
+        let full_last_logits = model.forward_tokens(full).slice([0..1, 3..4, 0..7]);
+
+        assert_eq!(
+            full_last_logits.into_data().to_vec::<f32>().unwrap(),
+            next_logits.into_data().to_vec::<f32>().unwrap()
+        );
+    }
+
+    #[test]
     fn minigpt_supports_zero_transformer_blocks() {
         type TestBackend = NdArray<f32, i64>;
         let device = NdArrayDevice::Cpu;
@@ -1078,6 +1332,45 @@ mod tests {
     }
 
     #[test]
+    fn minigpt_generate_cached_returns_requested_number_of_tokens() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let model = MiniGpt::<TestBackend>::new(7, 8, 1, 6, 2, &device);
+        let prompt = Tensor::<TestBackend, 2, Int>::from_data([[0, 1, 2]], &device);
+
+        let generated = model.generate_cached(prompt, 3);
+
+        assert_eq!(3, generated.len());
+        assert!(generated.iter().all(|&token| token < 7));
+    }
+
+    #[test]
+    fn minigpt_generate_cached_zero_tokens_returns_empty_output() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let model = MiniGpt::<TestBackend>::new(7, 8, 1, 4, 2, &device);
+        let prompt = Tensor::<TestBackend, 2, Int>::from_data([[0, 1, 2]], &device);
+
+        let generated = model.generate_cached(prompt, 0);
+
+        assert!(generated.is_empty());
+    }
+
+    #[test]
+    fn minigpt_generate_cached_matches_uncached_greedy_generation() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let model = MiniGpt::<TestBackend>::new(7, 8, 1, 6, 2, &device);
+        let prompt = [0, 1, 2];
+        let prompt_tensor = Tensor::<TestBackend, 2, Int>::from_data([[0, 1, 2]], &device);
+
+        let generated = model.generate_cached(prompt_tensor, 3);
+        let uncached = model.generate(&prompt, 3, &device).unwrap();
+
+        assert_eq!(uncached[prompt.len()..], generated);
+    }
+
+    #[test]
     fn multi_head_attention_causal_mask_blocks_future_positions_for_each_head() {
         type TestBackend = NdArray<f32, i64>;
         let device = NdArrayDevice::Cpu;
@@ -1089,6 +1382,58 @@ mod tests {
             vec![
                 false, true, true, false, false, true, false, false, false, false, true, true,
                 false, false, true, false, false, false,
+            ],
+            mask.into_data().to_vec::<bool>().unwrap()
+        );
+    }
+
+    #[test]
+    fn multi_head_attention_forward_with_cache_matches_full_forward_without_cache() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let attention = MultiHeadAttention::<TestBackend>::new(8, 2, &device);
+        let input = Tensor::<TestBackend, 3>::zeros([2, 3, 8], &device);
+
+        let expected = attention
+            .forward(input.clone())
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let (actual, cache) = attention.forward_with_cache(input, None);
+
+        assert_eq!([2, 3, 8], actual.shape().dims());
+        assert_eq!([2, 2, 3, 4], cache.keys.shape().dims());
+        assert_eq!([2, 2, 3, 4], cache.values.shape().dims());
+        assert_eq!(expected, actual.into_data().to_vec::<f32>().unwrap());
+    }
+
+    #[test]
+    fn multi_head_attention_forward_with_cache_appends_new_keys_and_values() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let attention = MultiHeadAttention::<TestBackend>::new(8, 2, &device);
+        let prompt = Tensor::<TestBackend, 3>::zeros([2, 3, 8], &device);
+        let next_token = Tensor::<TestBackend, 3>::ones([2, 1, 8], &device);
+
+        let (_prompt_output, cache) = attention.forward_with_cache(prompt, None);
+        let (next_output, next_cache) = attention.forward_with_cache(next_token, Some(cache));
+
+        assert_eq!([2, 1, 8], next_output.shape().dims());
+        assert_eq!([2, 2, 4, 4], next_cache.keys.shape().dims());
+        assert_eq!([2, 2, 4, 4], next_cache.values.shape().dims());
+    }
+
+    #[test]
+    fn multi_head_attention_causal_cache_mask_allows_cached_tokens_and_blocks_future_new_tokens() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+
+        let mask = MultiHeadAttention::<TestBackend>::causal_cache_mask(1, 1, 2, 5, &device);
+
+        assert_eq!([1, 1, 2, 5], mask.shape().dims());
+        assert_eq!(
+            vec![
+                false, false, false, false, true, false, false, false, false, false
             ],
             mask.into_data().to_vec::<bool>().unwrap()
         );

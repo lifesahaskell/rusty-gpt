@@ -14,6 +14,9 @@ cargo run --release -- --model minigpt
 # Train on CUDA (requires the CUDA toolkit installed; opt in via the `cuda` Cargo feature)
 cargo run --release --features cuda -- --backend cuda --model minigpt
 
+# Train from a file on CUDA via the helper script
+./scripts/run_training.sh --backend cuda --checkpoint checkpoints/mini_gpt data/input.txt
+
 # Compare all four model variants on the same batch
 cargo run -- --model compare
 

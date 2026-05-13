@@ -2,9 +2,10 @@ mod loader;
 pub mod model;
 pub mod server;
 mod tokenizer;
+pub mod utils;
 
 use crate::loader::data::DataLoader;
-use crate::model::persistence::load_model;
+use crate::model::persistence::{load_model, save_model};
 use crate::model::{
     MiniGpt, MultiAttentionModel, SingleAttentionModel, TrainingLogContext, TrainingLogFormat,
     TrivialModel,
@@ -201,6 +202,7 @@ fn main() -> Result<()> {
                 hyperparameters,
                 config.model,
                 &device,
+                &config.checkpoint_path,
                 "cuda",
                 TrainingLogFormat::Json,
             )
@@ -233,6 +235,7 @@ fn run_cpu_demo(
             hyperparameters,
             model_choice,
             &device,
+            checkpoint_path,
             "cpu",
             TrainingLogFormat::Plain,
         )
@@ -510,6 +513,7 @@ fn run_training_demo<B: burn::tensor::backend::AutodiffBackend>(
     hyperparameters: Hyperparameters,
     model_choice: ModelChoice,
     device: &B::Device,
+    checkpoint_path: &Path,
     backend_label: &'static str,
     log_format: TrainingLogFormat,
 ) -> Result<()> {
@@ -537,6 +541,7 @@ fn run_training_demo<B: burn::tensor::backend::AutodiffBackend>(
             device,
             tokenizer.vocab_size(),
             hyperparameters,
+            checkpoint_path,
             backend_label,
             log_format,
         )?;
@@ -552,6 +557,7 @@ fn train_model<B: burn::tensor::backend::AutodiffBackend>(
     device: &B::Device,
     vocab_size: usize,
     hyperparameters: Hyperparameters,
+    checkpoint_path: &Path,
     backend_label: &'static str,
     log_format: TrainingLogFormat,
 ) -> Result<()> {
@@ -610,7 +616,7 @@ fn train_model<B: burn::tensor::backend::AutodiffBackend>(
             .context("failed to train multi attention model")?;
         }
         ModelChoice::MiniGpt => {
-            let _model = MiniGpt::<B>::train(
+            let model = MiniGpt::<B>::train(
                 data_loader,
                 value_loader,
                 device,
@@ -627,9 +633,31 @@ fn train_model<B: burn::tensor::backend::AutodiffBackend>(
             )
             .map_err(anyhow::Error::msg)
             .context("failed to train minigpt model")?;
+            save_minigpt_checkpoint(model, checkpoint_path)?;
         }
         ModelChoice::Compare => unreachable!("compare should be expanded before training dispatch"),
     }
+
+    Ok(())
+}
+
+fn save_minigpt_checkpoint<B: burn::tensor::backend::AutodiffBackend>(
+    model: MiniGpt<B>,
+    checkpoint_path: &Path,
+) -> Result<()> {
+    if let Some(parent) = checkpoint_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create checkpoint directory {:?}", parent))?;
+    }
+
+    save_model(model, checkpoint_path)
+        .with_context(|| format!("failed to save minigpt checkpoint to {:?}", checkpoint_path))?;
+    println!(
+        "Saved minigpt checkpoint to {:?}",
+        checkpoint_path.with_extension("mpk")
+    );
 
     Ok(())
 }
@@ -923,6 +951,52 @@ mod tests {
 
         assert_eq!((207..230).collect::<Vec<_>>(), value_tokens);
         assert_eq!(22, value_block_size);
+    }
+
+    #[test]
+    fn minigpt_training_saves_checkpoint_mpk_file() {
+        type TestBackend = Autodiff<NdArray<f32, i64>>;
+        let device = NdArrayDevice::Cpu;
+        let checkpoint_path = std::env::temp_dir()
+            .join("rusty-gpt-checkpoint-tests")
+            .join(format!("mini-gpt-{}", std::process::id()));
+        let saved_path = checkpoint_path.with_extension("mpk");
+        let _ = fs::remove_file(&saved_path);
+
+        let hyperparameters = Hyperparameters {
+            block_size: 4,
+            batch_size: 2,
+            embed_dim: 8,
+            num_heads: 2,
+            head_dim: 4,
+            num_layers: 1,
+            dropout: 0.0,
+            learning_rate: 1e-4,
+            train_steps: 1,
+            eval_interval: 0,
+            generate_tokens: 4,
+            minigpt_grad_clip_norm: 1.0,
+        };
+        let text = "abcdefghijklmnopqrstuvwxyz ".repeat(8);
+
+        run_training_demo::<TestBackend>(
+            &text,
+            hyperparameters,
+            ModelChoice::MiniGpt,
+            &device,
+            &checkpoint_path,
+            "cpu",
+            TrainingLogFormat::Plain,
+        )
+        .unwrap();
+
+        assert!(
+            saved_path.is_file(),
+            "expected training to save {:?}",
+            saved_path
+        );
+
+        let _ = fs::remove_file(saved_path);
     }
 
     #[cfg(feature = "cuda")]
