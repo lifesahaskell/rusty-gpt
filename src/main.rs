@@ -5,9 +5,14 @@ mod tokenizer;
 
 use crate::loader::data::DataLoader;
 use crate::model::persistence::load_model;
-use crate::model::{MiniGpt, MultiAttentionModel, SingleAttentionModel, TrivialModel};
+use crate::model::{
+    MiniGpt, MultiAttentionModel, SingleAttentionModel, TrainingLogContext, TrainingLogFormat,
+    TrivialModel,
+};
+use crate::server::ServerState;
 use crate::tokenizer::char::CharTokenizer;
 use anyhow::{Context, Result, bail};
+use axum::Router;
 use burn::backend::Autodiff;
 #[cfg(feature = "cuda")]
 use burn::backend::Cuda;
@@ -18,10 +23,13 @@ use burn::tensor::backend::Backend;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const DEFAULT_INPUT_PATH: &str = "data/input.txt";
 const DEFAULT_MINIGPT_CHECKPOINT_PATH: &str = "checkpoints/mini_gpt";
+const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:8787";
 
 const BLOCK_SIZE: usize = 128; // context length, start with 64 or 128
 const BATCH_SIZE: usize = 32; // start with 32 for quick training and testing, or 64+ for better results at the cost of more memory and slower training
@@ -150,9 +158,28 @@ fn main() -> Result<()> {
         env::var("RUSTY_GPT_INPUT").ok().as_deref(),
         env::var("RUSTY_GPT_MODEL").ok().as_deref(),
         env::var("RUSTY_GPT_MINIGPT_CHECKPOINT").ok().as_deref(),
+        env::var("RUSTY_GPT_SERVER_ADDR").ok().as_deref(),
     )?;
     let text = load_input_text(&config.input_path)?;
     let hyperparameters = Hyperparameters::from_env()?;
+
+    if config.serve {
+        return match config.backend {
+            BackendChoice::Cpu => run_http_server_with_runtime::<NdArray<f32, i64>>(
+                &text,
+                hyperparameters,
+                config.server_addr,
+                &NdArrayDevice::Cpu,
+            ),
+            #[cfg(feature = "cuda")]
+            BackendChoice::Cuda => run_http_server_with_runtime::<Cuda>(
+                &text,
+                hyperparameters,
+                config.server_addr,
+                &CudaDevice::default(),
+            ),
+        };
+    }
 
     match config.backend {
         BackendChoice::Cpu => run_cpu_demo(
@@ -167,7 +194,16 @@ fn main() -> Result<()> {
             if config.interactive {
                 bail!("interactive generation currently requires --backend cpu");
             }
-            run_demo::<Cuda>(&text, hyperparameters, config.model, &CudaDevice::default())
+            let device = CudaDevice::default();
+            run_demo::<Cuda>(&text, hyperparameters, config.model, &device)?;
+            run_training_demo::<Autodiff<Cuda>>(
+                &text,
+                hyperparameters,
+                config.model,
+                &device,
+                "cuda",
+                TrainingLogFormat::Json,
+            )
         }
     }
 }
@@ -197,8 +233,66 @@ fn run_cpu_demo(
             hyperparameters,
             model_choice,
             &device,
+            "cpu",
+            TrainingLogFormat::Plain,
         )
     }
+}
+
+fn run_http_server_with_runtime<B>(
+    text: &str,
+    hyperparameters: Hyperparameters,
+    server_addr: SocketAddr,
+    device: &B::Device,
+) -> Result<()>
+where
+    B: Backend + Send + Sync + 'static,
+    B::Device: Send + Sync + 'static,
+{
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to start tokio runtime")?;
+
+    runtime.block_on(run_http_server::<B>(
+        text,
+        hyperparameters,
+        server_addr,
+        device,
+    ))
+}
+
+async fn run_http_server<B>(
+    text: &str,
+    hyperparameters: Hyperparameters,
+    server_addr: SocketAddr,
+    device: &B::Device,
+) -> Result<()>
+where
+    B: Backend + Send + Sync + 'static,
+    B::Device: Send + Sync + 'static,
+{
+    let tokenizer = CharTokenizer::from_text(text);
+    let model = MiniGpt::<B>::new(
+        tokenizer.vocab_size(),
+        hyperparameters.embed_dim,
+        hyperparameters.num_layers,
+        hyperparameters.block_size,
+        hyperparameters.num_heads,
+        device,
+    );
+    let state = Arc::new(ServerState::new(model, tokenizer, device.clone()));
+    let app = Router::new()
+        .nest("/api", server::router::<B>())
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind(server_addr)
+        .await
+        .with_context(|| format!("failed to bind HTTP server on {server_addr}"))?;
+
+    println!("Serving GPT API on http://{server_addr}");
+    axum::serve(listener, app)
+        .await
+        .context("HTTP server failed")
 }
 
 fn run_demo<B: Backend>(
@@ -416,6 +510,8 @@ fn run_training_demo<B: burn::tensor::backend::AutodiffBackend>(
     hyperparameters: Hyperparameters,
     model_choice: ModelChoice,
     device: &B::Device,
+    backend_label: &'static str,
+    log_format: TrainingLogFormat,
 ) -> Result<()> {
     let tokenizer = CharTokenizer::from_text(text);
     let encoded = tokenizer.encode(text);
@@ -441,6 +537,8 @@ fn run_training_demo<B: burn::tensor::backend::AutodiffBackend>(
             device,
             tokenizer.vocab_size(),
             hyperparameters,
+            backend_label,
+            log_format,
         )?;
     }
 
@@ -454,7 +552,15 @@ fn train_model<B: burn::tensor::backend::AutodiffBackend>(
     device: &B::Device,
     vocab_size: usize,
     hyperparameters: Hyperparameters,
+    backend_label: &'static str,
+    log_format: TrainingLogFormat,
 ) -> Result<()> {
+    let log_context = TrainingLogContext {
+        backend: backend_label,
+        model: model_choice.label(),
+        format: log_format,
+    };
+
     match model_choice {
         ModelChoice::Trivial => {
             let _model = TrivialModel::<B>::train(
@@ -466,6 +572,7 @@ fn train_model<B: burn::tensor::backend::AutodiffBackend>(
                 hyperparameters.learning_rate,
                 hyperparameters.train_steps,
                 hyperparameters.eval_interval,
+                log_context,
             )
             .map_err(anyhow::Error::msg)
             .context("failed to train trivial model")?;
@@ -481,6 +588,7 @@ fn train_model<B: burn::tensor::backend::AutodiffBackend>(
                 hyperparameters.learning_rate,
                 hyperparameters.train_steps,
                 hyperparameters.eval_interval,
+                log_context,
             )
             .map_err(anyhow::Error::msg)
             .context("failed to train single attention model")?;
@@ -496,6 +604,7 @@ fn train_model<B: burn::tensor::backend::AutodiffBackend>(
                 hyperparameters.learning_rate,
                 hyperparameters.train_steps,
                 hyperparameters.eval_interval,
+                log_context,
             )
             .map_err(anyhow::Error::msg)
             .context("failed to train multi attention model")?;
@@ -514,6 +623,7 @@ fn train_model<B: burn::tensor::backend::AutodiffBackend>(
                 hyperparameters.train_steps,
                 hyperparameters.eval_interval,
                 hyperparameters.minigpt_grad_clip_norm,
+                log_context,
             )
             .map_err(anyhow::Error::msg)
             .context("failed to train minigpt model")?;
@@ -558,6 +668,8 @@ struct RuntimeConfig {
     input_path: PathBuf,
     checkpoint_path: PathBuf,
     interactive: bool,
+    serve: bool,
+    server_addr: SocketAddr,
 }
 
 fn load_input_text(path: &Path) -> Result<String> {
@@ -575,7 +687,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    parse_runtime_config_with_checkpoint(args, env_backend, env_input, env_model, None)
+    parse_runtime_config_with_checkpoint(args, env_backend, env_input, env_model, None, None)
 }
 
 fn parse_runtime_config_with_checkpoint<I, S>(
@@ -584,6 +696,7 @@ fn parse_runtime_config_with_checkpoint<I, S>(
     env_input: Option<&str>,
     env_model: Option<&str>,
     env_checkpoint: Option<&str>,
+    env_server_addr: Option<&str>,
 ) -> Result<RuntimeConfig>
 where
     I: IntoIterator<Item = S>,
@@ -597,7 +710,9 @@ where
     let mut arg_input = None;
     let mut arg_model = None;
     let mut arg_checkpoint = None;
+    let mut arg_server_addr = None;
     let mut interactive = false;
+    let mut serve = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -630,13 +745,31 @@ where
                 arg_checkpoint = Some(value.as_str());
                 index += 2;
             }
+            "--server-addr" => {
+                let value = args
+                    .get(index + 1)
+                    .context("--server-addr requires a value like 127.0.0.1:8787")?;
+                arg_server_addr = Some(value.as_str());
+                index += 2;
+            }
             "--interactive-generate" => {
                 interactive = true;
+                index += 1;
+            }
+            "--serve" => {
+                serve = true;
                 index += 1;
             }
             other => bail!("unsupported argument: {other}"),
         }
     }
+
+    let server_addr_text = arg_server_addr
+        .or(env_server_addr)
+        .unwrap_or(DEFAULT_SERVER_ADDR);
+    let server_addr = server_addr_text
+        .parse()
+        .with_context(|| format!("invalid server address '{server_addr_text}'"))?;
 
     Ok(RuntimeConfig {
         backend: parse_backend_name(arg_backend.or(env_backend).unwrap_or("cpu"))?,
@@ -648,6 +781,8 @@ where
                 .unwrap_or(DEFAULT_MINIGPT_CHECKPOINT_PATH),
         ),
         interactive,
+        serve,
+        server_addr,
     })
 }
 
@@ -689,6 +824,11 @@ mod tests {
         assert_eq!(
             PathBuf::from(DEFAULT_MINIGPT_CHECKPOINT_PATH),
             config.checkpoint_path
+        );
+        assert!(!config.serve);
+        assert_eq!(
+            DEFAULT_SERVER_ADDR.parse::<SocketAddr>().unwrap(),
+            config.server_addr
         );
     }
 
@@ -867,6 +1007,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -884,6 +1025,7 @@ mod tests {
             None,
             None,
             Some("checkpoints/from-env"),
+            None,
         )
         .unwrap();
 
@@ -897,6 +1039,7 @@ mod tests {
     fn missing_checkpoint_arg_value_returns_clear_error() {
         let err = parse_runtime_config_with_checkpoint(
             ["--checkpoint".to_string()],
+            None,
             None,
             None,
             None,

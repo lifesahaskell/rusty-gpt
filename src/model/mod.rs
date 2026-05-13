@@ -11,6 +11,29 @@ use crate::loader::data::DataLoader;
 
 pub mod persistence;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrainingLogFormat {
+    Plain,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TrainingLogContext {
+    pub backend: &'static str,
+    pub model: &'static str,
+    pub format: TrainingLogFormat,
+}
+
+impl TrainingLogContext {
+    pub fn plain(model: &'static str) -> Self {
+        Self {
+            backend: "cpu",
+            model,
+            format: TrainingLogFormat::Plain,
+        }
+    }
+}
+
 fn should_log_training_step(step: usize, steps: usize, eval_interval: usize) -> bool {
     if eval_interval == 0 {
         return step + 1 == steps;
@@ -39,6 +62,39 @@ fn value_loss<B: Backend>(
 ) -> Result<B::FloatElem, String> {
     let (inputs, targets) = loader.next_batch::<B>(device)?;
     Ok(language_model_loss(loss_fn, forward(inputs), targets).into_scalar())
+}
+
+fn training_progress_log_line<B: Backend>(
+    context: TrainingLogContext,
+    step: usize,
+    steps: usize,
+    training_loss: B::FloatElem,
+    value_loss: B::FloatElem,
+) -> String {
+    match context.format {
+        TrainingLogFormat::Plain => {
+            format!("Step {step}: training loss = {training_loss:.4}, value loss = {value_loss:.4}")
+        }
+        TrainingLogFormat::Json => {
+            format!(
+                r#"{{"event":"training_progress","backend":"{}","model":"{}","step":{},"total_steps":{},"training_loss":{:.6},"value_loss":{:.6}}}"#,
+                context.backend, context.model, step, steps, training_loss, value_loss
+            )
+        }
+    }
+}
+
+fn log_training_progress<B: Backend>(
+    context: TrainingLogContext,
+    step: usize,
+    steps: usize,
+    training_loss: B::FloatElem,
+    value_loss: B::FloatElem,
+) {
+    println!(
+        "{}",
+        training_progress_log_line::<B>(context, step, steps, training_loss, value_loss)
+    );
 }
 
 #[derive(Module, Debug)]
@@ -71,6 +127,7 @@ impl<B: AutodiffBackend> TrivialModel<B> {
         lr: f64,
         steps: usize,
         eval_interval: usize,
+        log_context: TrainingLogContext,
     ) -> Result<Self, String> {
         let mut model = TrivialModel::<B>::new(vocab_size, d_model, device);
         let mut optimizer = AdamWConfig::new().init();
@@ -90,9 +147,7 @@ impl<B: AutodiffBackend> TrivialModel<B> {
                 let value_loss = value_loss(value_loader, device, &loss_fn, |inputs| {
                     model.forward(inputs)
                 })?;
-                println!(
-                    "Step {step}: training loss = {training_loss:.4}, value loss = {value_loss:.4}"
-                );
+                log_training_progress::<B>(log_context, step, steps, training_loss, value_loss);
             }
         }
 
@@ -137,6 +192,7 @@ impl<B: AutodiffBackend> SingleAttentionModel<B> {
         lr: f64,
         steps: usize,
         eval_interval: usize,
+        log_context: TrainingLogContext,
     ) -> Result<Self, String> {
         let mut model = SingleAttentionModel::<B>::new(vocab_size, d_model, head_dim, device);
         let mut optimizer = AdamWConfig::new().init();
@@ -156,9 +212,7 @@ impl<B: AutodiffBackend> SingleAttentionModel<B> {
                 let value_loss = value_loss(value_loader, device, &loss_fn, |inputs| {
                     model.forward_tokens(inputs)
                 })?;
-                println!(
-                    "Step {step}: training loss = {training_loss:.4}, value loss = {value_loss:.4}"
-                );
+                log_training_progress::<B>(log_context, step, steps, training_loss, value_loss);
             }
         }
 
@@ -215,6 +269,7 @@ impl<B: AutodiffBackend> MultiAttentionModel<B> {
         lr: f64,
         steps: usize,
         eval_interval: usize,
+        log_context: TrainingLogContext,
     ) -> Result<Self, String> {
         let mut model = MultiAttentionModel::<B>::new(vocab_size, d_model, num_heads, device);
         let mut optimizer = AdamWConfig::new().init();
@@ -234,9 +289,7 @@ impl<B: AutodiffBackend> MultiAttentionModel<B> {
                 let value_loss = value_loss(value_loader, device, &loss_fn, |inputs| {
                     model.forward_tokens(inputs)
                 })?;
-                println!(
-                    "Step {step}: training loss = {training_loss:.4}, value loss = {value_loss:.4}"
-                );
+                log_training_progress::<B>(log_context, step, steps, training_loss, value_loss);
             }
         }
 
@@ -615,6 +668,7 @@ impl<B: AutodiffBackend> MiniGpt<B> {
         steps: usize,
         eval_interval: usize,
         grad_clip_norm: f32,
+        log_context: TrainingLogContext,
     ) -> Result<Self, String> {
         let mut model = MiniGpt::<B>::new(
             vocab_size,
@@ -643,9 +697,7 @@ impl<B: AutodiffBackend> MiniGpt<B> {
                 let value_loss = value_loss(value_loader, device, &loss_fn, |inputs| {
                     model.forward_tokens(inputs)
                 })?;
-                println!(
-                    "Step {step}: training loss = {training_loss:.4}, value loss = {value_loss:.4}"
-                );
+                log_training_progress::<B>(log_context, step, steps, training_loss, value_loss);
             }
         }
 
@@ -679,6 +731,31 @@ mod tests {
         assert!(!should_log_training_step(0, 3, 0));
         assert!(!should_log_training_step(1, 3, 0));
         assert!(should_log_training_step(2, 3, 0));
+    }
+
+    #[test]
+    fn training_progress_json_log_line_includes_backend_and_losses() {
+        type TestBackend = NdArray<f32, i64>;
+        let line = training_progress_log_line::<TestBackend>(
+            TrainingLogContext {
+                backend: "cuda",
+                model: "minigpt",
+                format: TrainingLogFormat::Json,
+            },
+            10,
+            100,
+            1.25,
+            2.5,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!("training_progress", parsed["event"]);
+        assert_eq!("cuda", parsed["backend"]);
+        assert_eq!("minigpt", parsed["model"]);
+        assert_eq!(10, parsed["step"]);
+        assert_eq!(100, parsed["total_steps"]);
+        assert_eq!(1.25, parsed["training_loss"]);
+        assert_eq!(2.5, parsed["value_loss"]);
     }
 
     #[test]
