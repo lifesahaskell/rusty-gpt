@@ -12,6 +12,7 @@ use crate::model::{
 };
 use crate::server::ServerState;
 use crate::tokenizer::char::CharTokenizer;
+use crate::utils::benchmark_generation;
 use anyhow::{Context, Result, bail};
 use axum::Router;
 use burn::backend::Autodiff;
@@ -44,6 +45,7 @@ const TRAIN_STEPS: usize = 1000; // number of training steps, start with 1000 fo
 const EVAL_INTERVAL: usize = 100; // how often to evaluate and print training progress, in steps
 const GENERATE_TOKENS: usize = 80; // number of tokens to generate in interactive generation mode
 const MINIGPT_GRAD_CLIP_NORM: f32 = 1.0; // max gradient norm for minigpt training
+const PREFETCH_BATCHES: usize = 2; // number of prepared CPU batches queued ahead of training
 
 #[derive(Debug, Clone, Copy)]
 struct Hyperparameters {
@@ -59,6 +61,7 @@ struct Hyperparameters {
     eval_interval: usize,
     generate_tokens: usize,
     minigpt_grad_clip_norm: f32,
+    prefetch_batches: usize,
 }
 
 impl Default for Hyperparameters {
@@ -76,6 +79,7 @@ impl Default for Hyperparameters {
             eval_interval: EVAL_INTERVAL,
             generate_tokens: GENERATE_TOKENS,
             minigpt_grad_clip_norm: MINIGPT_GRAD_CLIP_NORM,
+            prefetch_batches: PREFETCH_BATCHES,
         }
     }
 }
@@ -96,6 +100,10 @@ impl Hyperparameters {
         apply_env_override(
             "RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM",
             &mut hyperparameters.minigpt_grad_clip_norm,
+        )?;
+        apply_env_override(
+            "RUSTY_GPT_PREFETCH_BATCHES",
+            &mut hyperparameters.prefetch_batches,
         )?;
 
         if hyperparameters.minigpt_grad_clip_norm <= 0.0 {
@@ -158,6 +166,10 @@ impl ModelChoice {
             ModelChoice::Compare => "compare",
         }
     }
+
+    fn includes_minigpt(self) -> bool {
+        matches!(self, ModelChoice::MiniGpt | ModelChoice::Compare)
+    }
 }
 
 fn main() -> Result<()> {
@@ -178,6 +190,8 @@ fn main() -> Result<()> {
                 &text,
                 hyperparameters,
                 config.server_addr,
+                &config.checkpoint_path,
+                config.load_checkpoint,
                 &NdArrayDevice::Cpu,
             ),
             #[cfg(feature = "cuda")]
@@ -185,6 +199,8 @@ fn main() -> Result<()> {
                 &text,
                 hyperparameters,
                 config.server_addr,
+                &config.checkpoint_path,
+                config.load_checkpoint,
                 &CudaDevice::default(),
             ),
         };
@@ -196,6 +212,7 @@ fn main() -> Result<()> {
             hyperparameters,
             config.model,
             config.interactive,
+            config.benchmark_generation,
             &config.checkpoint_path,
         ),
         #[cfg(feature = "cuda")]
@@ -211,8 +228,11 @@ fn main() -> Result<()> {
                 config.model,
                 &device,
                 &config.checkpoint_path,
-                "cuda",
-                TrainingLogFormat::Json,
+                TrainingDemoOptions {
+                    backend_label: "cuda",
+                    log_format: TrainingLogFormat::Json,
+                    benchmark_generation: config.benchmark_generation,
+                },
             )
         }
     }
@@ -223,11 +243,15 @@ fn run_cpu_demo(
     hyperparameters: Hyperparameters,
     model_choice: ModelChoice,
     interactive: bool,
+    benchmark_generation: bool,
     checkpoint_path: &Path,
 ) -> Result<()> {
     let device = NdArrayDevice::Cpu;
     run_demo::<NdArray<f32, i64>>(text, hyperparameters, model_choice, &device)?;
     if interactive {
+        if benchmark_generation {
+            bail!("generation benchmarks cannot run with --interactive-generate");
+        }
         if model_choice != ModelChoice::MiniGpt {
             bail!("interactive generation requires --model minigpt");
         }
@@ -244,8 +268,11 @@ fn run_cpu_demo(
             model_choice,
             &device,
             checkpoint_path,
-            "cpu",
-            TrainingLogFormat::Plain,
+            TrainingDemoOptions {
+                backend_label: "cpu",
+                log_format: TrainingLogFormat::Plain,
+                benchmark_generation,
+            },
         )
     }
 }
@@ -254,6 +281,8 @@ fn run_http_server_with_runtime<B>(
     text: &str,
     hyperparameters: Hyperparameters,
     server_addr: SocketAddr,
+    checkpoint_path: &Path,
+    load_checkpoint_enabled: bool,
     device: &B::Device,
 ) -> Result<()>
 where
@@ -269,6 +298,8 @@ where
         text,
         hyperparameters,
         server_addr,
+        checkpoint_path,
+        load_checkpoint_enabled,
         device,
     ))
 }
@@ -277,6 +308,8 @@ async fn run_http_server<B>(
     text: &str,
     hyperparameters: Hyperparameters,
     server_addr: SocketAddr,
+    checkpoint_path: &Path,
+    load_checkpoint_enabled: bool,
     device: &B::Device,
 ) -> Result<()>
 where
@@ -284,7 +317,12 @@ where
     B::Device: Send + Sync + 'static,
 {
     let tokenizer = CharTokenizer::from_text(text);
-    let model = new_minigpt::<B>(tokenizer.vocab_size(), hyperparameters, device);
+    let template = new_minigpt::<B>(tokenizer.vocab_size(), hyperparameters, device);
+    let model = if load_checkpoint_enabled {
+        load_minigpt_checkpoint(template, checkpoint_path, device)?
+    } else {
+        template
+    };
     let state = Arc::new(ServerState::new(model, tokenizer, device.clone()));
     let app = Router::new()
         .nest("/api", server::router::<B>())
@@ -310,7 +348,7 @@ fn run_demo<B: Backend>(
     println!("Vocab size: {}", tokenizer.vocab_size());
     println!("Input chars: {}", text.chars().count());
     println!(
-        "Hyperparameters: block_size={}, batch_size={}, embed_dim={}, num_heads={}, head_dim={}, num_layers={}, dropout={}, lr={}, train_steps={}, eval_interval={}, generate_tokens={}, minigpt_grad_clip_norm={}",
+        "Hyperparameters: block_size={}, batch_size={}, embed_dim={}, num_heads={}, head_dim={}, num_layers={}, dropout={}, lr={}, train_steps={}, eval_interval={}, generate_tokens={}, minigpt_grad_clip_norm={}, prefetch_batches={}",
         hyperparameters.block_size,
         hyperparameters.batch_size,
         hyperparameters.embed_dim,
@@ -322,7 +360,8 @@ fn run_demo<B: Backend>(
         hyperparameters.train_steps,
         hyperparameters.eval_interval,
         hyperparameters.generate_tokens,
-        hyperparameters.minigpt_grad_clip_norm
+        hyperparameters.minigpt_grad_clip_norm,
+        hyperparameters.prefetch_batches
     );
     let preview_len = encoded.len().min(80);
     println!(
@@ -367,6 +406,16 @@ fn run_interactive_minigpt_generation<B: burn::tensor::backend::AutodiffBackend>
 ) -> Result<()> {
     let tokenizer = CharTokenizer::from_text(text);
     let template = new_minigpt::<B>(tokenizer.vocab_size(), hyperparameters, device);
+    let model = load_minigpt_checkpoint(template, checkpoint_path, device)?;
+
+    interactive_generation_loop(&model, &tokenizer, hyperparameters.generate_tokens, device)
+}
+
+fn load_minigpt_checkpoint<B: Backend>(
+    template: MiniGpt<B>,
+    checkpoint_path: &Path,
+    device: &B::Device,
+) -> Result<MiniGpt<B>> {
     let model = load_model(template, checkpoint_path, device).with_context(|| {
         format!(
             "failed to load minigpt checkpoint from {:?}",
@@ -378,7 +427,7 @@ fn run_interactive_minigpt_generation<B: burn::tensor::backend::AutodiffBackend>
         checkpoint_path.with_extension("mpk")
     );
 
-    interactive_generation_loop(&model, &tokenizer, hyperparameters.generate_tokens, device)
+    Ok(model)
 }
 
 fn interactive_generation_loop<B: Backend>(
@@ -516,9 +565,12 @@ fn run_training_demo<B: burn::tensor::backend::AutodiffBackend>(
     model_choice: ModelChoice,
     device: &B::Device,
     checkpoint_path: &Path,
-    backend_label: &'static str,
-    log_format: TrainingLogFormat,
+    options: TrainingDemoOptions,
 ) -> Result<()> {
+    if options.benchmark_generation && !model_choice.includes_minigpt() {
+        bail!("generation benchmarks require --model minigpt or compare");
+    }
+
     let tokenizer = CharTokenizer::from_text(text);
     let encoded = tokenizer.encode(text);
     let (training_tokens, value_tokens, value_block_size) =
@@ -544,12 +596,20 @@ fn run_training_demo<B: burn::tensor::backend::AutodiffBackend>(
             vocab_size: tokenizer.vocab_size(),
             hyperparameters,
             checkpoint_path,
-            backend_label,
-            log_format,
+            backend_label: options.backend_label,
+            log_format: options.log_format,
+            benchmark_generation: options.benchmark_generation,
         })?;
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrainingDemoOptions {
+    backend_label: &'static str,
+    log_format: TrainingLogFormat,
+    benchmark_generation: bool,
 }
 
 struct TrainingRun<'a, B: burn::tensor::backend::AutodiffBackend> {
@@ -562,6 +622,7 @@ struct TrainingRun<'a, B: burn::tensor::backend::AutodiffBackend> {
     checkpoint_path: &'a Path,
     backend_label: &'static str,
     log_format: TrainingLogFormat,
+    benchmark_generation: bool,
 }
 
 fn train_model<B: burn::tensor::backend::AutodiffBackend>(run: TrainingRun<'_, B>) -> Result<()> {
@@ -575,7 +636,8 @@ fn train_model<B: burn::tensor::backend::AutodiffBackend>(run: TrainingRun<'_, B
         run.hyperparameters.train_steps,
         run.hyperparameters.eval_interval,
         log_context,
-    );
+    )
+    .with_prefetch_batches(run.hyperparameters.prefetch_batches);
 
     match run.model_choice {
         ModelChoice::Trivial => {
@@ -632,6 +694,9 @@ fn train_model<B: burn::tensor::backend::AutodiffBackend>(run: TrainingRun<'_, B
             )
             .map_err(anyhow::Error::msg)
             .context("failed to train minigpt model")?;
+            if run.benchmark_generation {
+                benchmark_generation(&model, run.device);
+            }
             save_minigpt_checkpoint(model, run.checkpoint_path)?;
         }
         ModelChoice::Compare => unreachable!("compare should be expanded before training dispatch"),
@@ -695,6 +760,8 @@ struct RuntimeConfig {
     input_path: PathBuf,
     checkpoint_path: PathBuf,
     interactive: bool,
+    benchmark_generation: bool,
+    load_checkpoint: bool,
     serve: bool,
     server_addr: SocketAddr,
 }
@@ -739,6 +806,8 @@ where
     let mut arg_checkpoint = None;
     let mut arg_server_addr = None;
     let mut interactive = false;
+    let mut benchmark_generation = false;
+    let mut load_checkpoint = false;
     let mut serve = false;
     let mut index = 0;
 
@@ -783,6 +852,14 @@ where
                 interactive = true;
                 index += 1;
             }
+            "--benchmark-generation" => {
+                benchmark_generation = true;
+                index += 1;
+            }
+            "--load-checkpoint" => {
+                load_checkpoint = true;
+                index += 1;
+            }
             "--serve" => {
                 serve = true;
                 index += 1;
@@ -808,6 +885,8 @@ where
                 .unwrap_or(DEFAULT_MINIGPT_CHECKPOINT_PATH),
         ),
         interactive,
+        benchmark_generation,
+        load_checkpoint,
         serve,
         server_addr,
     })
@@ -853,6 +932,8 @@ mod tests {
             config.checkpoint_path
         );
         assert!(!config.serve);
+        assert!(!config.benchmark_generation);
+        assert!(!config.load_checkpoint);
         assert_eq!(
             DEFAULT_SERVER_ADDR.parse::<SocketAddr>().unwrap(),
             config.server_addr
@@ -878,6 +959,7 @@ mod tests {
             MINIGPT_GRAD_CLIP_NORM,
             hyperparameters.minigpt_grad_clip_norm
         );
+        assert_eq!(PREFETCH_BATCHES, hyperparameters.prefetch_batches);
     }
 
     #[test]
@@ -889,6 +971,7 @@ mod tests {
             env::set_var("RUSTY_GPT_EVAL_INTERVAL", "3");
             env::set_var("RUSTY_GPT_GENERATE_TOKENS", "11");
             env::set_var("RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM", "0.5");
+            env::set_var("RUSTY_GPT_PREFETCH_BATCHES", "4");
         }
 
         let hyperparameters = Hyperparameters::from_env().unwrap();
@@ -897,6 +980,7 @@ mod tests {
         assert_eq!(3, hyperparameters.eval_interval);
         assert_eq!(11, hyperparameters.generate_tokens);
         assert_eq!(0.5, hyperparameters.minigpt_grad_clip_norm);
+        assert_eq!(4, hyperparameters.prefetch_batches);
 
         // SAFETY: See note above.
         unsafe {
@@ -904,6 +988,7 @@ mod tests {
             env::remove_var("RUSTY_GPT_EVAL_INTERVAL");
             env::remove_var("RUSTY_GPT_GENERATE_TOKENS");
             env::remove_var("RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM");
+            env::remove_var("RUSTY_GPT_PREFETCH_BATCHES");
         }
     }
 
@@ -975,6 +1060,7 @@ mod tests {
             eval_interval: 0,
             generate_tokens: 4,
             minigpt_grad_clip_norm: 1.0,
+            prefetch_batches: 2,
         };
         let text = "abcdefghijklmnopqrstuvwxyz ".repeat(8);
 
@@ -984,8 +1070,11 @@ mod tests {
             ModelChoice::MiniGpt,
             &device,
             &checkpoint_path,
-            "cpu",
-            TrainingLogFormat::Plain,
+            TrainingDemoOptions {
+                backend_label: "cpu",
+                log_format: TrainingLogFormat::Plain,
+                benchmark_generation: false,
+            },
         )
         .unwrap();
 
@@ -1220,6 +1309,63 @@ mod tests {
 
         assert_eq!(ModelChoice::MiniGpt, config.model);
         assert!(config.interactive);
+    }
+
+    #[test]
+    fn generation_benchmark_can_be_selected_from_args() {
+        let config =
+            parse_runtime_config(["--benchmark-generation".to_string()], None, None, None).unwrap();
+
+        assert!(config.benchmark_generation);
+    }
+
+    #[test]
+    fn checkpoint_loading_can_be_selected_from_args() {
+        let config =
+            parse_runtime_config(["--load-checkpoint".to_string()], None, None, None).unwrap();
+
+        assert!(config.load_checkpoint);
+    }
+
+    #[test]
+    fn generation_benchmark_requires_minigpt_training_model() {
+        type TestBackend = Autodiff<NdArray<f32, i64>>;
+        let device = NdArrayDevice::Cpu;
+        let checkpoint_path = std::env::temp_dir().join("rusty-gpt-unused-benchmark-checkpoint");
+        let hyperparameters = Hyperparameters {
+            block_size: 4,
+            batch_size: 2,
+            embed_dim: 8,
+            num_heads: 2,
+            head_dim: 4,
+            num_layers: 1,
+            dropout: 0.0,
+            learning_rate: 1e-4,
+            train_steps: 1,
+            eval_interval: 0,
+            generate_tokens: 4,
+            minigpt_grad_clip_norm: 1.0,
+            prefetch_batches: 0,
+        };
+
+        let err = run_training_demo::<TestBackend>(
+            &"abcdefghijklmnopqrstuvwxyz ".repeat(8),
+            hyperparameters,
+            ModelChoice::Trivial,
+            &device,
+            &checkpoint_path,
+            TrainingDemoOptions {
+                backend_label: "cpu",
+                log_format: TrainingLogFormat::Plain,
+                benchmark_generation: true,
+            },
+        )
+        .expect_err("benchmarking should require minigpt or compare");
+
+        assert!(
+            err.to_string()
+                .contains("generation benchmarks require --model minigpt or compare")
+        );
     }
 
     #[test]

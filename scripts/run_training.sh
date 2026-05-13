@@ -3,13 +3,14 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run_training.sh [--backend cpu|cuda] [--checkpoint path] <training-data-file>
+Usage: scripts/run_training.sh [--backend cpu|cuda] [--checkpoint path] [--benchmark] <training-data-file>
 
 Runs rusty-gpt training against the provided UTF-8 text file.
 
 Options:
   --backend cpu|cuda                     Overrides RUSTY_GPT_BACKEND
   --checkpoint path                      Overrides RUSTY_GPT_MINIGPT_CHECKPOINT
+  --benchmark                            Run MiniGpt generation benchmarks after training
   -h, --help                             Show this help
 
 Environment overrides:
@@ -19,6 +20,7 @@ Environment overrides:
   RUSTY_GPT_MINIGPT_CHECKPOINT=<path>     Default: checkpoints/mini_gpt
   RUSTY_GPT_TRAIN_STEPS=<int>             Default: app default
   RUSTY_GPT_EVAL_INTERVAL=<int>           Default: app default
+  RUSTY_GPT_PREFETCH_BATCHES=<int>         Default: app default
 USAGE
 }
 
@@ -29,6 +31,7 @@ fi
 
 BACKEND_ARG=""
 CHECKPOINT_ARG=""
+BENCHMARK_ARGS=()
 TRAINING_FILE=""
 
 while [[ $# -gt 0 ]]; do
@@ -55,6 +58,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --checkpoint=*)
       CHECKPOINT_ARG="${1#--checkpoint=}"
+      shift
+      ;;
+    --benchmark)
+      BENCHMARK_ARGS=(--benchmark-generation)
       shift
       ;;
     -*)
@@ -106,4 +113,5 @@ cargo run "${CARGO_FEATURE_ARGS[@]}" -- \
   --input "$TRAINING_FILE" \
   --model "$RUSTY_GPT_MODEL" \
   --checkpoint "$RUSTY_GPT_MINIGPT_CHECKPOINT" \
-  "${TRAINING_BACKEND_ARGS[@]}"
+  "${TRAINING_BACKEND_ARGS[@]}" \
+  "${BENCHMARK_ARGS[@]}"

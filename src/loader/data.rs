@@ -1,8 +1,27 @@
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor, TensorData};
+use std::sync::mpsc::{Receiver, sync_channel};
+use std::thread::JoinHandle;
 
 pub type TokenBatch<B> = (Tensor<B, 2, Int>, Tensor<B, 2, Int>);
 
+#[derive(Debug)]
+pub struct RawTokenBatch {
+    inputs: Vec<i64>,
+    targets: Vec<i64>,
+    shape: [usize; 2],
+}
+
+impl RawTokenBatch {
+    pub fn into_tensors<B: Backend>(self, device: &B::Device) -> TokenBatch<B> {
+        (
+            Tensor::from_data(TensorData::new(self.inputs, self.shape), device),
+            Tensor::from_data(TensorData::new(self.targets, self.shape), device),
+        )
+    }
+}
+
+#[derive(Clone)]
 pub struct DataLoader {
     pub tokens: Vec<usize>,
     pub block_size: usize, // context length, start with 64 or 128
@@ -11,6 +30,11 @@ pub struct DataLoader {
 
 impl DataLoader {
     pub fn next_batch<B: Backend>(&self, device: &B::Device) -> Result<TokenBatch<B>, String> {
+        self.next_raw_batch()
+            .map(|batch| batch.into_tensors::<B>(device))
+    }
+
+    pub fn next_raw_batch(&self) -> Result<RawTokenBatch, String> {
         if self.tokens.len() <= self.block_size {
             return Err(format!(
                 "not enough tokens to build a batch: got {}, need at least {}",
@@ -35,10 +59,43 @@ impl DataLoader {
                     .map(|&t| t as i64),
             );
         }
-        let shape = [self.batch_size, self.block_size];
-        let x_tensor = Tensor::from_data(TensorData::new(x, shape), device);
-        let y_tensor = Tensor::from_data(TensorData::new(y, shape), device);
-        Ok((x_tensor, y_tensor))
+
+        Ok(RawTokenBatch {
+            inputs: x,
+            targets: y,
+            shape: [self.batch_size, self.block_size],
+        })
+    }
+}
+
+pub struct BatchPrefetcher {
+    receiver: Receiver<Result<RawTokenBatch, String>>,
+    _worker: JoinHandle<()>,
+}
+
+impl BatchPrefetcher {
+    pub fn new(loader: DataLoader, depth: usize) -> Self {
+        let depth = depth.max(1);
+        let (sender, receiver) = sync_channel(depth);
+        let worker = std::thread::spawn(move || {
+            loop {
+                if sender.send(loader.next_raw_batch()).is_err() {
+                    break;
+                }
+            }
+        });
+
+        Self {
+            receiver,
+            _worker: worker,
+        }
+    }
+
+    pub fn next_batch<B: Backend>(&self, device: &B::Device) -> Result<TokenBatch<B>, String> {
+        self.receiver
+            .recv()
+            .map_err(|err| format!("batch prefetch worker stopped: {err}"))?
+            .map(|batch| batch.into_tensors::<B>(device))
     }
 }
 
@@ -94,5 +151,22 @@ mod tests {
             .expect_err("short token stream should fail");
 
         assert!(err.contains("not enough tokens"));
+    }
+
+    #[test]
+    fn prefetcher_returns_requested_batch_shape() {
+        type TestBackend = NdArray<f32, i64>;
+        let loader = DataLoader {
+            tokens: vec![0, 1, 2, 3, 4, 5],
+            block_size: 2,
+            batch_size: 3,
+        };
+        let device = NdArrayDevice::Cpu;
+        let prefetcher = BatchPrefetcher::new(loader, 2);
+
+        let (x, y) = prefetcher.next_batch::<TestBackend>(&device).unwrap();
+
+        assert_eq!([3, 2], x.shape().dims());
+        assert_eq!([3, 2], y.shape().dims());
     }
 }

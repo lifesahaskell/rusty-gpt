@@ -7,7 +7,7 @@ use burn::tensor::activation::{gelu, softmax};
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Bool, Int, Tensor, TensorData};
 
-use crate::loader::data::DataLoader;
+use crate::loader::data::{BatchPrefetcher, DataLoader, TokenBatch};
 
 pub mod persistence;
 
@@ -39,6 +39,7 @@ pub struct TrainingParams {
     pub learning_rate: f64,
     pub steps: usize,
     pub eval_interval: usize,
+    pub prefetch_batches: usize,
     pub grad_clipping: Option<GradientClippingConfig>,
     pub log_context: TrainingLogContext,
 }
@@ -54,6 +55,7 @@ impl TrainingParams {
             learning_rate,
             steps,
             eval_interval,
+            prefetch_batches: 0,
             grad_clipping: None,
             log_context,
         }
@@ -61,6 +63,11 @@ impl TrainingParams {
 
     pub fn with_grad_clip_norm(mut self, norm: f32) -> Self {
         self.grad_clipping = Some(GradientClippingConfig::Norm(norm));
+        self
+    }
+
+    pub fn with_prefetch_batches(mut self, batches: usize) -> Self {
+        self.prefetch_batches = batches;
         self
     }
 }
@@ -137,6 +144,28 @@ fn log_training_progress<B: Backend>(
     );
 }
 
+enum TrainingBatchSource<'a> {
+    Direct(&'a DataLoader),
+    Prefetch(BatchPrefetcher),
+}
+
+impl<'a> TrainingBatchSource<'a> {
+    fn new(loader: &'a DataLoader, prefetch_batches: usize) -> Self {
+        if prefetch_batches == 0 {
+            Self::Direct(loader)
+        } else {
+            Self::Prefetch(BatchPrefetcher::new(loader.clone(), prefetch_batches))
+        }
+    }
+
+    fn next_batch<B: Backend>(&self, device: &B::Device) -> Result<TokenBatch<B>, String> {
+        match self {
+            Self::Direct(loader) => loader.next_batch(device),
+            Self::Prefetch(prefetcher) => prefetcher.next_batch(device),
+        }
+    }
+}
+
 fn train_language_model<B, M>(
     mut model: M,
     loader: &DataLoader,
@@ -149,13 +178,14 @@ where
     B: AutodiffBackend,
     M: AutodiffModule<B>,
 {
+    let training_batches = TrainingBatchSource::new(loader, params.prefetch_batches);
     let mut optimizer = AdamWConfig::new()
         .with_grad_clipping(params.grad_clipping)
         .init();
     let loss_fn = CrossEntropyLossConfig::new().init(device);
 
     for step in 0..params.steps {
-        let (inputs, targets) = loader.next_batch::<B>(device)?;
+        let (inputs, targets) = training_batches.next_batch::<B>(device)?;
         let loss = language_model_loss(&loss_fn, forward(&model, inputs), targets);
 
         let grads = loss.backward();

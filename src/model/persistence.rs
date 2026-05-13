@@ -27,7 +27,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::TrivialModel;
+    use crate::model::{MiniGpt, TrivialModel};
+    use burn::backend::Autodiff;
     use burn::backend::ndarray::{NdArray, NdArrayDevice};
     use burn::tensor::{Int, Tensor};
 
@@ -53,6 +54,30 @@ mod tests {
         let actual = loaded.forward(input).into_data().to_vec::<f32>().unwrap();
 
         assert_eq!(expected, actual);
+
+        let _ = std::fs::remove_file(saved_path);
+    }
+
+    #[test]
+    fn autodiff_checkpoint_loads_into_inference_backend() {
+        type TrainBackend = Autodiff<NdArray<f32, i64>>;
+        type InferenceBackend = NdArray<f32, i64>;
+
+        let device = NdArrayDevice::Cpu;
+        let path = std::env::temp_dir().join(format!(
+            "rusty-gpt-minigpt-inference-load-{}",
+            std::process::id()
+        ));
+        let saved_path = path.with_extension("mpk");
+
+        let model = MiniGpt::<TrainBackend>::new(7, 8, 1, 4, 2, &device);
+        save_model(model, &path).unwrap();
+
+        let template = MiniGpt::<InferenceBackend>::new(7, 8, 1, 4, 2, &device);
+        let loaded = load_model(template, &path, &device).unwrap();
+        let input = Tensor::<InferenceBackend, 2, Int>::from_data([[0, 1, 2]], &device);
+
+        assert_eq!([1, 3, 7], loaded.forward_tokens(input).shape().dims());
 
         let _ = std::fs::remove_file(saved_path);
     }
