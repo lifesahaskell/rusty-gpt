@@ -1,4 +1,4 @@
-use burn::module::Module;
+use burn::module::{AutodiffModule, Module};
 use burn::nn::loss::{CrossEntropyLoss, CrossEntropyLossConfig};
 use burn::nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig};
 use burn::optim::grad_clipping::GradientClippingConfig;
@@ -34,12 +34,52 @@ impl TrainingLogContext {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct TrainingParams {
+    pub learning_rate: f64,
+    pub steps: usize,
+    pub eval_interval: usize,
+    pub grad_clipping: Option<GradientClippingConfig>,
+    pub log_context: TrainingLogContext,
+}
+
+impl TrainingParams {
+    pub fn new(
+        learning_rate: f64,
+        steps: usize,
+        eval_interval: usize,
+        log_context: TrainingLogContext,
+    ) -> Self {
+        Self {
+            learning_rate,
+            steps,
+            eval_interval,
+            grad_clipping: None,
+            log_context,
+        }
+    }
+
+    pub fn with_grad_clip_norm(mut self, norm: f32) -> Self {
+        self.grad_clipping = Some(GradientClippingConfig::Norm(norm));
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MiniGptConfig {
+    pub vocab_size: usize,
+    pub d_model: usize,
+    pub num_blocks: usize,
+    pub max_position_embeddings: usize,
+    pub num_heads: usize,
+}
+
 fn should_log_training_step(step: usize, steps: usize, eval_interval: usize) -> bool {
     if eval_interval == 0 {
         return step + 1 == steps;
     }
 
-    steps <= eval_interval || step % eval_interval == 0 || step + 1 == steps
+    steps <= eval_interval || step.is_multiple_of(eval_interval) || step + 1 == steps
 }
 
 fn language_model_loss<B: Backend>(
@@ -97,6 +137,49 @@ fn log_training_progress<B: Backend>(
     );
 }
 
+fn train_language_model<B, M>(
+    mut model: M,
+    loader: &DataLoader,
+    value_loader: &DataLoader,
+    device: &B::Device,
+    params: TrainingParams,
+    forward: impl Fn(&M, Tensor<B, 2, Int>) -> Tensor<B, 3>,
+) -> Result<M, String>
+where
+    B: AutodiffBackend,
+    M: AutodiffModule<B>,
+{
+    let mut optimizer = AdamWConfig::new()
+        .with_grad_clipping(params.grad_clipping)
+        .init();
+    let loss_fn = CrossEntropyLossConfig::new().init(device);
+
+    for step in 0..params.steps {
+        let (inputs, targets) = loader.next_batch::<B>(device)?;
+        let loss = language_model_loss(&loss_fn, forward(&model, inputs), targets);
+
+        let grads = loss.backward();
+        let grads = GradientsParams::from_grads(grads, &model);
+        model = optimizer.step(params.learning_rate, model, grads);
+
+        if should_log_training_step(step, params.steps, params.eval_interval) {
+            let training_loss = loss.into_scalar();
+            let value_loss = value_loss(value_loader, device, &loss_fn, |inputs| {
+                forward(&model, inputs)
+            })?;
+            log_training_progress::<B>(
+                params.log_context,
+                step,
+                params.steps,
+                training_loss,
+                value_loss,
+            );
+        }
+    }
+
+    Ok(model)
+}
+
 pub struct LayerCache<B: Backend> {
     pub keys: Tensor<B, 4>,   // [B, NUM_HEADS, T_cached, HEAD_DIM]
     pub values: Tensor<B, 4>, // [B, NUM_HEADS, T_cached, HEAD_DIM]
@@ -145,34 +228,16 @@ impl<B: AutodiffBackend> TrivialModel<B> {
         device: &B::Device,
         vocab_size: usize,
         d_model: usize,
-        lr: f64,
-        steps: usize,
-        eval_interval: usize,
-        log_context: TrainingLogContext,
+        params: TrainingParams,
     ) -> Result<Self, String> {
-        let mut model = TrivialModel::<B>::new(vocab_size, d_model, device);
-        let mut optimizer = AdamWConfig::new().init();
-        let loss_fn = CrossEntropyLossConfig::new().init(device);
-
-        for step in 0..steps {
-            let (inputs, targets) = loader.next_batch::<B>(device)?;
-            let logits = model.forward(inputs);
-            let loss = language_model_loss(&loss_fn, logits, targets);
-
-            let grads = loss.backward();
-            let grads = GradientsParams::from_grads(grads, &model);
-            model = optimizer.step(lr, model, grads);
-
-            if should_log_training_step(step, steps, eval_interval) {
-                let training_loss = loss.into_scalar();
-                let value_loss = value_loss(value_loader, device, &loss_fn, |inputs| {
-                    model.forward(inputs)
-                })?;
-                log_training_progress::<B>(log_context, step, steps, training_loss, value_loss);
-            }
-        }
-
-        Ok(model)
+        train_language_model(
+            TrivialModel::<B>::new(vocab_size, d_model, device),
+            loader,
+            value_loader,
+            device,
+            params,
+            |model, inputs| model.forward(inputs),
+        )
     }
 }
 
@@ -210,34 +275,16 @@ impl<B: AutodiffBackend> SingleAttentionModel<B> {
         vocab_size: usize,
         d_model: usize,
         head_dim: usize,
-        lr: f64,
-        steps: usize,
-        eval_interval: usize,
-        log_context: TrainingLogContext,
+        params: TrainingParams,
     ) -> Result<Self, String> {
-        let mut model = SingleAttentionModel::<B>::new(vocab_size, d_model, head_dim, device);
-        let mut optimizer = AdamWConfig::new().init();
-        let loss_fn = CrossEntropyLossConfig::new().init(device);
-
-        for step in 0..steps {
-            let (inputs, targets) = loader.next_batch::<B>(device)?;
-            let logits = model.forward_tokens(inputs);
-            let loss = language_model_loss(&loss_fn, logits, targets);
-
-            let grads = loss.backward();
-            let grads = GradientsParams::from_grads(grads, &model);
-            model = optimizer.step(lr, model, grads);
-
-            if should_log_training_step(step, steps, eval_interval) {
-                let training_loss = loss.into_scalar();
-                let value_loss = value_loss(value_loader, device, &loss_fn, |inputs| {
-                    model.forward_tokens(inputs)
-                })?;
-                log_training_progress::<B>(log_context, step, steps, training_loss, value_loss);
-            }
-        }
-
-        Ok(model)
+        train_language_model(
+            SingleAttentionModel::<B>::new(vocab_size, d_model, head_dim, device),
+            loader,
+            value_loader,
+            device,
+            params,
+            |model, inputs| model.forward_tokens(inputs),
+        )
     }
 }
 
@@ -287,34 +334,16 @@ impl<B: AutodiffBackend> MultiAttentionModel<B> {
         vocab_size: usize,
         d_model: usize,
         num_heads: usize,
-        lr: f64,
-        steps: usize,
-        eval_interval: usize,
-        log_context: TrainingLogContext,
+        params: TrainingParams,
     ) -> Result<Self, String> {
-        let mut model = MultiAttentionModel::<B>::new(vocab_size, d_model, num_heads, device);
-        let mut optimizer = AdamWConfig::new().init();
-        let loss_fn = CrossEntropyLossConfig::new().init(device);
-
-        for step in 0..steps {
-            let (inputs, targets) = loader.next_batch::<B>(device)?;
-            let logits = model.forward_tokens(inputs);
-            let loss = language_model_loss(&loss_fn, logits, targets);
-
-            let grads = loss.backward();
-            let grads = GradientsParams::from_grads(grads, &model);
-            model = optimizer.step(lr, model, grads);
-
-            if should_log_training_step(step, steps, eval_interval) {
-                let training_loss = loss.into_scalar();
-                let value_loss = value_loss(value_loader, device, &loss_fn, |inputs| {
-                    model.forward_tokens(inputs)
-                })?;
-                log_training_progress::<B>(log_context, step, steps, training_loss, value_loss);
-            }
-        }
-
-        Ok(model)
+        train_language_model(
+            MultiAttentionModel::<B>::new(vocab_size, d_model, num_heads, device),
+            loader,
+            value_loader,
+            device,
+            params,
+            |model, inputs| model.forward_tokens(inputs),
+        )
     }
 }
 
@@ -597,8 +626,7 @@ impl<B: Backend> Block<B> {
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let x = x.clone() + self.attn.forward(self.ln1.forward(x));
-        let x = x.clone() + self.mlp.forward(self.ln2.forward(x));
-        x
+        x.clone() + self.mlp.forward(self.ln2.forward(x))
     }
 
     pub fn forward_with_weights(&self, x: Tensor<B, 3>) -> (Tensor<B, 3>, Tensor<B, 4>) {
@@ -848,49 +876,24 @@ impl<B: AutodiffBackend> MiniGpt<B> {
         loader: &DataLoader,
         value_loader: &DataLoader,
         device: &B::Device,
-        vocab_size: usize,
-        d_model: usize,
-        num_blocks: usize,
-        max_position_embeddings: usize,
-        num_heads: usize,
-        lr: f64,
-        steps: usize,
-        eval_interval: usize,
-        grad_clip_norm: f32,
-        log_context: TrainingLogContext,
+        config: MiniGptConfig,
+        params: TrainingParams,
     ) -> Result<Self, String> {
-        let mut model = MiniGpt::<B>::new(
-            vocab_size,
-            d_model,
-            num_blocks,
-            max_position_embeddings,
-            num_heads,
+        train_language_model(
+            MiniGpt::<B>::new(
+                config.vocab_size,
+                config.d_model,
+                config.num_blocks,
+                config.max_position_embeddings,
+                config.num_heads,
+                device,
+            ),
+            loader,
+            value_loader,
             device,
-        );
-        let mut optimizer = AdamWConfig::new()
-            .with_grad_clipping(Some(GradientClippingConfig::Norm(grad_clip_norm)))
-            .init();
-        let loss_fn = CrossEntropyLossConfig::new().init(device);
-
-        for step in 0..steps {
-            let (inputs, targets) = loader.next_batch::<B>(device)?;
-            let logits = model.forward_tokens(inputs);
-            let loss = language_model_loss(&loss_fn, logits, targets);
-
-            let grads = loss.backward();
-            let grads = GradientsParams::from_grads(grads, &model);
-            model = optimizer.step(lr, model, grads);
-
-            if should_log_training_step(step, steps, eval_interval) {
-                let training_loss = loss.into_scalar();
-                let value_loss = value_loss(value_loader, device, &loss_fn, |inputs| {
-                    model.forward_tokens(inputs)
-                })?;
-                log_training_progress::<B>(log_context, step, steps, training_loss, value_loss);
-            }
-        }
-
-        Ok(model)
+            params,
+            |model, inputs| model.forward_tokens(inputs),
+        )
     }
 }
 

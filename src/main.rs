@@ -7,8 +7,8 @@ pub mod utils;
 use crate::loader::data::DataLoader;
 use crate::model::persistence::{load_model, save_model};
 use crate::model::{
-    MiniGpt, MultiAttentionModel, SingleAttentionModel, TrainingLogContext, TrainingLogFormat,
-    TrivialModel,
+    MiniGpt, MiniGptConfig, MultiAttentionModel, SingleAttentionModel, TrainingLogContext,
+    TrainingLogFormat, TrainingParams, TrivialModel,
 };
 use crate::server::ServerState;
 use crate::tokenizer::char::CharTokenizer;
@@ -84,32 +84,40 @@ impl Hyperparameters {
     fn from_env() -> Result<Self> {
         let mut hyperparameters = Self::default();
 
-        if let Ok(train_steps) = env::var("RUSTY_GPT_TRAIN_STEPS") {
-            hyperparameters.train_steps = train_steps
-                .parse()
-                .with_context(|| format!("invalid RUSTY_GPT_TRAIN_STEPS value: {train_steps}"))?;
-        }
-        if let Ok(eval_interval) = env::var("RUSTY_GPT_EVAL_INTERVAL") {
-            hyperparameters.eval_interval = eval_interval.parse().with_context(|| {
-                format!("invalid RUSTY_GPT_EVAL_INTERVAL value: {eval_interval}")
-            })?;
-        }
-        if let Ok(generate_tokens) = env::var("RUSTY_GPT_GENERATE_TOKENS") {
-            hyperparameters.generate_tokens = generate_tokens.parse().with_context(|| {
-                format!("invalid RUSTY_GPT_GENERATE_TOKENS value: {generate_tokens}")
-            })?;
-        }
-        if let Ok(grad_clip_norm) = env::var("RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM") {
-            hyperparameters.minigpt_grad_clip_norm = grad_clip_norm.parse().with_context(|| {
-                format!("invalid RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM value: {grad_clip_norm}")
-            })?;
-        }
+        apply_env_override("RUSTY_GPT_TRAIN_STEPS", &mut hyperparameters.train_steps)?;
+        apply_env_override(
+            "RUSTY_GPT_EVAL_INTERVAL",
+            &mut hyperparameters.eval_interval,
+        )?;
+        apply_env_override(
+            "RUSTY_GPT_GENERATE_TOKENS",
+            &mut hyperparameters.generate_tokens,
+        )?;
+        apply_env_override(
+            "RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM",
+            &mut hyperparameters.minigpt_grad_clip_norm,
+        )?;
+
         if hyperparameters.minigpt_grad_clip_norm <= 0.0 {
             bail!("RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM must be greater than zero");
         }
 
         Ok(hyperparameters)
     }
+}
+
+fn apply_env_override<T>(name: &str, target: &mut T) -> Result<()>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    if let Ok(value) = env::var(name) {
+        *target = value
+            .parse()
+            .with_context(|| format!("invalid {name} value: {value}"))?;
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,14 +284,7 @@ where
     B::Device: Send + Sync + 'static,
 {
     let tokenizer = CharTokenizer::from_text(text);
-    let model = MiniGpt::<B>::new(
-        tokenizer.vocab_size(),
-        hyperparameters.embed_dim,
-        hyperparameters.num_layers,
-        hyperparameters.block_size,
-        hyperparameters.num_heads,
-        device,
-    );
+    let model = new_minigpt::<B>(tokenizer.vocab_size(), hyperparameters, device);
     let state = Arc::new(ServerState::new(model, tokenizer, device.clone()));
     let app = Router::new()
         .nest("/api", server::router::<B>())
@@ -365,14 +366,7 @@ fn run_interactive_minigpt_generation<B: burn::tensor::backend::AutodiffBackend>
     checkpoint_path: &Path,
 ) -> Result<()> {
     let tokenizer = CharTokenizer::from_text(text);
-    let template = MiniGpt::<B>::new(
-        tokenizer.vocab_size(),
-        hyperparameters.embed_dim,
-        hyperparameters.num_layers,
-        hyperparameters.block_size,
-        hyperparameters.num_heads,
-        device,
-    );
+    let template = new_minigpt::<B>(tokenizer.vocab_size(), hyperparameters, device);
     let model = load_model(template, checkpoint_path, device).with_context(|| {
         format!(
             "failed to load minigpt checkpoint from {:?}",
@@ -494,18 +488,26 @@ fn run_model_forward<B: Backend>(
             model.forward_tokens(input)
         }
         ModelChoice::MiniGpt => {
-            let model = MiniGpt::<B>::new(
-                vocab_size,
-                hyperparameters.embed_dim,
-                hyperparameters.num_layers,
-                hyperparameters.block_size,
-                hyperparameters.num_heads,
-                device,
-            );
+            let model = new_minigpt::<B>(vocab_size, hyperparameters, device);
             model.forward_tokens(input)
         }
         ModelChoice::Compare => unreachable!("compare should be expanded before forward dispatch"),
     }
+}
+
+fn new_minigpt<B: Backend>(
+    vocab_size: usize,
+    hyperparameters: Hyperparameters,
+    device: &B::Device,
+) -> MiniGpt<B> {
+    MiniGpt::<B>::new(
+        vocab_size,
+        hyperparameters.embed_dim,
+        hyperparameters.num_layers,
+        hyperparameters.block_size,
+        hyperparameters.num_heads,
+        device,
+    )
 }
 
 fn run_training_demo<B: burn::tensor::backend::AutodiffBackend>(
@@ -534,106 +536,103 @@ fn run_training_demo<B: burn::tensor::backend::AutodiffBackend>(
 
     for model_choice in model_choice.comparison_models() {
         println!("Training {} model", model_choice.label());
-        train_model::<B>(
+        train_model(TrainingRun::<B> {
             model_choice,
-            &data_loader,
-            &value_loader,
+            data_loader: &data_loader,
+            value_loader: &value_loader,
             device,
-            tokenizer.vocab_size(),
+            vocab_size: tokenizer.vocab_size(),
             hyperparameters,
             checkpoint_path,
             backend_label,
             log_format,
-        )?;
+        })?;
     }
 
     Ok(())
 }
 
-fn train_model<B: burn::tensor::backend::AutodiffBackend>(
+struct TrainingRun<'a, B: burn::tensor::backend::AutodiffBackend> {
     model_choice: ModelChoice,
-    data_loader: &DataLoader,
-    value_loader: &DataLoader,
-    device: &B::Device,
+    data_loader: &'a DataLoader,
+    value_loader: &'a DataLoader,
+    device: &'a B::Device,
     vocab_size: usize,
     hyperparameters: Hyperparameters,
-    checkpoint_path: &Path,
+    checkpoint_path: &'a Path,
     backend_label: &'static str,
     log_format: TrainingLogFormat,
-) -> Result<()> {
-    let log_context = TrainingLogContext {
-        backend: backend_label,
-        model: model_choice.label(),
-        format: log_format,
-    };
+}
 
-    match model_choice {
+fn train_model<B: burn::tensor::backend::AutodiffBackend>(run: TrainingRun<'_, B>) -> Result<()> {
+    let log_context = TrainingLogContext {
+        backend: run.backend_label,
+        model: run.model_choice.label(),
+        format: run.log_format,
+    };
+    let params = TrainingParams::new(
+        run.hyperparameters.learning_rate,
+        run.hyperparameters.train_steps,
+        run.hyperparameters.eval_interval,
+        log_context,
+    );
+
+    match run.model_choice {
         ModelChoice::Trivial => {
             let _model = TrivialModel::<B>::train(
-                data_loader,
-                value_loader,
-                device,
-                vocab_size,
-                hyperparameters.embed_dim,
-                hyperparameters.learning_rate,
-                hyperparameters.train_steps,
-                hyperparameters.eval_interval,
-                log_context,
+                run.data_loader,
+                run.value_loader,
+                run.device,
+                run.vocab_size,
+                run.hyperparameters.embed_dim,
+                params,
             )
             .map_err(anyhow::Error::msg)
             .context("failed to train trivial model")?;
         }
         ModelChoice::SingleAttention => {
             let _model = SingleAttentionModel::<B>::train(
-                data_loader,
-                value_loader,
-                device,
-                vocab_size,
-                hyperparameters.embed_dim,
-                hyperparameters.head_dim,
-                hyperparameters.learning_rate,
-                hyperparameters.train_steps,
-                hyperparameters.eval_interval,
-                log_context,
+                run.data_loader,
+                run.value_loader,
+                run.device,
+                run.vocab_size,
+                run.hyperparameters.embed_dim,
+                run.hyperparameters.head_dim,
+                params,
             )
             .map_err(anyhow::Error::msg)
             .context("failed to train single attention model")?;
         }
         ModelChoice::MultiAttention => {
             let _model = MultiAttentionModel::<B>::train(
-                data_loader,
-                value_loader,
-                device,
-                vocab_size,
-                hyperparameters.embed_dim,
-                hyperparameters.num_heads,
-                hyperparameters.learning_rate,
-                hyperparameters.train_steps,
-                hyperparameters.eval_interval,
-                log_context,
+                run.data_loader,
+                run.value_loader,
+                run.device,
+                run.vocab_size,
+                run.hyperparameters.embed_dim,
+                run.hyperparameters.num_heads,
+                params,
             )
             .map_err(anyhow::Error::msg)
             .context("failed to train multi attention model")?;
         }
         ModelChoice::MiniGpt => {
             let model = MiniGpt::<B>::train(
-                data_loader,
-                value_loader,
-                device,
-                vocab_size,
-                hyperparameters.embed_dim,
-                hyperparameters.num_layers,
-                hyperparameters.block_size,
-                hyperparameters.num_heads,
-                hyperparameters.learning_rate,
-                hyperparameters.train_steps,
-                hyperparameters.eval_interval,
-                hyperparameters.minigpt_grad_clip_norm,
-                log_context,
+                run.data_loader,
+                run.value_loader,
+                run.device,
+                MiniGptConfig {
+                    vocab_size: run.vocab_size,
+                    d_model: run.hyperparameters.embed_dim,
+                    num_blocks: run.hyperparameters.num_layers,
+                    max_position_embeddings: run.hyperparameters.block_size,
+                    num_heads: run.hyperparameters.num_heads,
+                },
+                params.with_grad_clip_norm(run.hyperparameters.minigpt_grad_clip_norm),
             )
             .map_err(anyhow::Error::msg)
             .context("failed to train minigpt model")?;
-            save_minigpt_checkpoint(model, checkpoint_path)?;
+            save_minigpt_checkpoint(model, run.checkpoint_path)?;
         }
         ModelChoice::Compare => unreachable!("compare should be expanded before training dispatch"),
     }

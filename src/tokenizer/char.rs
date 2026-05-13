@@ -11,16 +11,15 @@ impl CharTokenizer {
         let mut chars: Vec<char> = text.chars().collect();
         chars.sort();
         chars.dedup();
-        let id_to_char = chars.clone();
         let char_to_id = chars
-            .clone()
-            .into_iter()
+            .iter()
+            .copied()
             .enumerate()
             .map(|(i, c)| (c, i))
             .collect();
         Self {
             char_to_id,
-            id_to_char,
+            id_to_char: chars,
         }
     }
 

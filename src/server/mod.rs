@@ -75,22 +75,13 @@ where
     B: Backend,
 {
     if request.prompt.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "prompt must not be empty".to_string(),
-        ));
+        return Err(bad_request("prompt must not be empty"));
     }
     if request.max_tokens == 0 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "max_tokens must be greater than zero".to_string(),
-        ));
+        return Err(bad_request("max_tokens must be greater than zero"));
     }
     if request.temperature <= 0.0 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "temperature must be greater than zero".to_string(),
-        ));
+        return Err(bad_request("temperature must be greater than zero"));
     }
 
     let prompt_tokens = state
@@ -100,7 +91,7 @@ where
     let generated_tokens = state
         .model
         .generate(&prompt_tokens, request.max_tokens, &state.device)
-        .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+        .map_err(bad_request)?;
     let attention_tokens = context_window(&generated_tokens, state.model.block_size());
     let attention = attention_for_tokens(&state, attention_tokens)?;
     let generated = state.tokenizer.decode(&generated_tokens);
@@ -114,6 +105,10 @@ where
         tokens,
         attention,
     }))
+}
+
+fn bad_request(message: impl Into<String>) -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, message.into())
 }
 
 async fn info<B>(State(state): State<SharedServerState<B>>) -> Json<InfoResponse>
@@ -145,6 +140,13 @@ fn attention_for_tokens<B: Backend>(
     let mut attention_data = Vec::new();
     for (layer, attention) in attentions.into_iter().enumerate() {
         let [batch_size, num_heads, seq_len, _] = attention.shape().dims();
+        if batch_size != 1 {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("expected attention batch size 1, got {batch_size}"),
+            ));
+        }
+
         let values = attention.into_data().to_vec::<f32>().map_err(|err| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -168,13 +170,6 @@ fn attention_for_tokens<B: Backend>(
                 head,
                 weights,
             });
-        }
-
-        if batch_size != 1 {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("expected attention batch size 1, got {batch_size}"),
-            ));
         }
     }
 

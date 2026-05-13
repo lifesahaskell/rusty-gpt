@@ -1,6 +1,8 @@
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor, TensorData};
 
+pub type TokenBatch<B> = (Tensor<B, 2, Int>, Tensor<B, 2, Int>);
+
 pub struct DataLoader {
     pub tokens: Vec<usize>,
     pub block_size: usize, // context length, start with 64 or 128
@@ -8,10 +10,7 @@ pub struct DataLoader {
 }
 
 impl DataLoader {
-    pub fn next_batch<B: Backend>(
-        &self,
-        device: &B::Device,
-    ) -> Result<(Tensor<B, 2, Int>, Tensor<B, 2, Int>), String> {
+    pub fn next_batch<B: Backend>(&self, device: &B::Device) -> Result<TokenBatch<B>, String> {
         if self.tokens.len() <= self.block_size {
             return Err(format!(
                 "not enough tokens to build a batch: got {}, need at least {}",
