@@ -17,6 +17,12 @@ cargo run --release --features cuda -- --backend cuda --model minigpt
 # Train from a file on CUDA via the helper script
 ./scripts/run_training.sh --backend cuda --checkpoint checkpoints/mini_gpt data/input.txt
 
+# Train a BPE tokenizer from a corpus
+cargo run --bin train-tokenizer -- --corpus data/repo-source.txt --vocab-size 2048 --output checkpoints/tokenizer.json
+
+# Collect source files from another repository into data/<name>.txt
+cargo run --bin collect-source -- --repo /path/to/repo --output repo-source.txt
+
 # Compare all four model variants on the same batch
 cargo run -- --model compare
 
@@ -90,13 +96,47 @@ CLI flags and `RUSTY_GPT_*` environment variables can both drive runtime behavio
 
 Model-shape hyperparameters (`BLOCK_SIZE`, `BATCH_SIZE`, `EMBED_DIM`, `NUM_HEADS`, `NUM_LAYERS`, `DROPOUT`, `LEARNING_RATE`) are compile-time constants at the top of `src/main.rs`.
 
+## Tools
+
+The package includes small utility binaries under `src/bin/`.
+
+### BPE tokenizer training
+
+Train and save a byte-pair encoding tokenizer as JSON:
+
+```bash
+cargo run --bin train-tokenizer -- --corpus data/fafolang.txt --vocab-size 2048 --output checkpoints/tokenizer.json
+```
+
+Flags:
+
+| Flag | Required | Notes |
+|---|---:|---|
+| `--corpus <path>` | yes | UTF-8 text corpus used to learn BPE merges. |
+| `--vocab-size <n>` | yes | Target vocabulary size. Must be at least `256` because byte tokens are always present. |
+| `--output <path>` | yes | Tokenizer JSON output path. Parent directories are created. |
+
+### Source corpus collection
+
+Concatenate source files from a repository into a text file under `data/`:
+
+```bash
+cargo run --bin collect-source -- --repo /path/to/repo --output repo-source.txt
+```
+
+If `--output` is omitted, the tool writes `data/<repo-folder-name>.txt`. If `--output` includes a path, only the file name is used so output stays in `data/`.
+
+The collector includes common source/config/documentation extensions such as `rs`, `toml`, `ts`, `tsx`, `js`, `py`, `go`, `java`, `c`, `cpp`, `sh`, `html`, `css`, `json`, `yaml`, `sql`, and `md`. It skips generated or heavy directories including `.git`, `target`, `node_modules`, `dist`, `build`, `.next`, and `coverage`.
+
 ## CUDA troubleshooting
 
 The CUDA backend is compiled into the binary with `--features cuda`, but it still needs a working NVIDIA driver visible to the process. If `/api/info` works and `/api/generate` crashes with a `cudarc` error like `undefined symbol: cuCoredumpDeregisterCompleteCallback`, the loaded `libcuda.so.1` is older than the CUDA driver API expected by Burn/CubeCL. On WSL this usually means the Windows NVIDIA driver or WSL GPU integration needs to be updated; `nvidia-smi` should work from the same shell before using `--backend cuda`.
 
 ## What's in the box
 
+- `src/lib.rs` — shared library entry point used by the main app and utility binaries.
 - `src/tokenizer/char.rs` — deterministic character-level tokenizer.
+- `src/tokenizer/bpe.rs` — byte-pair encoding tokenizer trainer, JSON save/load, and shared tokenizer trait implementation.
 - `src/loader/data.rs` — random-window batch sampler returning `(x, y)` where `y` is `x` shifted by one token.
 - `src/model/mod.rs` — four models built up step by step:
   1. `TrivialModel` — embedding → linear head.
@@ -105,6 +145,8 @@ The CUDA backend is compiled into the binary with `--features cuda`, but it stil
   4. `MiniGpt` — token + position embeddings, a stack of pre-norm transformer blocks, final layer norm, LM head; supports greedy generation and attention introspection.
 - `src/model/persistence.rs` — `.mpk` checkpoint save/load via Burn's `NamedMpkFileRecorder`.
 - `src/server/mod.rs` — Axum router exposing `POST /api/generate` and `GET /api/info` with per-layer/per-head attention matrices.
+- `src/bin/train-tokenizer.rs` — CLI for training and saving BPE tokenizers.
+- `src/bin/collect-source.rs` — CLI for building code corpora from repositories.
 - `mini-gpt-ui/` — React/Vite UI that calls the GPT API.
 - `scripts/run_local.sh` — starts the local UI dev server.
 - `scripts/run_e2e_tests.sh` — runs the full-stack E2E suite.
