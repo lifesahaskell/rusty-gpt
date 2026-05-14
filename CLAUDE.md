@@ -182,7 +182,7 @@ Other invariants:
 
 - `src/bin/train-tokenizer.rs` — `cargo run --bin train-tokenizer -- --corpus <path-or-hf-uri> --vocab-size <n> --output <path.json>`. `--corpus` accepts a local path or an `hf://` dataset URI (same loader as `--input`). Emits JSON progress events to stdout. Required to produce the BPE tokenizer MiniGPT depends on.
 - `src/bin/collect-source.rs` — `cargo run --bin collect-source -- --repo <path> [--output <path>]`. Concatenates source files from a repo into `data/<name>.txt` for use as a training corpus.
-- `scripts/run_training.sh`, `scripts/run_local.sh`, `scripts/run_e2e_tests.sh`, `scripts/build_release_candidate.sh` — convenience wrappers; see the README for details. `run_training.sh` adds `--train-tokenizer` / `--tokenizer <path>` / `--vocab-size <n>` to optionally train the BPE tokenizer from the training input before model training.
+- `scripts/run_training.sh`, `scripts/run_local.sh`, `scripts/run_e2e_tests.sh`, `scripts/build_release_candidate.sh` — convenience wrappers; see the README for details. `run_training.sh` is fully flag-driven: `--backend`, `--model`, `--checkpoint`, `--tokenizer`, `--train-tokenizer`, `--vocab-size`, `--cargo-profile`, `--train-steps`, `--eval-interval`, `--prefetch-batches`, `--log-format`, `--benchmark*`, `--artifacts-dir`. The old `RUSTY_GPT_*` env overrides are **deprecated** — still honored (CLI flags win) but each emits a deprecation warning; use the equivalent flag instead.
 - `mini-gpt-ui/` — separate React frontend with its own README and toolchain. Calls the Rust server's `/api` routes. **Out of scope** for this memo; treat it as a black-box consumer.
 
 ## Gotchas
