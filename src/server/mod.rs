@@ -8,7 +8,7 @@ use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor, TensorData};
 use serde::{Deserialize, Serialize};
 
-use crate::model::MiniGpt;
+use crate::model::{GenerationOptions, MiniGpt};
 use crate::observability::{EventLogger, RuntimeEvent};
 use crate::tokenizer::RuntimeTokenizer;
 
@@ -60,6 +60,7 @@ pub struct GenerateRequest {
     pub prompt: String,
     pub max_tokens: usize,
     pub temperature: f32,
+    pub top_k: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -119,6 +120,13 @@ where
             started_at,
         ));
     }
+    if request.top_k == Some(0) {
+        return Err(logged_bad_request(
+            &state.logger,
+            "top_k must be greater than zero",
+            started_at,
+        ));
+    }
 
     let prompt_tokens = state
         .tokenizer
@@ -126,7 +134,13 @@ where
         .map_err(|err| logged_bad_request(&state.logger, err, started_at))?;
     let generated_tokens = state
         .model
-        .generate_with_cache(&prompt_tokens, request.max_tokens, &state.device)
+        .generate_with_cache_options(
+            &prompt_tokens,
+            request.max_tokens,
+            &state.device,
+            GenerationOptions::sampling(request.temperature, request.top_k)
+                .map_err(|err| logged_bad_request(&state.logger, err, started_at))?,
+        )
         .map_err(|err| logged_bad_request(&state.logger, err, started_at))?;
     let attention_tokens = context_window(&generated_tokens, state.model.block_size());
     let attention = attention_for_tokens(&state, attention_tokens)?;
@@ -306,6 +320,7 @@ mod tests {
                 prompt: "ab".to_string(),
                 max_tokens: 1,
                 temperature: 1.0,
+                top_k: Some(3),
             }),
         )
         .await;
@@ -341,6 +356,7 @@ mod tests {
                 prompt: "".to_string(),
                 max_tokens: 1,
                 temperature: 1.0,
+                top_k: None,
             }),
         )
         .await;
@@ -352,5 +368,30 @@ mod tests {
         assert_eq!(400, rejected["status"]);
         assert_eq!("prompt must not be empty", rejected["reason"]);
         assert!(rejected.get("prompt").is_none());
+    }
+
+    #[tokio::test]
+    async fn generate_rejects_zero_top_k() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let model = MiniGpt::<TestBackend>::new(7, 8, 1, 6, 2, &device);
+        let tokenizer = RuntimeTokenizer::char_from_text("abcdefg");
+        let logger = EventLogger::stdout(LogFormat::Plain);
+        let state = Arc::new(ServerState::new(model, tokenizer, device, logger));
+
+        let response = generate(
+            State(state),
+            Json(GenerateRequest {
+                prompt: "ab".to_string(),
+                max_tokens: 1,
+                temperature: 1.0,
+                top_k: Some(0),
+            }),
+        )
+        .await;
+
+        let err = response.expect_err("zero top_k should be rejected");
+        assert_eq!(StatusCode::BAD_REQUEST, err.0);
+        assert_eq!("top_k must be greater than zero", err.1);
     }
 }

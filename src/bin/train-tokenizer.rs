@@ -3,6 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use rusty_gpt::loader::huggingface;
 use rusty_gpt::tokenizer::Tokenizer;
 use rusty_gpt::tokenizer::bpe::BpeTrainer;
 use serde::Serialize;
@@ -16,15 +17,14 @@ struct TokenizerSavedEvent {
 
 #[derive(Debug, PartialEq, Eq)]
 struct Config {
-    corpus: PathBuf,
+    corpus: String,
     vocab_size: usize,
     output: PathBuf,
 }
 
 fn main() -> Result<()> {
     let config = parse_args(env::args().skip(1))?;
-    let corpus = fs::read_to_string(&config.corpus)
-        .with_context(|| format!("failed to read corpus from {:?}", config.corpus))?;
+    let corpus = load_corpus_text(&config.corpus)?;
     let tokenizer = BpeTrainer::new(config.vocab_size).train_with_observer(&corpus, |event| {
         log_json(&event);
     });
@@ -75,7 +75,7 @@ where
                 let value = args
                     .get(index + 1)
                     .context("--corpus requires a path to a text file")?;
-                corpus = Some(PathBuf::from(value));
+                corpus = Some(value.to_string());
                 index += 2;
             }
             "--vocab-size" => {
@@ -115,6 +115,14 @@ where
     Ok(config)
 }
 
+fn load_corpus_text(source: &str) -> Result<String> {
+    if let Some(text) = huggingface::load_text_from_uri(source)? {
+        return Ok(text);
+    }
+
+    fs::read_to_string(source).with_context(|| format!("failed to read corpus from {source}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,7 +141,7 @@ mod tests {
 
         assert_eq!(
             Config {
-                corpus: PathBuf::from("data/fafolang.txt"),
+                corpus: "data/fafolang.txt".to_string(),
                 vocab_size: 2048,
                 output: PathBuf::from("checkpoints/tokenizer.json"),
             },

@@ -9,10 +9,14 @@ use burn::backend::ndarray::{NdArray, NdArrayDevice};
 use burn::tensor::backend::Backend;
 use rusty_gpt::loader::data::DataLoader;
 use rusty_gpt::loader::huggingface;
-use rusty_gpt::model::persistence::{load_model, save_model};
+use rusty_gpt::model::persistence::{
+    CheckpointMetadata, CheckpointModelShape, CheckpointTokenizer, CheckpointTrainingMetrics,
+    CheckpointTrainingRun, load_model_with_metadata_validation, save_checkpoint_metadata,
+    save_model, sha256_file_hex,
+};
 use rusty_gpt::model::{
     MiniGpt, MiniGptConfig, MultiAttentionModel, SingleAttentionModel, TrainingLogContext,
-    TrainingParams, TrivialModel,
+    TrainingOutcome, TrainingParams, TrivialModel,
 };
 use rusty_gpt::observability::{EventLogger, LogFormat, RuntimeEvent};
 use rusty_gpt::server;
@@ -24,6 +28,7 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -53,7 +58,7 @@ const GENERATE_TOKENS: usize = 80; // number of tokens to generate in interactiv
 const MINIGPT_GRAD_CLIP_NORM: f32 = 1.0; // max gradient norm for minigpt training
 const PREFETCH_BATCHES: usize = 2; // number of prepared CPU batches queued ahead of training
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Hyperparameters {
     block_size: usize,
     batch_size: usize,
@@ -91,41 +96,189 @@ impl Default for Hyperparameters {
 }
 
 impl Hyperparameters {
+    #[cfg(test)]
     fn from_env() -> Result<Self> {
+        Self::from_env_and_overrides(
+            &RuntimeEnv::from_process_env(),
+            &HyperparameterOverrides::default(),
+        )
+    }
+
+    fn from_env_and_overrides(
+        env: &RuntimeEnv,
+        overrides: &HyperparameterOverrides,
+    ) -> Result<Self> {
         let mut hyperparameters = Self::default();
 
-        apply_env_override("RUSTY_GPT_TRAIN_STEPS", &mut hyperparameters.train_steps)?;
-        apply_env_override(
+        apply_optional_override(
+            "RUSTY_GPT_BLOCK_SIZE",
+            env.block_size.as_deref(),
+            &mut hyperparameters.block_size,
+        )?;
+        apply_optional_override(
+            "RUSTY_GPT_BATCH_SIZE",
+            env.batch_size.as_deref(),
+            &mut hyperparameters.batch_size,
+        )?;
+        apply_optional_override(
+            "RUSTY_GPT_EMBED_DIM",
+            env.embed_dim.as_deref(),
+            &mut hyperparameters.embed_dim,
+        )?;
+        apply_optional_override(
+            "RUSTY_GPT_NUM_HEADS",
+            env.num_heads.as_deref(),
+            &mut hyperparameters.num_heads,
+        )?;
+        apply_optional_override(
+            "RUSTY_GPT_NUM_LAYERS",
+            env.num_layers.as_deref(),
+            &mut hyperparameters.num_layers,
+        )?;
+        apply_optional_override(
+            "RUSTY_GPT_DROPOUT",
+            env.dropout.as_deref(),
+            &mut hyperparameters.dropout,
+        )?;
+        apply_optional_override(
+            "RUSTY_GPT_LEARNING_RATE",
+            env.learning_rate.as_deref(),
+            &mut hyperparameters.learning_rate,
+        )?;
+        apply_optional_override(
+            "RUSTY_GPT_TRAIN_STEPS",
+            env.train_steps.as_deref(),
+            &mut hyperparameters.train_steps,
+        )?;
+        apply_optional_override(
             "RUSTY_GPT_EVAL_INTERVAL",
+            env.eval_interval.as_deref(),
             &mut hyperparameters.eval_interval,
         )?;
-        apply_env_override(
+        apply_optional_override(
             "RUSTY_GPT_GENERATE_TOKENS",
+            env.generate_tokens.as_deref(),
             &mut hyperparameters.generate_tokens,
         )?;
-        apply_env_override(
+        apply_optional_override(
             "RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM",
+            env.minigpt_grad_clip_norm.as_deref(),
             &mut hyperparameters.minigpt_grad_clip_norm,
         )?;
-        apply_env_override(
+        apply_optional_override(
             "RUSTY_GPT_PREFETCH_BATCHES",
+            env.prefetch_batches.as_deref(),
             &mut hyperparameters.prefetch_batches,
         )?;
 
-        if hyperparameters.minigpt_grad_clip_norm <= 0.0 {
+        overrides.apply_to(&mut hyperparameters);
+        hyperparameters.validate()?;
+        Ok(hyperparameters)
+    }
+
+    fn validate(&mut self) -> Result<()> {
+        if self.block_size == 0 {
+            bail!("block_size must be greater than zero");
+        }
+        if self.batch_size == 0 {
+            bail!("batch_size must be greater than zero");
+        }
+        if self.embed_dim == 0 {
+            bail!("embed_dim must be greater than zero");
+        }
+        if self.num_heads == 0 {
+            bail!("num_heads must be greater than zero");
+        }
+        if self.num_layers == 0 {
+            bail!("num_layers must be greater than zero");
+        }
+        if !self.embed_dim.is_multiple_of(self.num_heads) {
+            bail!("embed_dim must be divisible by num_heads");
+        }
+        if !(0.0..1.0).contains(&self.dropout) {
+            bail!("dropout must be >= 0 and < 1");
+        }
+        if self.learning_rate <= 0.0 {
+            bail!("learning_rate must be greater than zero");
+        }
+        if self.train_steps == 0 {
+            bail!("train_steps must be greater than zero");
+        }
+        if self.generate_tokens == 0 {
+            bail!("generate_tokens must be greater than zero");
+        }
+        if self.minigpt_grad_clip_norm <= 0.0 {
             bail!("RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM must be greater than zero");
         }
 
-        Ok(hyperparameters)
+        self.head_dim = self.embed_dim / self.num_heads;
+        Ok(())
     }
 }
 
-fn apply_env_override<T>(name: &str, target: &mut T) -> Result<()>
+#[derive(Debug, Clone, Default, PartialEq)]
+struct HyperparameterOverrides {
+    block_size: Option<usize>,
+    batch_size: Option<usize>,
+    embed_dim: Option<usize>,
+    num_heads: Option<usize>,
+    num_layers: Option<usize>,
+    dropout: Option<f64>,
+    learning_rate: Option<f64>,
+    train_steps: Option<usize>,
+    eval_interval: Option<usize>,
+    generate_tokens: Option<usize>,
+    minigpt_grad_clip_norm: Option<f32>,
+    prefetch_batches: Option<usize>,
+}
+
+impl HyperparameterOverrides {
+    fn apply_to(&self, hyperparameters: &mut Hyperparameters) {
+        if let Some(value) = self.block_size {
+            hyperparameters.block_size = value;
+        }
+        if let Some(value) = self.batch_size {
+            hyperparameters.batch_size = value;
+        }
+        if let Some(value) = self.embed_dim {
+            hyperparameters.embed_dim = value;
+        }
+        if let Some(value) = self.num_heads {
+            hyperparameters.num_heads = value;
+        }
+        if let Some(value) = self.num_layers {
+            hyperparameters.num_layers = value;
+        }
+        if let Some(value) = self.dropout {
+            hyperparameters.dropout = value;
+        }
+        if let Some(value) = self.learning_rate {
+            hyperparameters.learning_rate = value;
+        }
+        if let Some(value) = self.train_steps {
+            hyperparameters.train_steps = value;
+        }
+        if let Some(value) = self.eval_interval {
+            hyperparameters.eval_interval = value;
+        }
+        if let Some(value) = self.generate_tokens {
+            hyperparameters.generate_tokens = value;
+        }
+        if let Some(value) = self.minigpt_grad_clip_norm {
+            hyperparameters.minigpt_grad_clip_norm = value;
+        }
+        if let Some(value) = self.prefetch_batches {
+            hyperparameters.prefetch_batches = value;
+        }
+    }
+}
+
+fn apply_optional_override<T>(name: &str, value: Option<&str>, target: &mut T) -> Result<()>
 where
     T: std::str::FromStr,
     T::Err: std::error::Error + Send + Sync + 'static,
 {
-    if let Ok(value) = env::var(name) {
+    if let Some(value) = value {
         *target = value
             .parse()
             .with_context(|| format!("invalid {name} value: {value}"))?;
@@ -202,10 +355,11 @@ fn main() -> Result<()> {
             benchmark_gen_lens: env::var(BENCHMARK_GEN_LENS_ENV).ok(),
             benchmark_warmups: env::var(BENCHMARK_WARMUPS_ENV).ok(),
             benchmark_iterations: env::var(BENCHMARK_ITERATIONS_ENV).ok(),
+            ..RuntimeEnv::from_process_env()
         },
     )?;
     let text = load_input_text(&config.input_path)?;
-    let hyperparameters = Hyperparameters::from_env()?;
+    let hyperparameters = config.hyperparameters;
     let logger = EventLogger::stdout(config.log_format);
     logger.log(RuntimeEvent::AppConfigured {
         backend: config.backend.label().to_string(),
@@ -261,6 +415,7 @@ fn main() -> Result<()> {
                 benchmark_config: &config.benchmark_config,
                 logger,
                 checkpoint_path: &config.checkpoint_path,
+                input_source: &config.input_path.display().to_string(),
             },
         ),
         #[cfg(feature = "cuda")]
@@ -281,6 +436,7 @@ fn main() -> Result<()> {
                     logger,
                     benchmark_generation: config.benchmark_generation,
                     benchmark_config: config.benchmark_config,
+                    input_source: config.input_path.display().to_string(),
                 },
             )
         }
@@ -294,6 +450,7 @@ struct CpuDemoOptions<'a> {
     benchmark_config: &'a BenchmarkConfig,
     logger: EventLogger,
     checkpoint_path: &'a Path,
+    input_source: &'a str,
 }
 
 fn run_cpu_demo(
@@ -335,6 +492,7 @@ fn run_cpu_demo(
                 logger: options.logger,
                 benchmark_generation: options.benchmark_generation,
                 benchmark_config: options.benchmark_config.clone(),
+                input_source: options.input_source.to_string(),
             },
         )
     }
@@ -480,12 +638,21 @@ fn load_minigpt_checkpoint<B: Backend>(
     logger: &EventLogger,
 ) -> Result<MiniGpt<B>> {
     let started_at = Instant::now();
-    let model = load_model(template, checkpoint_path, device).with_context(|| {
-        format!(
-            "failed to load minigpt checkpoint from {:?}",
-            checkpoint_path.with_extension("mpk")
-        )
-    })?;
+    let expected_shape = CheckpointModelShape {
+        vocab_size: template.vocab_size(),
+        block_size: template.block_size(),
+        embed_dim: template.d_model(),
+        num_heads: template.num_heads(),
+        num_layers: template.num_layers(),
+    };
+    let model =
+        load_model_with_metadata_validation(template, checkpoint_path, &expected_shape, device)
+            .with_context(|| {
+                format!(
+                    "failed to load minigpt checkpoint from {:?}",
+                    checkpoint_path.with_extension("mpk")
+                )
+            })?;
     logger.log(RuntimeEvent::CheckpointLoaded {
         path: checkpoint_path.with_extension("mpk").display().to_string(),
         elapsed_ms: started_at.elapsed().as_millis(),
@@ -723,6 +890,7 @@ where
             logger: options.logger.clone(),
             benchmark_generation: options.benchmark_generation,
             benchmark_config: options.benchmark_config.clone(),
+            input_source: &options.input_source,
         })?;
     }
 
@@ -735,6 +903,7 @@ struct TrainingDemoOptions {
     logger: EventLogger,
     benchmark_generation: bool,
     benchmark_config: BenchmarkConfig,
+    input_source: String,
 }
 
 struct TrainingRun<'a, B: burn::tensor::backend::AutodiffBackend> {
@@ -749,6 +918,7 @@ struct TrainingRun<'a, B: burn::tensor::backend::AutodiffBackend> {
     logger: EventLogger,
     benchmark_generation: bool,
     benchmark_config: BenchmarkConfig,
+    input_source: &'a str,
 }
 
 fn train_model<B>(run: TrainingRun<'_, B>) -> Result<()>
@@ -780,7 +950,7 @@ where
                 total_steps: run.hyperparameters.train_steps,
             });
             let started_at = Instant::now();
-            let _model = TrivialModel::<B>::train(
+            let outcome = TrivialModel::<B>::train(
                 run.data_loader,
                 run.value_loader,
                 run.device,
@@ -790,12 +960,7 @@ where
             )
             .map_err(anyhow::Error::msg)
             .context("failed to train trivial model")?;
-            run.logger.log(RuntimeEvent::TrainingCompleted {
-                backend: run.backend_label.to_string(),
-                model: run.model_choice.label().to_string(),
-                total_steps: run.hyperparameters.train_steps,
-                elapsed_ms: started_at.elapsed().as_millis(),
-            });
+            log_training_completed(&run, started_at, outcome.metrics);
         }
         ModelChoice::SingleAttention => {
             run.logger.log(RuntimeEvent::TrainingStarted {
@@ -807,7 +972,7 @@ where
                 total_steps: run.hyperparameters.train_steps,
             });
             let started_at = Instant::now();
-            let _model = SingleAttentionModel::<B>::train(
+            let outcome = SingleAttentionModel::<B>::train(
                 run.data_loader,
                 run.value_loader,
                 run.device,
@@ -818,12 +983,7 @@ where
             )
             .map_err(anyhow::Error::msg)
             .context("failed to train single attention model")?;
-            run.logger.log(RuntimeEvent::TrainingCompleted {
-                backend: run.backend_label.to_string(),
-                model: run.model_choice.label().to_string(),
-                total_steps: run.hyperparameters.train_steps,
-                elapsed_ms: started_at.elapsed().as_millis(),
-            });
+            log_training_completed(&run, started_at, outcome.metrics);
         }
         ModelChoice::MultiAttention => {
             run.logger.log(RuntimeEvent::TrainingStarted {
@@ -835,7 +995,7 @@ where
                 total_steps: run.hyperparameters.train_steps,
             });
             let started_at = Instant::now();
-            let _model = MultiAttentionModel::<B>::train(
+            let outcome = MultiAttentionModel::<B>::train(
                 run.data_loader,
                 run.value_loader,
                 run.device,
@@ -846,12 +1006,7 @@ where
             )
             .map_err(anyhow::Error::msg)
             .context("failed to train multi attention model")?;
-            run.logger.log(RuntimeEvent::TrainingCompleted {
-                backend: run.backend_label.to_string(),
-                model: run.model_choice.label().to_string(),
-                total_steps: run.hyperparameters.train_steps,
-                elapsed_ms: started_at.elapsed().as_millis(),
-            });
+            log_training_completed(&run, started_at, outcome.metrics);
         }
         ModelChoice::MiniGpt => {
             run.logger.log(RuntimeEvent::TrainingStarted {
@@ -863,7 +1018,7 @@ where
                 total_steps: run.hyperparameters.train_steps,
             });
             let started_at = Instant::now();
-            let model = MiniGpt::<B>::train(
+            let outcome = MiniGpt::<B>::train(
                 run.data_loader,
                 run.value_loader,
                 run.device,
@@ -878,18 +1033,18 @@ where
             )
             .map_err(anyhow::Error::msg)
             .context("failed to train minigpt model")?;
-            run.logger.log(RuntimeEvent::TrainingCompleted {
-                backend: run.backend_label.to_string(),
-                model: run.model_choice.label().to_string(),
-                total_steps: run.hyperparameters.train_steps,
-                elapsed_ms: started_at.elapsed().as_millis(),
-            });
+            log_training_completed(&run, started_at, outcome.metrics);
             if run.benchmark_generation {
-                benchmark_generation(&model, run.device, &run.benchmark_config, &run.logger)
-                    .map_err(anyhow::Error::msg)
-                    .context("failed to benchmark minigpt generation")?;
+                benchmark_generation(
+                    &outcome.model,
+                    run.device,
+                    &run.benchmark_config,
+                    &run.logger,
+                )
+                .map_err(anyhow::Error::msg)
+                .context("failed to benchmark minigpt generation")?;
             }
-            save_minigpt_checkpoint(model, run.checkpoint_path, &run.logger)?;
+            save_minigpt_checkpoint(outcome, run.checkpoint_path, &run)?;
         }
         ModelChoice::Compare => unreachable!("compare should be expanded before training dispatch"),
     }
@@ -897,10 +1052,27 @@ where
     Ok(())
 }
 
+fn log_training_completed<B>(
+    run: &TrainingRun<'_, B>,
+    started_at: Instant,
+    metrics: rusty_gpt::model::TrainingMetrics,
+) where
+    B: burn::tensor::backend::AutodiffBackend,
+{
+    run.logger.log(RuntimeEvent::TrainingCompleted {
+        backend: run.backend_label.to_string(),
+        model: run.model_choice.label().to_string(),
+        total_steps: run.hyperparameters.train_steps,
+        elapsed_ms: started_at.elapsed().as_millis(),
+        final_value_loss: metrics.final_value_loss,
+        final_perplexity: metrics.final_perplexity,
+    });
+}
+
 fn save_minigpt_checkpoint<B: burn::tensor::backend::AutodiffBackend>(
-    model: MiniGpt<B>,
+    outcome: TrainingOutcome<MiniGpt<B>>,
     checkpoint_path: &Path,
-    logger: &EventLogger,
+    run: &TrainingRun<'_, B>,
 ) -> Result<()> {
     if let Some(parent) = checkpoint_path.parent()
         && !parent.as_os_str().is_empty()
@@ -910,14 +1082,72 @@ fn save_minigpt_checkpoint<B: burn::tensor::backend::AutodiffBackend>(
     }
 
     let started_at = Instant::now();
-    save_model(model, checkpoint_path)
+    save_model(outcome.model, checkpoint_path)
         .with_context(|| format!("failed to save minigpt checkpoint to {:?}", checkpoint_path))?;
-    logger.log(RuntimeEvent::CheckpointSaved {
+    save_checkpoint_metadata(checkpoint_path, &checkpoint_metadata(run, outcome.metrics)?)
+        .with_context(|| {
+            format!(
+                "failed to save checkpoint metadata for {:?}",
+                checkpoint_path
+            )
+        })?;
+    run.logger.log(RuntimeEvent::CheckpointSaved {
         path: checkpoint_path.with_extension("mpk").display().to_string(),
         elapsed_ms: started_at.elapsed().as_millis(),
     });
 
     Ok(())
+}
+
+fn checkpoint_metadata<B: burn::tensor::backend::AutodiffBackend>(
+    run: &TrainingRun<'_, B>,
+    metrics: rusty_gpt::model::TrainingMetrics,
+) -> Result<CheckpointMetadata> {
+    let tokenizer_path = PathBuf::from(minigpt_tokenizer_path());
+    Ok(CheckpointMetadata {
+        version: 1,
+        created_at_utc: chrono::Utc::now().to_rfc3339(),
+        git_commit: current_git_commit(),
+        input_source: run.input_source.to_string(),
+        model_shape: CheckpointModelShape {
+            vocab_size: run.vocab_size,
+            block_size: run.hyperparameters.block_size,
+            embed_dim: run.hyperparameters.embed_dim,
+            num_heads: run.hyperparameters.num_heads,
+            num_layers: run.hyperparameters.num_layers,
+        },
+        tokenizer: CheckpointTokenizer {
+            path: tokenizer_path.display().to_string(),
+            sha256: sha256_file_hex(&tokenizer_path)?,
+            vocab_size: run.vocab_size,
+        },
+        training: CheckpointTrainingRun {
+            backend: run.backend_label.to_string(),
+            train_tokens: run.data_loader.tokens.len(),
+            value_tokens: run.value_loader.tokens.len(),
+            batch_size: run.hyperparameters.batch_size,
+            learning_rate: run.hyperparameters.learning_rate,
+            train_steps: run.hyperparameters.train_steps,
+            eval_interval: run.hyperparameters.eval_interval,
+            grad_clip_norm: run.hyperparameters.minigpt_grad_clip_norm,
+            prefetch_batches: run.hyperparameters.prefetch_batches,
+        },
+        final_metrics: CheckpointTrainingMetrics {
+            final_value_loss: metrics.final_value_loss,
+            final_perplexity: metrics.final_perplexity,
+        },
+    })
+}
+
+fn current_git_commit() -> Option<String> {
+    Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|commit| commit.trim().to_string())
+        .filter(|commit| !commit.is_empty())
 }
 
 fn split_training_and_value_tokens(
@@ -947,12 +1177,13 @@ fn split_training_and_value_tokens(
     ))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct RuntimeConfig {
     backend: BackendChoice,
     model: ModelChoice,
     input_path: PathBuf,
     checkpoint_path: PathBuf,
+    hyperparameters: Hyperparameters,
     interactive: bool,
     benchmark_generation: bool,
     load_checkpoint: bool,
@@ -975,6 +1206,47 @@ struct RuntimeEnv {
     benchmark_gen_lens: Option<String>,
     benchmark_warmups: Option<String>,
     benchmark_iterations: Option<String>,
+    block_size: Option<String>,
+    batch_size: Option<String>,
+    embed_dim: Option<String>,
+    num_heads: Option<String>,
+    num_layers: Option<String>,
+    dropout: Option<String>,
+    learning_rate: Option<String>,
+    train_steps: Option<String>,
+    eval_interval: Option<String>,
+    generate_tokens: Option<String>,
+    minigpt_grad_clip_norm: Option<String>,
+    prefetch_batches: Option<String>,
+}
+
+impl RuntimeEnv {
+    fn from_process_env() -> Self {
+        Self {
+            backend: env::var("RUSTY_GPT_BACKEND").ok(),
+            input: env::var("RUSTY_GPT_INPUT").ok(),
+            model: env::var("RUSTY_GPT_MODEL").ok(),
+            checkpoint: env::var("RUSTY_GPT_MINIGPT_CHECKPOINT").ok(),
+            server_addr: env::var("RUSTY_GPT_SERVER_ADDR").ok(),
+            log_format: env::var(LOG_FORMAT_ENV).ok(),
+            benchmark_prompt_lens: env::var(BENCHMARK_PROMPT_LENS_ENV).ok(),
+            benchmark_gen_lens: env::var(BENCHMARK_GEN_LENS_ENV).ok(),
+            benchmark_warmups: env::var(BENCHMARK_WARMUPS_ENV).ok(),
+            benchmark_iterations: env::var(BENCHMARK_ITERATIONS_ENV).ok(),
+            block_size: env::var("RUSTY_GPT_BLOCK_SIZE").ok(),
+            batch_size: env::var("RUSTY_GPT_BATCH_SIZE").ok(),
+            embed_dim: env::var("RUSTY_GPT_EMBED_DIM").ok(),
+            num_heads: env::var("RUSTY_GPT_NUM_HEADS").ok(),
+            num_layers: env::var("RUSTY_GPT_NUM_LAYERS").ok(),
+            dropout: env::var("RUSTY_GPT_DROPOUT").ok(),
+            learning_rate: env::var("RUSTY_GPT_LEARNING_RATE").ok(),
+            train_steps: env::var("RUSTY_GPT_TRAIN_STEPS").ok(),
+            eval_interval: env::var("RUSTY_GPT_EVAL_INTERVAL").ok(),
+            generate_tokens: env::var("RUSTY_GPT_GENERATE_TOKENS").ok(),
+            minigpt_grad_clip_norm: env::var("RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM").ok(),
+            prefetch_batches: env::var("RUSTY_GPT_PREFETCH_BATCHES").ok(),
+        }
+    }
 }
 
 fn load_input_text(path: &Path) -> Result<String> {
@@ -1027,6 +1299,7 @@ where
     let mut arg_benchmark_gen_lens = None;
     let mut arg_benchmark_warmups = None;
     let mut arg_benchmark_iterations = None;
+    let mut hyperparameter_overrides = HyperparameterOverrides::default();
     let mut interactive = false;
     let mut benchmark_generation = false;
     let mut load_checkpoint = false;
@@ -1106,6 +1379,66 @@ where
                 arg_benchmark_iterations = Some(value.as_str());
                 index += 2;
             }
+            "--block-size" => {
+                hyperparameter_overrides.block_size =
+                    Some(parse_arg_value(&args, index, "--block-size")?);
+                index += 2;
+            }
+            "--batch-size" => {
+                hyperparameter_overrides.batch_size =
+                    Some(parse_arg_value(&args, index, "--batch-size")?);
+                index += 2;
+            }
+            "--embed-dim" => {
+                hyperparameter_overrides.embed_dim =
+                    Some(parse_arg_value(&args, index, "--embed-dim")?);
+                index += 2;
+            }
+            "--num-heads" => {
+                hyperparameter_overrides.num_heads =
+                    Some(parse_arg_value(&args, index, "--num-heads")?);
+                index += 2;
+            }
+            "--num-layers" => {
+                hyperparameter_overrides.num_layers =
+                    Some(parse_arg_value(&args, index, "--num-layers")?);
+                index += 2;
+            }
+            "--dropout" => {
+                hyperparameter_overrides.dropout =
+                    Some(parse_arg_value(&args, index, "--dropout")?);
+                index += 2;
+            }
+            "--learning-rate" => {
+                hyperparameter_overrides.learning_rate =
+                    Some(parse_arg_value(&args, index, "--learning-rate")?);
+                index += 2;
+            }
+            "--train-steps" => {
+                hyperparameter_overrides.train_steps =
+                    Some(parse_arg_value(&args, index, "--train-steps")?);
+                index += 2;
+            }
+            "--eval-interval" => {
+                hyperparameter_overrides.eval_interval =
+                    Some(parse_arg_value(&args, index, "--eval-interval")?);
+                index += 2;
+            }
+            "--generate-tokens" => {
+                hyperparameter_overrides.generate_tokens =
+                    Some(parse_arg_value(&args, index, "--generate-tokens")?);
+                index += 2;
+            }
+            "--grad-clip-norm" => {
+                hyperparameter_overrides.minigpt_grad_clip_norm =
+                    Some(parse_arg_value(&args, index, "--grad-clip-norm")?);
+                index += 2;
+            }
+            "--prefetch-batches" => {
+                hyperparameter_overrides.prefetch_batches =
+                    Some(parse_arg_value(&args, index, "--prefetch-batches")?);
+                index += 2;
+            }
             "--interactive-generate" => {
                 interactive = true;
                 index += 1;
@@ -1165,6 +1498,7 @@ where
             .with_context(|| format!("invalid benchmark iterations '{value}'"))?;
     }
     benchmark_config.validate()?;
+    let hyperparameters = Hyperparameters::from_env_and_overrides(&env, &hyperparameter_overrides)?;
 
     Ok(RuntimeConfig {
         backend,
@@ -1179,6 +1513,7 @@ where
                 .or(env.checkpoint.as_deref())
                 .unwrap_or(DEFAULT_MINIGPT_CHECKPOINT_PATH),
         ),
+        hyperparameters,
         interactive,
         benchmark_generation,
         load_checkpoint,
@@ -1196,6 +1531,19 @@ fn default_log_format(backend: BackendChoice) -> LogFormat {
         #[cfg(feature = "cuda")]
         BackendChoice::Cuda => LogFormat::Json,
     }
+}
+
+fn parse_arg_value<T>(args: &[String], index: usize, name: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    let value = args
+        .get(index + 1)
+        .with_context(|| format!("{name} requires a value"))?;
+    value
+        .parse()
+        .with_context(|| format!("invalid {name} value: {value}"))
 }
 
 fn parse_backend_name(name: &str) -> Result<BackendChoice> {
@@ -1383,6 +1731,65 @@ mod tests {
     }
 
     #[test]
+    fn hyperparameter_args_take_precedence_over_env() {
+        let config = parse_runtime_config_with_checkpoint(
+            [
+                "--block-size".to_string(),
+                "64".to_string(),
+                "--batch-size".to_string(),
+                "4".to_string(),
+                "--embed-dim".to_string(),
+                "32".to_string(),
+                "--num-heads".to_string(),
+                "4".to_string(),
+                "--num-layers".to_string(),
+                "2".to_string(),
+                "--learning-rate".to_string(),
+                "0.001".to_string(),
+            ],
+            RuntimeEnv {
+                block_size: Some("128".to_string()),
+                batch_size: Some("16".to_string()),
+                embed_dim: Some("64".to_string()),
+                num_heads: Some("8".to_string()),
+                num_layers: Some("3".to_string()),
+                learning_rate: Some("0.01".to_string()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(64, config.hyperparameters.block_size);
+        assert_eq!(4, config.hyperparameters.batch_size);
+        assert_eq!(32, config.hyperparameters.embed_dim);
+        assert_eq!(4, config.hyperparameters.num_heads);
+        assert_eq!(8, config.hyperparameters.head_dim);
+        assert_eq!(2, config.hyperparameters.num_layers);
+        assert_eq!(0.001, config.hyperparameters.learning_rate);
+    }
+
+    #[test]
+    fn hyperparameters_reject_invalid_head_split() {
+        let err = parse_runtime_config(
+            [
+                "--embed-dim".to_string(),
+                "30".to_string(),
+                "--num-heads".to_string(),
+                "8".to_string(),
+            ],
+            None,
+            None,
+            None,
+        )
+        .expect_err("invalid head split should fail");
+
+        assert!(
+            err.to_string()
+                .contains("embed_dim must be divisible by num_heads")
+        );
+    }
+
+    #[test]
     fn hyperparameters_reject_non_positive_minigpt_gradient_clip_norm() {
         // SAFETY: This unit test mutates process environment while not relying on
         // other environment-sensitive code in parallel.
@@ -1435,7 +1842,9 @@ mod tests {
             .join("rusty-gpt-checkpoint-tests")
             .join(format!("mini-gpt-{}", std::process::id()));
         let saved_path = checkpoint_path.with_extension("mpk");
+        let metadata_path = checkpoint_path.with_extension("metadata.json");
         let _ = fs::remove_file(&saved_path);
+        let _ = fs::remove_file(&metadata_path);
 
         let hyperparameters = Hyperparameters {
             block_size: 4,
@@ -1471,6 +1880,7 @@ mod tests {
                 logger: EventLogger::stdout(LogFormat::Plain),
                 benchmark_generation: false,
                 benchmark_config: BenchmarkConfig::default(),
+                input_source: "test".to_string(),
             },
         )
         .unwrap();
@@ -1485,8 +1895,14 @@ mod tests {
             "expected training to save {:?}",
             saved_path
         );
+        assert!(
+            metadata_path.is_file(),
+            "expected training to save {:?}",
+            metadata_path
+        );
 
         let _ = fs::remove_file(saved_path);
+        let _ = fs::remove_file(metadata_path);
     }
 
     #[cfg(feature = "cuda")]
@@ -1807,6 +2223,7 @@ mod tests {
                 logger: EventLogger::stdout(LogFormat::Plain),
                 benchmark_generation: true,
                 benchmark_config: BenchmarkConfig::default(),
+                input_source: "test".to_string(),
             },
         )
         .expect_err("benchmarking should require minigpt or compare");

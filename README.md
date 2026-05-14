@@ -21,6 +21,9 @@ cargo run --release --features cuda --bin rusty-gpt -- --backend cuda --model mi
 # Train from a Hugging Face dataset through the datasets-server rows API
 ./scripts/run_training.sh --backend cuda 'hf://Salesforce/wikitext?config=wikitext-2-raw-v1&split=train&column=text&rows=1000'
 
+# Train a tokenizer from the same input before MiniGPT training
+./scripts/run_training.sh --train-tokenizer --tokenizer checkpoints/wikitext-tokenizer.json --vocab-size 2048 'hf://Salesforce/wikitext?config=wikitext-2-raw-v1&split=train&column=text&rows=1000'
+
 # Train a BPE tokenizer from a corpus
 cargo run --bin train-tokenizer -- --corpus data/repo-source.txt --vocab-size 2048 --output checkpoints/tokenizer.json
 
@@ -98,11 +101,18 @@ CLI flags and `RUSTY_GPT_*` environment variables can both drive runtime behavio
 | `--load-checkpoint` | — | off | With `--serve`, loads MiniGPT API weights from `--checkpoint`. The checkpoint must match the model shape and tokenizer vocabulary from `--input`. |
 | `--load-latest-checkpoint` | — | off | With `--serve`, loads the newest `.mpk` file in `checkpoints/` as the MiniGPT API weights. |
 | `--server-addr <host:port>` | `RUSTY_GPT_SERVER_ADDR` | `127.0.0.1:8787` | Address used by `--serve`. |
-| — | `RUSTY_GPT_TRAIN_STEPS` | `1000` | |
-| — | `RUSTY_GPT_EVAL_INTERVAL` | `100` | `0` ⇒ log only the final step. |
-| — | `RUSTY_GPT_PREFETCH_BATCHES` | `2` | Number of prepared CPU batches queued ahead of training. |
-| — | `RUSTY_GPT_GENERATE_TOKENS` | `80` | |
-| — | `RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM` | `1.0` | Must be > 0. |
+| `--block-size <n>` | `RUSTY_GPT_BLOCK_SIZE` | `128` | Context length. Must be > 0. |
+| `--batch-size <n>` | `RUSTY_GPT_BATCH_SIZE` | `32` | Training batch size. Must be > 0. |
+| `--embed-dim <n>` | `RUSTY_GPT_EMBED_DIM` | `128` | Model width. Must be divisible by `num_heads`. |
+| `--num-heads <n>` | `RUSTY_GPT_NUM_HEADS` | `4` | Attention heads. Must be > 0. |
+| `--num-layers <n>` | `RUSTY_GPT_NUM_LAYERS` | `4` | Transformer block count. Must be > 0. |
+| `--dropout <p>` | `RUSTY_GPT_DROPOUT` | `0.0` | Reserved model dropout setting. Must be `>= 0` and `< 1`. |
+| `--learning-rate <n>` | `RUSTY_GPT_LEARNING_RATE` | `1e-4` | Optimizer learning rate. |
+| `--train-steps <n>` | `RUSTY_GPT_TRAIN_STEPS` | `1000` | Must be > 0. |
+| `--eval-interval <n>` | `RUSTY_GPT_EVAL_INTERVAL` | `100` | `0` ⇒ log only the final step. |
+| `--prefetch-batches <n>` | `RUSTY_GPT_PREFETCH_BATCHES` | `2` | Number of prepared CPU batches queued ahead of training. |
+| `--generate-tokens <n>` | `RUSTY_GPT_GENERATE_TOKENS` | `80` | Interactive generation token count. |
+| `--grad-clip-norm <n>` | `RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM` | `1.0` | Must be > 0. |
 | `--benchmark-prompt-lens <list>` | `RUSTY_GPT_BENCHMARK_PROMPT_LENS` | `10,50,100` | Comma-separated prompt lengths for `--benchmark-generation`. |
 | `--benchmark-gen-lens <list>` | `RUSTY_GPT_BENCHMARK_GEN_LENS` | `50,100,200` | Comma-separated generated-token lengths for `--benchmark-generation`. |
 | `--benchmark-warmups <n>` | `RUSTY_GPT_BENCHMARK_WARMUPS` | `1` | Warmup iterations per benchmark case. |
@@ -111,6 +121,10 @@ CLI flags and `RUSTY_GPT_*` environment variables can both drive runtime behavio
 `scripts/run_training.sh` defaults to `cargo run --release`. Set `RUSTY_GPT_CARGO_PROFILE=dev` for faster debug builds while iterating. For `--backend cuda`, the script defaults to JSON logs, `RUSTY_GPT_PREFETCH_BATCHES=2`, and `RUSTY_GPT_EVAL_INTERVAL=500` unless those values are already provided.
 
 `--input` also accepts Hugging Face dataset URIs in the form `hf://<dataset-id>?config=<config>&split=<split>&column=<column>&rows=<n>&offset=<n>`. The loader uses the Hugging Face datasets-server rows API, concatenates the selected column with newlines, and defaults to `config=default`, `split=train`, `column=text`, `rows=1000`, and `offset=0`.
+
+`POST /api/generate` accepts optional `top_k` in addition to `prompt`, `max_tokens`, and `temperature`. API requests require `temperature > 0`; internal greedy generation remains available for benchmarks and tests via zero-temperature generation options.
+
+MiniGPT checkpoint saves now write a sidecar `<checkpoint>.metadata.json` next to the Burn `.mpk` weights. The metadata records model shape, tokenizer path/hash, input source, training hyperparameters, final value loss, final perplexity, and git commit when available. Legacy `.mpk` checkpoints without metadata still load; checkpoints with metadata fail fast if the requested model shape is incompatible.
 
 Model-shape hyperparameters (`BLOCK_SIZE`, `BATCH_SIZE`, `EMBED_DIM`, `NUM_HEADS`, `NUM_LAYERS`, `DROPOUT`, `LEARNING_RATE`) are compile-time constants at the top of `src/main.rs`.
 

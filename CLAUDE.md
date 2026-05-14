@@ -71,13 +71,20 @@ CLI flags (in `src/main.rs`) and environment variables both work; CLI takes prec
 | `--server-addr` | `RUSTY_GPT_SERVER_ADDR` | `host:port`, default `127.0.0.1:8787` |
 | `--benchmark-generation` | — | flag; runs naive-vs-cached generation benchmarks (requires `--model minigpt` or `compare`) |
 | — | `RUSTY_GPT_BPE_TOKENIZER` | path, default `checkpoints/tokenizer.json` |
-| — | `RUSTY_GPT_TRAIN_STEPS` | int |
-| — | `RUSTY_GPT_EVAL_INTERVAL` | int (0 ⇒ log only final step) |
-| — | `RUSTY_GPT_GENERATE_TOKENS` | int |
-| — | `RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM` | f32, must be > 0 |
-| — | `RUSTY_GPT_PREFETCH_BATCHES` | int, default `2` (CPU prefetch queue depth) |
+| `--block-size` | `RUSTY_GPT_BLOCK_SIZE` | int, default `128`; must be > 0 |
+| `--batch-size` | `RUSTY_GPT_BATCH_SIZE` | int, default `32`; must be > 0 |
+| `--embed-dim` | `RUSTY_GPT_EMBED_DIM` | int, default `128`; must be divisible by `num_heads` |
+| `--num-heads` | `RUSTY_GPT_NUM_HEADS` | int, default `4`; must be > 0 |
+| `--num-layers` | `RUSTY_GPT_NUM_LAYERS` | int, default `4`; must be > 0 |
+| `--dropout` | `RUSTY_GPT_DROPOUT` | f64, default `0.0`; must be `>= 0` and `< 1` |
+| `--learning-rate` | `RUSTY_GPT_LEARNING_RATE` | f64, default `1e-4`; must be > 0 |
+| `--train-steps` | `RUSTY_GPT_TRAIN_STEPS` | int, must be > 0 |
+| `--eval-interval` | `RUSTY_GPT_EVAL_INTERVAL` | int (0 ⇒ log only final step) |
+| `--generate-tokens` | `RUSTY_GPT_GENERATE_TOKENS` | int, must be > 0 |
+| `--grad-clip-norm` | `RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM` | f32, must be > 0 |
+| `--prefetch-batches` | `RUSTY_GPT_PREFETCH_BATCHES` | int, default `2` (CPU prefetch queue depth) |
 
-The model-shape and training hyperparameters (`BLOCK_SIZE`, `BATCH_SIZE`, `EMBED_DIM`, `NUM_HEADS`, `NUM_LAYERS`, `DROPOUT`, `LEARNING_RATE`, `TRAIN_STEPS`, `EVAL_INTERVAL`, `GENERATE_TOKENS`, `MINIGPT_GRAD_CLIP_NORM`, `PREFETCH_BATCHES`) are compile-time constants at the top of `src/main.rs` (lines 34–46) — edit and rebuild to change them. The trailing five also accept env-var overrides at runtime.
+The constants at the top of `src/main.rs` are only the **defaults** for the `Hyperparameters` struct. Every model-shape and training hyperparameter is now overridable at runtime via a CLI flag or `RUSTY_GPT_*` env var (CLI wins). `Hyperparameters::from_env_and_overrides` resolves env → CLI overrides → `validate()`, which enforces the positivity/divisibility rules and recomputes `head_dim = embed_dim / num_heads`. Invalid combinations (e.g. `embed_dim` not divisible by `num_heads`) fail at config-parse time.
 
 ## Architecture
 
@@ -144,6 +151,8 @@ Every `train(...)` impl follows the same shape (see `TrivialModel::train` for th
 
 Train/value split: `split_training_and_value_tokens` reserves the **last 10%** for value loss and shrinks the value-loader's block size if the tail is shorter than `block_size`.
 
+Each `train(...)` returns `TrainingOutcome<M> { model, metrics }` where `TrainingMetrics` carries `final_value_loss` and `final_perplexity`. The `TrainingProgress` / `TrainingCompleted` observability events were extended to log perplexity.
+
 ### Tokenizer & batching invariants
 
 The tokenizer is chosen by model:
@@ -167,16 +176,19 @@ Other invariants:
 
 `GenerateResponse` includes per-layer/per-head attention matrices (`AttentionData { layer, head, weights }`) for visualization; the React UI in `mini-gpt-ui/` is the primary consumer.
 
+`POST /api/generate` accepts an optional `top_k` alongside `prompt`, `max_tokens`, and `temperature`. API requests require `temperature > 0` (sampling); `top_k == 0` is rejected. Greedy decoding (`GenerationOptions::greedy()`, temperature 0) stays available internally for benchmarks/tests. Generation entry points have `_with_options` variants in `src/model/mod.rs`.
+
 ### Sibling tooling
 
-- `src/bin/train-tokenizer.rs` — `cargo run --bin train-tokenizer -- --corpus <path> --vocab-size <n> --output <path.json>`. Emits JSON progress events to stdout. Required to produce the BPE tokenizer MiniGPT depends on.
+- `src/bin/train-tokenizer.rs` — `cargo run --bin train-tokenizer -- --corpus <path-or-hf-uri> --vocab-size <n> --output <path.json>`. `--corpus` accepts a local path or an `hf://` dataset URI (same loader as `--input`). Emits JSON progress events to stdout. Required to produce the BPE tokenizer MiniGPT depends on.
 - `src/bin/collect-source.rs` — `cargo run --bin collect-source -- --repo <path> [--output <path>]`. Concatenates source files from a repo into `data/<name>.txt` for use as a training corpus.
-- `scripts/run_training.sh`, `scripts/run_local.sh`, `scripts/run_e2e_tests.sh`, `scripts/build_release_candidate.sh` — convenience wrappers; see the README for details.
+- `scripts/run_training.sh`, `scripts/run_local.sh`, `scripts/run_e2e_tests.sh`, `scripts/build_release_candidate.sh` — convenience wrappers; see the README for details. `run_training.sh` adds `--train-tokenizer` / `--tokenizer <path>` / `--vocab-size <n>` to optionally train the BPE tokenizer from the training input before model training.
 - `mini-gpt-ui/` — separate React frontend with its own README and toolchain. Calls the Rust server's `/api` routes. **Out of scope** for this memo; treat it as a black-box consumer.
 
 ## Gotchas
 
 - **Checkpoints**: Burn's `NamedMpkFileRecorder` appends `.mpk` automatically. Pass the path **without** the extension (e.g. `checkpoints/mini_gpt`); the actual file is `checkpoints/mini_gpt.mpk`. `--checkpoint` and `RUSTY_GPT_MINIGPT_CHECKPOINT` follow the same convention. The `checkpoints/` directory is gitignored.
+- **Checkpoint metadata sidecar**: MiniGPT saves also write `<checkpoint>.metadata.json` next to the `.mpk` weights (`src/model/persistence.rs`). It records model shape, tokenizer path + sha256, input source, training hyperparameters, final value loss/perplexity, and git commit. `load_model_with_metadata_validation` fails fast on a model-shape mismatch; legacy `.mpk` files without a sidecar still load unchecked.
 - **MiniGPT needs `checkpoints/tokenizer.json` to exist** — there is no auto-train fallback. If absent, `main.rs::load_minigpt_tokenizer` returns an error containing the exact `train-tokenizer` command to run. `RUSTY_GPT_BPE_TOKENIZER` overrides the path.
 - **Server routes live under `/api`** — `src/server/mod.rs` defines `/generate` and `/info`, but `run_http_server` nests them under `/api`. `curl http://localhost:8787/generate` returns 404; the right path is `/api/generate`.
 - **`--serve` only hosts MiniGPT** — the other three model variants are training-only and cannot be served. `--load-checkpoint` and `--load-latest-checkpoint` are mutually exclusive (parse-time error).

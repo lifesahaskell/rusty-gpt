@@ -41,6 +41,17 @@ pub struct TrainingParams {
     pub log_context: TrainingLogContext,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrainingMetrics {
+    pub final_value_loss: f64,
+    pub final_perplexity: f64,
+}
+
+pub struct TrainingOutcome<M> {
+    pub model: M,
+    pub metrics: TrainingMetrics,
+}
+
 impl TrainingParams {
     pub fn new(
         learning_rate: f64,
@@ -76,6 +87,31 @@ pub struct MiniGptConfig {
     pub num_blocks: usize,
     pub max_position_embeddings: usize,
     pub num_heads: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GenerationOptions {
+    pub temperature: f32,
+    pub top_k: Option<usize>,
+}
+
+impl GenerationOptions {
+    pub fn greedy() -> Self {
+        Self {
+            temperature: 0.0,
+            top_k: None,
+        }
+    }
+
+    pub fn sampling(temperature: f32, top_k: Option<usize>) -> Result<Self, String> {
+        if temperature <= 0.0 {
+            return Err("temperature must be greater than zero".to_string());
+        }
+        if top_k == Some(0) {
+            return Err("top_k must be greater than zero".to_string());
+        }
+        Ok(Self { temperature, top_k })
+    }
 }
 
 fn should_log_training_step(step: usize, steps: usize, eval_interval: usize) -> bool {
@@ -150,6 +186,10 @@ struct TrainingThroughput {
     step_ms_mean: f64,
 }
 
+fn perplexity(value_loss: f64) -> f64 {
+    value_loss.exp()
+}
+
 impl TrainingThroughput {
     fn from_progress(
         completed_steps: usize,
@@ -170,23 +210,22 @@ impl TrainingThroughput {
     }
 }
 
-fn log_training_progress<B: Backend>(
+fn log_training_progress(
     context: TrainingLogContext,
     step: usize,
     steps: usize,
-    training_loss: B::FloatElem,
-    value_loss: B::FloatElem,
+    training_loss: f64,
+    value_loss: f64,
     throughput: TrainingThroughput,
-) where
-    B::FloatElem: Into<f64>,
-{
+) {
     context.logger.log(RuntimeEvent::TrainingProgress {
         backend: context.backend.to_string(),
         model: context.model.to_string(),
         step,
         total_steps: steps,
-        training_loss: training_loss.into(),
-        value_loss: value_loss.into(),
+        training_loss,
+        value_loss,
+        value_perplexity: perplexity(value_loss),
         elapsed_ms: throughput.elapsed_ms,
         tokens_per_second: throughput.tokens_per_second,
         steps_per_second: throughput.steps_per_second,
@@ -223,7 +262,7 @@ fn train_language_model<B, M>(
     device: &B::Device,
     params: TrainingParams,
     forward: impl Fn(&M, Tensor<B, 2, Int>) -> Tensor<B, 3>,
-) -> Result<M, String>
+) -> Result<TrainingOutcome<M>, String>
 where
     B: AutodiffBackend,
     M: AutodiffModule<B>,
@@ -235,6 +274,7 @@ where
         .init();
     let loss_fn = CrossEntropyLossConfig::new().init(device);
     let started_at = std::time::Instant::now();
+    let mut final_value_loss = None;
 
     for step in 0..params.steps {
         let (inputs, targets) = training_batches.next_batch::<B>(device)?;
@@ -251,11 +291,13 @@ where
                 loader.block_size,
                 started_at.elapsed().as_millis(),
             );
-            let training_loss = loss.into_scalar();
-            let value_loss = value_loss(value_loader, device, &loss_fn, |inputs| {
+            let training_loss = loss.into_scalar().into();
+            let value_loss: f64 = value_loss(value_loader, device, &loss_fn, |inputs| {
                 forward(&model, inputs)
-            })?;
-            log_training_progress::<B>(
+            })?
+            .into();
+            final_value_loss = Some(value_loss);
+            log_training_progress(
                 params.log_context.clone(),
                 step,
                 params.steps,
@@ -266,7 +308,20 @@ where
         }
     }
 
-    Ok(model)
+    let final_value_loss = final_value_loss.unwrap_or_else(|| {
+        value_loss(value_loader, device, &loss_fn, |inputs| {
+            forward(&model, inputs)
+        })
+        .map(Into::into)
+        .unwrap_or(f64::NAN)
+    });
+    Ok(TrainingOutcome {
+        model,
+        metrics: TrainingMetrics {
+            final_value_loss,
+            final_perplexity: perplexity(final_value_loss),
+        },
+    })
 }
 
 pub struct LayerCache<B: Backend> {
@@ -322,7 +377,7 @@ where
         vocab_size: usize,
         d_model: usize,
         params: TrainingParams,
-    ) -> Result<Self, String> {
+    ) -> Result<TrainingOutcome<Self>, String> {
         train_language_model(
             TrivialModel::<B>::new(vocab_size, d_model, device),
             loader,
@@ -373,7 +428,7 @@ where
         d_model: usize,
         head_dim: usize,
         params: TrainingParams,
-    ) -> Result<Self, String> {
+    ) -> Result<TrainingOutcome<Self>, String> {
         train_language_model(
             SingleAttentionModel::<B>::new(vocab_size, d_model, head_dim, device),
             loader,
@@ -436,7 +491,7 @@ where
         d_model: usize,
         num_heads: usize,
         params: TrainingParams,
-    ) -> Result<Self, String> {
+    ) -> Result<TrainingOutcome<Self>, String> {
         train_language_model(
             MultiAttentionModel::<B>::new(vocab_size, d_model, num_heads, device),
             loader,
@@ -856,6 +911,10 @@ impl<B: Backend> MiniGpt<B> {
         self.blocks.first().map(Block::num_heads).unwrap_or(0)
     }
 
+    pub fn d_model(&self) -> usize {
+        self.token_embed.weight.shape().dims::<2>()[1]
+    }
+
     pub fn block_size(&self) -> usize {
         self.max_position_embeddings
     }
@@ -992,6 +1051,15 @@ impl<B: Backend> MiniGpt<B> {
     }
 
     pub fn generate_cached(&self, prompt: Tensor<B, 2, Int>, max_new: usize) -> Vec<usize> {
+        self.generate_cached_with_options(prompt, max_new, GenerationOptions::greedy())
+    }
+
+    pub fn generate_cached_with_options(
+        &self,
+        prompt: Tensor<B, 2, Int>,
+        max_new: usize,
+        options: GenerationOptions,
+    ) -> Vec<usize> {
         if max_new == 0 {
             return Vec::new();
         }
@@ -1000,14 +1068,14 @@ impl<B: Backend> MiniGpt<B> {
         let mut cache = KvCache::empty(self.num_layers());
         let (logits, new_cache) = self.forward_with_cache(prompt, cache);
         cache = new_cache;
-        let mut next_token = Self::greedy_last_token(logits);
+        let mut next_token = Self::select_last_token(logits, options);
         let mut generated = vec![next_token];
 
         for _ in 1..max_new {
             let next_input = Tensor::from_data([[next_token as i64]], &device);
             let (logits, new_cache) = self.forward_with_cache(next_input, cache);
             cache = new_cache;
-            next_token = Self::greedy_last_token(logits);
+            next_token = Self::select_last_token(logits, options);
             generated.push(next_token);
         }
 
@@ -1019,6 +1087,21 @@ impl<B: Backend> MiniGpt<B> {
         prompt: &[usize],
         max_new_tokens: usize,
         device: &B::Device,
+    ) -> Result<Vec<usize>, String> {
+        self.generate_with_cache_options(
+            prompt,
+            max_new_tokens,
+            device,
+            GenerationOptions::greedy(),
+        )
+    }
+
+    pub fn generate_with_cache_options(
+        &self,
+        prompt: &[usize],
+        max_new_tokens: usize,
+        device: &B::Device,
+        options: GenerationOptions,
     ) -> Result<Vec<usize>, String> {
         self.validate_generation_prompt(prompt)?;
 
@@ -1032,7 +1115,7 @@ impl<B: Backend> MiniGpt<B> {
             let prompt_data: Vec<i64> = context.iter().map(|&token| token as i64).collect();
             let prompt_tensor =
                 Tensor::from_data(TensorData::new(prompt_data, [1, context.len()]), device);
-            let generated = self.generate_cached(prompt_tensor, chunk_len);
+            let generated = self.generate_cached_with_options(prompt_tensor, chunk_len, options);
 
             remaining -= generated.len();
             output.extend(generated);
@@ -1055,17 +1138,75 @@ impl<B: Backend> MiniGpt<B> {
         Ok(())
     }
 
-    fn greedy_last_token(logits: Tensor<B, 3>) -> usize {
+    fn select_last_token(logits: Tensor<B, 3>, options: GenerationOptions) -> usize {
         let [_batch_size, seq_len, vocab_size] = logits.shape().dims();
         let logits = logits.into_data().to_vec::<f32>().unwrap();
         let last_position_start = (seq_len - 1) * vocab_size;
-        logits[last_position_start..last_position_start + vocab_size]
+        let last_logits = &logits[last_position_start..last_position_start + vocab_size];
+        if options.temperature == 0.0 {
+            return Self::greedy_from_logits(last_logits);
+        }
+
+        sample_from_logits(
+            last_logits,
+            options.temperature,
+            options.top_k,
+            rand::random(),
+        )
+    }
+
+    fn greedy_from_logits(logits: &[f32]) -> usize {
+        logits
             .iter()
             .enumerate()
             .max_by(|(_, left), (_, right)| left.total_cmp(right))
             .map(|(token, _)| token)
             .expect("vocab size should be greater than zero")
     }
+}
+
+fn sample_from_logits(
+    logits: &[f32],
+    temperature: f32,
+    top_k: Option<usize>,
+    random_unit: f32,
+) -> usize {
+    if temperature <= 0.0 {
+        return logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(token, _)| token)
+            .expect("vocab size should be greater than zero");
+    }
+
+    let mut candidates: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+    candidates.sort_by(|(_, left), (_, right)| right.total_cmp(left));
+    if let Some(top_k) = top_k {
+        candidates.truncate(top_k.min(candidates.len()).max(1));
+    }
+    let max_logit = candidates
+        .iter()
+        .map(|(_, logit)| *logit)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let weights: Vec<f32> = candidates
+        .iter()
+        .map(|(_, logit)| ((*logit - max_logit) / temperature).exp())
+        .collect();
+    let total: f32 = weights.iter().sum();
+    if !total.is_finite() || total <= 0.0 {
+        return candidates[0].0;
+    }
+
+    let mut threshold = random_unit.clamp(0.0, 0.999_999) * total;
+    for ((token, _), weight) in candidates.iter().zip(weights) {
+        if threshold <= weight {
+            return *token;
+        }
+        threshold -= weight;
+    }
+
+    candidates.last().map(|(token, _)| *token).unwrap_or(0)
 }
 
 impl<B> MiniGpt<B>
@@ -1079,7 +1220,7 @@ where
         device: &B::Device,
         config: MiniGptConfig,
         params: TrainingParams,
-    ) -> Result<Self, String> {
+    ) -> Result<TrainingOutcome<Self>, String> {
         train_language_model(
             MiniGpt::<B>::new(
                 config.vocab_size,
@@ -1644,6 +1785,37 @@ mod tests {
         let uncached = model.generate(&prompt, 3, &device).unwrap();
 
         assert_eq!(uncached[prompt.len()..], generated);
+    }
+
+    #[test]
+    fn sampling_options_reject_invalid_values() {
+        assert!(GenerationOptions::sampling(0.0, None).is_err());
+        assert!(GenerationOptions::sampling(1.0, Some(0)).is_err());
+        assert_eq!(
+            GenerationOptions {
+                temperature: 1.0,
+                top_k: Some(3),
+            },
+            GenerationOptions::sampling(1.0, Some(3)).unwrap()
+        );
+    }
+
+    #[test]
+    fn top_k_sampling_restricts_candidates() {
+        let logits = [10.0, 9.0, 1.0, 0.0];
+
+        for random_unit in [0.0, 0.25, 0.75, 0.99] {
+            let token = sample_from_logits(&logits, 1.0, Some(2), random_unit);
+
+            assert!(token < 2, "top-k sampling selected token {token}");
+        }
+    }
+
+    #[test]
+    fn zero_temperature_sampling_is_greedy() {
+        let logits = [1.0, 5.0, 3.0];
+
+        assert_eq!(1, sample_from_logits(&logits, 0.0, Some(1), 0.99));
     }
 
     #[test]
