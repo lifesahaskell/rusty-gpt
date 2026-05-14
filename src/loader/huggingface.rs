@@ -2,9 +2,12 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use reqwest::StatusCode;
+use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -17,6 +20,12 @@ const DEFAULT_ROWS: usize = 1_000;
 const MAX_PAGE_ROWS: usize = 100;
 const DEFAULT_CACHE_DIR: &str = "data/huggingface-cache";
 const CACHE_DIR_ENV: &str = "RUSTY_GPT_HF_DATASET_CACHE";
+const REQUEST_DELAY_ENV: &str = "RUSTY_GPT_HF_REQUEST_DELAY_MS";
+const MAX_RETRIES_ENV: &str = "RUSTY_GPT_HF_MAX_RETRIES";
+const RETRY_BASE_DELAY_ENV: &str = "RUSTY_GPT_HF_RETRY_BASE_DELAY_MS";
+const DEFAULT_REQUEST_DELAY_MS: u64 = 250;
+const DEFAULT_MAX_RETRIES: usize = 6;
+const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HuggingFaceDatasetSpec {
@@ -92,6 +101,16 @@ impl HuggingFaceDatasetSpec {
             self.offset, self.rows,
         ))
     }
+
+    fn page_cache_path(&self, cache_dir: &Path, offset: usize, length: usize) -> PathBuf {
+        let digest = Sha256::digest(self.cache_key());
+        let dataset = safe_cache_component(&self.dataset);
+        let config = safe_cache_component(&self.config);
+        let split = safe_cache_component(&self.split);
+        cache_dir.join("pages").join(format!(
+            "{dataset}__{config}__{split}__offset-{offset}__length-{length}__{digest:x}.json"
+        ))
+    }
 }
 
 pub fn load_text_from_uri(input: &str) -> Result<Option<String>> {
@@ -133,7 +152,7 @@ fn load_text_cached(spec: &HuggingFaceDatasetSpec, cache_dir: &Path) -> Result<S
         }
     }
 
-    let text = load_text(spec)?;
+    let text = load_text(spec, cache_dir)?;
     if let Some(parent) = cache_path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -154,12 +173,14 @@ fn load_text_cached(spec: &HuggingFaceDatasetSpec, cache_dir: &Path) -> Result<S
     Ok(text)
 }
 
-fn load_text(spec: &HuggingFaceDatasetSpec) -> Result<String> {
+fn load_text(spec: &HuggingFaceDatasetSpec, cache_dir: &Path) -> Result<String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(60))
         .user_agent("rusty-gpt/0.1 huggingface-dataset-loader")
         .build()
         .context("failed to build Hugging Face dataset HTTP client")?;
+    let retry_policy = RetryPolicy::from_env();
+    let request_delay = env_duration_ms(REQUEST_DELAY_ENV, DEFAULT_REQUEST_DELAY_MS);
 
     let mut output = String::new();
     let mut fetched_rows = 0usize;
@@ -169,14 +190,8 @@ fn load_text(spec: &HuggingFaceDatasetSpec) -> Result<String> {
     while fetched_rows < spec.rows {
         let length = (spec.rows - fetched_rows).min(MAX_PAGE_ROWS);
         let url = spec.rows_url(offset, length);
-        let response = client
-            .get(&url)
-            .send()
-            .with_context(|| format!("failed to fetch Hugging Face dataset rows from {url}"))?
-            .error_for_status()
-            .with_context(|| format!("Hugging Face dataset rows request failed for {url}"))?
-            .json::<RowsResponse>()
-            .with_context(|| format!("failed to decode Hugging Face dataset rows from {url}"))?;
+        let response = load_rows_page(&client, &url, spec, cache_dir, offset, length, retry_policy)
+            .with_context(|| format!("failed to load Hugging Face dataset rows from {url}"))?;
 
         if response.rows.is_empty() {
             break;
@@ -190,6 +205,10 @@ fn load_text(spec: &HuggingFaceDatasetSpec) -> Result<String> {
         if total_rows.is_some_and(|total| offset >= total) {
             break;
         }
+
+        if !request_delay.is_zero() && fetched_rows < spec.rows {
+            thread::sleep(request_delay);
+        }
     }
 
     if output.trim().is_empty() {
@@ -201,6 +220,151 @@ fn load_text(spec: &HuggingFaceDatasetSpec) -> Result<String> {
     }
 
     Ok(output)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RetryPolicy {
+    max_retries: usize,
+    base_delay: Duration,
+}
+
+impl RetryPolicy {
+    fn from_env() -> Self {
+        Self {
+            max_retries: env_usize(MAX_RETRIES_ENV, DEFAULT_MAX_RETRIES),
+            base_delay: env_duration_ms(RETRY_BASE_DELAY_ENV, DEFAULT_RETRY_BASE_DELAY_MS),
+        }
+    }
+}
+
+fn load_rows_page(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    spec: &HuggingFaceDatasetSpec,
+    cache_dir: &Path,
+    offset: usize,
+    length: usize,
+    retry_policy: RetryPolicy,
+) -> Result<RowsResponse> {
+    let page_cache_path = spec.page_cache_path(cache_dir, offset, length);
+    if page_cache_path.is_file() {
+        let cached = fs::read_to_string(&page_cache_path).with_context(|| {
+            format!(
+                "failed to read cached Hugging Face dataset page from {:?}",
+                page_cache_path
+            )
+        })?;
+        return serde_json::from_str(&cached).with_context(|| {
+            format!(
+                "failed to decode cached Hugging Face dataset page {:?}",
+                page_cache_path
+            )
+        });
+    }
+
+    let mut attempt = 0usize;
+    loop {
+        let response = client
+            .get(url)
+            .send()
+            .with_context(|| format!("failed to fetch Hugging Face dataset rows from {url}"))?;
+        let status = response.status();
+        if status.is_success() {
+            let body = response
+                .text()
+                .with_context(|| format!("failed to read Hugging Face dataset rows from {url}"))?;
+            let parsed = serde_json::from_str::<RowsResponse>(&body).with_context(|| {
+                format!("failed to decode Hugging Face dataset rows from {url}")
+            })?;
+            write_page_cache(&page_cache_path, &body)?;
+            return Ok(parsed);
+        }
+
+        let headers = response.headers().clone();
+        let body = response.text().unwrap_or_default();
+        if should_retry_status(status) && attempt < retry_policy.max_retries {
+            let delay = retry_delay(&headers, retry_policy, attempt);
+            thread::sleep(delay);
+            attempt += 1;
+            continue;
+        }
+
+        bail!(
+            "Hugging Face dataset rows request failed for {url}: HTTP {status}; {}",
+            response_body_summary(&body)
+        );
+    }
+}
+
+fn write_page_cache(page_cache_path: &Path, body: &str) -> Result<()> {
+    if let Some(parent) = page_cache_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create Hugging Face dataset page cache directory {:?}",
+                parent
+            )
+        })?;
+    }
+
+    fs::write(page_cache_path, body).with_context(|| {
+        format!(
+            "failed to write Hugging Face dataset page cache to {:?}",
+            page_cache_path
+        )
+    })
+}
+
+fn should_retry_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+fn retry_delay(headers: &HeaderMap, retry_policy: RetryPolicy, attempt: usize) -> Duration {
+    retry_after_delay(headers)
+        .unwrap_or_else(|| exponential_backoff(retry_policy.base_delay, attempt))
+}
+
+fn retry_after_delay(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    let seconds = value.parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds))
+}
+
+fn exponential_backoff(base_delay: Duration, attempt: usize) -> Duration {
+    let multiplier = 1u32.checked_shl(attempt.min(6) as u32).unwrap_or(64);
+    base_delay.saturating_mul(multiplier)
+}
+
+fn response_body_summary(body: &str) -> String {
+    let summary: String = body
+        .chars()
+        .filter(|ch| !ch.is_control() || *ch == '\n' || *ch == '\t')
+        .take(240)
+        .collect();
+    if summary.trim().is_empty() {
+        "empty response body".to_string()
+    } else {
+        format!("response body: {}", summary.trim())
+    }
+}
+
+fn env_duration_ms(key: &str, default_ms: u64) -> Duration {
+    Duration::from_millis(env_u64(key, default_ms))
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
 }
 
 #[derive(Debug, Deserialize)]
@@ -411,6 +575,26 @@ mod tests {
     }
 
     #[test]
+    fn page_cache_path_changes_by_offset_and_length() {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "rusty-gpt-hf-page-cache-path-{}",
+            std::process::id()
+        ));
+        let spec = HuggingFaceDatasetSpec::parse(
+            "hf://Salesforce/wikitext?config=wikitext-2-raw-v1&rows=1000",
+        )
+        .unwrap()
+        .unwrap();
+
+        let first_path = spec.page_cache_path(&cache_dir, 0, 100);
+        let second_path = spec.page_cache_path(&cache_dir, 100, 100);
+        let shorter_path = spec.page_cache_path(&cache_dir, 0, 50);
+
+        assert_ne!(first_path, second_path);
+        assert_ne!(first_path, shorter_path);
+    }
+
+    #[test]
     fn load_text_from_uri_reads_cache_before_fetching() {
         let cache_dir =
             std::env::temp_dir().join(format!("rusty-gpt-hf-cache-read-{}", std::process::id()));
@@ -458,5 +642,21 @@ mod tests {
         let err = append_column_text(&mut output, &rows, "text").unwrap_err();
 
         assert!(err.to_string().contains("did not include column 'text'"));
+    }
+
+    #[test]
+    fn retry_after_delay_reads_seconds_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, "3".parse().unwrap());
+
+        assert_eq!(Some(Duration::from_secs(3)), retry_after_delay(&headers));
+    }
+
+    #[test]
+    fn exponential_backoff_doubles_base_delay() {
+        assert_eq!(
+            Duration::from_secs(4),
+            exponential_backoff(Duration::from_secs(1), 2)
+        );
     }
 }

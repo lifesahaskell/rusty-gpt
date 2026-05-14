@@ -99,6 +99,9 @@ CLI flags and `RUSTY_GPT_*` environment variables can both drive runtime behavio
 | `--log-format plain\|json` | `RUSTY_GPT_LOG_FORMAT` | backend default | CPU defaults to plain text; CUDA defaults to JSON Lines. |
 | — | `RUSTY_GPT_BPE_TOKENIZER` | `checkpoints/tokenizer.json` | BPE tokenizer JSON used by MiniGPT and `compare` runs. |
 | — | `RUSTY_GPT_HF_DATASET_CACHE` | `data/huggingface-cache` | Directory for cached `hf://` dataset text slices. |
+| — | `RUSTY_GPT_HF_REQUEST_DELAY_MS` | `250` | Delay between Hugging Face rows API page requests. Increase this if the datasets server returns 429s. |
+| — | `RUSTY_GPT_HF_MAX_RETRIES` | `6` | Retry count for Hugging Face rows API 429/5xx responses. |
+| — | `RUSTY_GPT_HF_RETRY_BASE_DELAY_MS` | `1000` | Base exponential-backoff delay when a retryable Hugging Face response has no `Retry-After` header. |
 | `--interactive-generate` | — | off | Requires `--backend cpu` and `--model minigpt`. |
 | `--serve` | — | off | Starts the HTTP API under `/api`; supports `cpu` and compiled-in `cuda` backends. |
 | `--load-checkpoint` | — | off | With `--serve`, loads MiniGPT API weights from `--checkpoint`. The checkpoint must match the model shape and tokenizer vocabulary from `--input`. |
@@ -123,7 +126,7 @@ CLI flags and `RUSTY_GPT_*` environment variables can both drive runtime behavio
 
 `scripts/run_training.sh` defaults to `cargo run --release`. Set `RUSTY_GPT_CARGO_PROFILE=dev` for faster debug builds while iterating. For `--backend cuda`, the script defaults to JSON logs, `RUSTY_GPT_PREFETCH_BATCHES=2`, and `RUSTY_GPT_EVAL_INTERVAL=500` unless those values are already provided.
 
-`--input` also accepts Hugging Face dataset URIs in the form `hf://<dataset-id>?config=<config>&split=<split>&column=<column>&rows=<n>&offset=<n>`. The loader uses the Hugging Face datasets-server rows API, concatenates the selected column with newlines, and defaults to `config=default`, `split=train`, `column=text`, `rows=1000`, and `offset=0`. Resolved dataset text is cached under `RUSTY_GPT_HF_DATASET_CACHE` before training; subsequent runs with the same dataset/config/split/column/offset/rows read the local copy before attempting a download.
+`--input` also accepts Hugging Face dataset URIs in the form `hf://<dataset-id>?config=<config>&split=<split>&column=<column>&rows=<n>&offset=<n>`. The loader uses the Hugging Face datasets-server rows API, concatenates the selected column with newlines, and defaults to `config=default`, `split=train`, `column=text`, `rows=1000`, and `offset=0`. Resolved dataset text is cached under `RUSTY_GPT_HF_DATASET_CACHE` before training; subsequent runs with the same dataset/config/split/column/offset/rows read the local copy before attempting a download. Individual rows API page responses are cached too, so a run interrupted by a rate limit can resume from already-fetched pages. For large pulls, prefer increasing `RUSTY_GPT_HF_REQUEST_DELAY_MS` instead of repeatedly restarting failed downloads.
 
 `POST /api/generate` accepts optional `top_k` in addition to `prompt`, `max_tokens`, and `temperature`. API requests require `temperature > 0`; internal greedy generation remains available for benchmarks and tests via zero-temperature generation options.
 
