@@ -8,20 +8,17 @@ use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Bool, Int, Tensor, TensorData};
 
 use crate::loader::data::{BatchPrefetcher, DataLoader, TokenBatch};
+use crate::observability::{EventLogger, LogFormat, RuntimeEvent};
 
 pub mod persistence;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrainingLogFormat {
-    Plain,
-    Json,
-}
+pub type TrainingLogFormat = LogFormat;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 pub struct TrainingLogContext {
     pub backend: &'static str,
     pub model: &'static str,
-    pub format: TrainingLogFormat,
+    pub logger: EventLogger,
 }
 
 impl TrainingLogContext {
@@ -29,12 +26,12 @@ impl TrainingLogContext {
         Self {
             backend: "cpu",
             model,
-            format: TrainingLogFormat::Plain,
+            logger: EventLogger::stdout(LogFormat::Plain),
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TrainingParams {
     pub learning_rate: f64,
     pub steps: usize,
@@ -111,6 +108,7 @@ fn value_loss<B: Backend>(
     Ok(language_model_loss(loss_fn, forward(inputs), targets).into_scalar())
 }
 
+#[cfg(test)]
 fn training_progress_log_line<B: Backend>(
     context: TrainingLogContext,
     step: usize,
@@ -118,11 +116,11 @@ fn training_progress_log_line<B: Backend>(
     training_loss: B::FloatElem,
     value_loss: B::FloatElem,
 ) -> String {
-    match context.format {
-        TrainingLogFormat::Plain => {
+    match context.logger.format() {
+        LogFormat::Plain => {
             format!("Step {step}: training loss = {training_loss:.4}, value loss = {value_loss:.4}")
         }
-        TrainingLogFormat::Json => {
+        LogFormat::Json => {
             format!(
                 r#"{{"event":"training_progress","backend":"{}","model":"{}","step":{},"total_steps":{},"training_loss":{:.6},"value_loss":{:.6}}}"#,
                 context.backend, context.model, step, steps, training_loss, value_loss
@@ -137,11 +135,19 @@ fn log_training_progress<B: Backend>(
     steps: usize,
     training_loss: B::FloatElem,
     value_loss: B::FloatElem,
-) {
-    println!(
-        "{}",
-        training_progress_log_line::<B>(context, step, steps, training_loss, value_loss)
-    );
+    elapsed_ms: u128,
+) where
+    B::FloatElem: Into<f64>,
+{
+    context.logger.log(RuntimeEvent::TrainingProgress {
+        backend: context.backend.to_string(),
+        model: context.model.to_string(),
+        step,
+        total_steps: steps,
+        training_loss: training_loss.into(),
+        value_loss: value_loss.into(),
+        elapsed_ms,
+    });
 }
 
 enum TrainingBatchSource<'a> {
@@ -177,12 +183,14 @@ fn train_language_model<B, M>(
 where
     B: AutodiffBackend,
     M: AutodiffModule<B>,
+    B::FloatElem: Into<f64>,
 {
     let training_batches = TrainingBatchSource::new(loader, params.prefetch_batches);
     let mut optimizer = AdamWConfig::new()
         .with_grad_clipping(params.grad_clipping)
         .init();
     let loss_fn = CrossEntropyLossConfig::new().init(device);
+    let started_at = std::time::Instant::now();
 
     for step in 0..params.steps {
         let (inputs, targets) = training_batches.next_batch::<B>(device)?;
@@ -198,11 +206,12 @@ where
                 forward(&model, inputs)
             })?;
             log_training_progress::<B>(
-                params.log_context,
+                params.log_context.clone(),
                 step,
                 params.steps,
                 training_loss,
                 value_loss,
+                started_at.elapsed().as_millis(),
             );
         }
     }
@@ -251,7 +260,11 @@ impl<B: Backend> TrivialModel<B> {
     }
 }
 
-impl<B: AutodiffBackend> TrivialModel<B> {
+impl<B> TrivialModel<B>
+where
+    B: AutodiffBackend,
+    B::FloatElem: Into<f64>,
+{
     pub fn train(
         loader: &DataLoader,
         value_loader: &DataLoader,
@@ -297,7 +310,11 @@ impl<B: Backend> SingleAttentionModel<B> {
     }
 }
 
-impl<B: AutodiffBackend> SingleAttentionModel<B> {
+impl<B> SingleAttentionModel<B>
+where
+    B: AutodiffBackend,
+    B::FloatElem: Into<f64>,
+{
     pub fn train(
         loader: &DataLoader,
         value_loader: &DataLoader,
@@ -356,7 +373,11 @@ impl<B: Backend> MultiAttentionModel<B> {
     }
 }
 
-impl<B: AutodiffBackend> MultiAttentionModel<B> {
+impl<B> MultiAttentionModel<B>
+where
+    B: AutodiffBackend,
+    B::FloatElem: Into<f64>,
+{
     pub fn train(
         loader: &DataLoader,
         value_loader: &DataLoader,
@@ -934,7 +955,11 @@ impl<B: Backend> MiniGpt<B> {
     }
 }
 
-impl<B: AutodiffBackend> MiniGpt<B> {
+impl<B> MiniGpt<B>
+where
+    B: AutodiffBackend,
+    B::FloatElem: Into<f64>,
+{
     pub fn train(
         loader: &DataLoader,
         value_loader: &DataLoader,
@@ -963,8 +988,10 @@ impl<B: AutodiffBackend> MiniGpt<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn::backend::Autodiff;
     use burn::backend::ndarray::{NdArray, NdArrayDevice};
     use burn::tensor::{Int, Tensor};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn training_step_logging_uses_interval_and_always_logs_final_step() {
@@ -995,7 +1022,7 @@ mod tests {
             TrainingLogContext {
                 backend: "cuda",
                 model: "minigpt",
-                format: TrainingLogFormat::Json,
+                logger: EventLogger::stdout(TrainingLogFormat::Json),
             },
             10,
             100,
@@ -1011,6 +1038,42 @@ mod tests {
         assert_eq!(100, parsed["total_steps"]);
         assert_eq!(1.25, parsed["training_loss"]);
         assert_eq!(2.5, parsed["value_loss"]);
+    }
+
+    #[test]
+    fn training_run_emits_final_progress_event() {
+        type TestBackend = Autodiff<NdArray<f32, i64>>;
+        let device = NdArrayDevice::Cpu;
+        let loader = DataLoader {
+            tokens: vec![0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4],
+            block_size: 2,
+            batch_size: 2,
+        };
+        let value_loader = loader.clone();
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&lines);
+        let logger = EventLogger::with_sink(LogFormat::Json, move |line| {
+            captured.lock().unwrap().push(line);
+        });
+        let params = TrainingParams::new(
+            1e-4,
+            3,
+            2,
+            TrainingLogContext {
+                backend: "cpu",
+                model: "trivial",
+                logger,
+            },
+        );
+
+        TrivialModel::<TestBackend>::train(&loader, &value_loader, &device, 7, 8, params).unwrap();
+
+        let lines = lines.lock().unwrap();
+        let final_progress: serde_json::Value =
+            serde_json::from_str(lines.last().expect("expected progress event")).unwrap();
+        assert_eq!("training_progress", final_progress["event"]);
+        assert_eq!(2, final_progress["step"]);
+        assert_eq!(3, final_progress["total_steps"]);
     }
 
     #[test]

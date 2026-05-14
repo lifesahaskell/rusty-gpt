@@ -19,10 +19,9 @@ fn default_runtime_uses_cpu_and_does_not_touch_cuda() {
         stdout,
         stderr
     );
-    assert!(stdout.contains("Vocab size:"));
-    assert!(stdout.contains("Hyperparameters:"));
-    assert!(stdout.contains("x shape:"));
-    assert!(stdout.contains("y shape:"));
+    assert!(stdout.contains("Configured app: backend=cpu"));
+    assert!(stdout.contains("Prepared runtime batch:"));
+    assert!(stdout.contains("trivial forward pass:"));
     assert!(!combined.contains("libcuda"));
     assert!(!combined.contains("RecvError"));
     assert!(!combined.contains("panicked"));

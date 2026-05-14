@@ -22,7 +22,6 @@
 }
 
 .prompt-controls,
-.response,
 .attention-panel,
 .training-dashboard {
   width: min(100%, 760px);
@@ -204,30 +203,55 @@
 
 .response {
   display: grid;
-  gap: 16px;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
+  gap: 24px;
+  width: min(100%, 1040px);
+  margin: 32px auto 0;
   margin-top: 32px;
   text-align: left;
 }
 
 .response p {
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.generation-panel {
+  display: grid;
+  min-width: 0;
+  gap: 16px;
 }
 
 .token-list {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  align-items: flex-start;
+  min-width: 0;
+  max-width: 100%;
   padding: 0;
   margin: 0;
   list-style: none;
 }
 
+.token-list li {
+  display: flex;
+  min-width: 0;
+  max-width: 100%;
+}
+
 .token-list button {
   min-width: 34px;
+  max-width: 100%;
   min-height: 34px;
   padding: 5px 9px;
   cursor: pointer;
   font-family: var(--mono);
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+  text-align: left;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .token-list .selected button {
@@ -244,8 +268,14 @@
 
 .attention-panel {
   display: grid;
+  align-self: start;
   gap: 14px;
+  width: 100%;
+  max-height: calc(100svh - 32px);
+  overflow: auto;
   padding-top: 8px;
+  position: sticky;
+  top: 16px;
 }
 
 .attention-header {
@@ -265,8 +295,10 @@
 }
 
 .attention-heatmap {
-  width: min(100%, 420px);
+  display: block;
+  width: min(100%, 360px);
   height: auto;
+  aspect-ratio: 1;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--code-bg);
@@ -277,6 +309,29 @@
 }
 
 @media (max-width: 640px) {
+  .App {
+    padding-inline: 16px;
+  }
+
+  .response {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .attention-panel {
+    max-height: none;
+    overflow: visible;
+    position: static;
+  }
+
+  .attention-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .attention-header select {
+    width: 100%;
+  }
+
   .training-header,
   .training-summary {
     flex-direction: column;

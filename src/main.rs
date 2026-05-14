@@ -11,23 +11,30 @@ use rusty_gpt::loader::data::DataLoader;
 use rusty_gpt::model::persistence::{load_model, save_model};
 use rusty_gpt::model::{
     MiniGpt, MiniGptConfig, MultiAttentionModel, SingleAttentionModel, TrainingLogContext,
-    TrainingLogFormat, TrainingParams, TrivialModel,
+    TrainingParams, TrivialModel,
 };
+use rusty_gpt::observability::{EventLogger, LogFormat, RuntimeEvent};
 use rusty_gpt::server;
 use rusty_gpt::server::ServerState;
 use rusty_gpt::tokenizer::RuntimeTokenizer;
-use rusty_gpt::utils::benchmark_generation;
+use rusty_gpt::utils::{BenchmarkConfig, benchmark_generation, parse_usize_list};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 const DEFAULT_INPUT_PATH: &str = "data/input.txt";
 const DEFAULT_MINIGPT_CHECKPOINT_PATH: &str = "checkpoints/mini_gpt";
 const DEFAULT_BPE_TOKENIZER_PATH: &str = "checkpoints/tokenizer.json";
 const BPE_TOKENIZER_ENV: &str = "RUSTY_GPT_BPE_TOKENIZER";
+const LOG_FORMAT_ENV: &str = "RUSTY_GPT_LOG_FORMAT";
+const BENCHMARK_PROMPT_LENS_ENV: &str = "RUSTY_GPT_BENCHMARK_PROMPT_LENS";
+const BENCHMARK_GEN_LENS_ENV: &str = "RUSTY_GPT_BENCHMARK_GEN_LENS";
+const BENCHMARK_WARMUPS_ENV: &str = "RUSTY_GPT_BENCHMARK_WARMUPS";
+const BENCHMARK_ITERATIONS_ENV: &str = "RUSTY_GPT_BENCHMARK_ITERATIONS";
 const DEFAULT_CHECKPOINT_DIR: &str = "checkpoints";
 const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:8787";
 
@@ -133,6 +140,16 @@ enum BackendChoice {
     Cuda,
 }
 
+impl BackendChoice {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            #[cfg(feature = "cuda")]
+            Self::Cuda => "cuda",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelChoice {
     Trivial,
@@ -173,34 +190,60 @@ impl ModelChoice {
 fn main() -> Result<()> {
     let config = parse_runtime_config_with_checkpoint(
         env::args().skip(1),
-        env::var("RUSTY_GPT_BACKEND").ok().as_deref(),
-        env::var("RUSTY_GPT_INPUT").ok().as_deref(),
-        env::var("RUSTY_GPT_MODEL").ok().as_deref(),
-        env::var("RUSTY_GPT_MINIGPT_CHECKPOINT").ok().as_deref(),
-        env::var("RUSTY_GPT_SERVER_ADDR").ok().as_deref(),
+        RuntimeEnv {
+            backend: env::var("RUSTY_GPT_BACKEND").ok(),
+            input: env::var("RUSTY_GPT_INPUT").ok(),
+            model: env::var("RUSTY_GPT_MODEL").ok(),
+            checkpoint: env::var("RUSTY_GPT_MINIGPT_CHECKPOINT").ok(),
+            server_addr: env::var("RUSTY_GPT_SERVER_ADDR").ok(),
+            log_format: env::var(LOG_FORMAT_ENV).ok(),
+            benchmark_prompt_lens: env::var(BENCHMARK_PROMPT_LENS_ENV).ok(),
+            benchmark_gen_lens: env::var(BENCHMARK_GEN_LENS_ENV).ok(),
+            benchmark_warmups: env::var(BENCHMARK_WARMUPS_ENV).ok(),
+            benchmark_iterations: env::var(BENCHMARK_ITERATIONS_ENV).ok(),
+        },
     )?;
     let text = load_input_text(&config.input_path)?;
     let hyperparameters = Hyperparameters::from_env()?;
+    let logger = EventLogger::stdout(config.log_format);
+    logger.log(RuntimeEvent::AppConfigured {
+        backend: config.backend.label().to_string(),
+        model: config.model.label().to_string(),
+        input_path: config.input_path.display().to_string(),
+        tokenizer_path: minigpt_tokenizer_path(),
+        checkpoint_path: config.checkpoint_path.display().to_string(),
+        log_format: config.log_format,
+        serve: config.serve,
+        benchmark_generation: config.benchmark_generation,
+    });
 
     if config.serve {
         return match config.backend {
             BackendChoice::Cpu => run_http_server_with_runtime::<NdArray<f32, i64>>(
                 &text,
                 hyperparameters,
-                config.server_addr,
-                &config.checkpoint_path,
-                config.load_checkpoint,
-                config.load_latest_checkpoint,
+                ServerRuntimeOptions {
+                    server_addr: config.server_addr,
+                    checkpoint_path: &config.checkpoint_path,
+                    load_checkpoint_enabled: config.load_checkpoint,
+                    load_latest_checkpoint_enabled: config.load_latest_checkpoint,
+                    backend_label: "cpu",
+                    logger,
+                },
                 &NdArrayDevice::Cpu,
             ),
             #[cfg(feature = "cuda")]
             BackendChoice::Cuda => run_http_server_with_runtime::<Cuda>(
                 &text,
                 hyperparameters,
-                config.server_addr,
-                &config.checkpoint_path,
-                config.load_checkpoint,
-                config.load_latest_checkpoint,
+                ServerRuntimeOptions {
+                    server_addr: config.server_addr,
+                    checkpoint_path: &config.checkpoint_path,
+                    load_checkpoint_enabled: config.load_checkpoint,
+                    load_latest_checkpoint_enabled: config.load_latest_checkpoint,
+                    backend_label: "cuda",
+                    logger,
+                },
                 &CudaDevice::default(),
             ),
         };
@@ -210,10 +253,14 @@ fn main() -> Result<()> {
         BackendChoice::Cpu => run_cpu_demo(
             &text,
             hyperparameters,
-            config.model,
-            config.interactive,
-            config.benchmark_generation,
-            &config.checkpoint_path,
+            CpuDemoOptions {
+                model_choice: config.model,
+                interactive: config.interactive,
+                benchmark_generation: config.benchmark_generation,
+                benchmark_config: &config.benchmark_config,
+                logger,
+                checkpoint_path: &config.checkpoint_path,
+            },
         ),
         #[cfg(feature = "cuda")]
         BackendChoice::Cuda => {
@@ -221,7 +268,7 @@ fn main() -> Result<()> {
                 bail!("interactive generation currently requires --backend cpu");
             }
             let device = CudaDevice::default();
-            run_demo::<Cuda>(&text, hyperparameters, config.model, &device)?;
+            run_demo::<Cuda>(&text, hyperparameters, config.model, &device, &logger)?;
             run_training_demo::<Autodiff<Cuda>>(
                 &text,
                 hyperparameters,
@@ -230,60 +277,81 @@ fn main() -> Result<()> {
                 &config.checkpoint_path,
                 TrainingDemoOptions {
                     backend_label: "cuda",
-                    log_format: TrainingLogFormat::Json,
+                    logger,
                     benchmark_generation: config.benchmark_generation,
+                    benchmark_config: config.benchmark_config,
                 },
             )
         }
     }
 }
 
-fn run_cpu_demo(
-    text: &str,
-    hyperparameters: Hyperparameters,
+struct CpuDemoOptions<'a> {
     model_choice: ModelChoice,
     interactive: bool,
     benchmark_generation: bool,
-    checkpoint_path: &Path,
+    benchmark_config: &'a BenchmarkConfig,
+    logger: EventLogger,
+    checkpoint_path: &'a Path,
+}
+
+fn run_cpu_demo(
+    text: &str,
+    hyperparameters: Hyperparameters,
+    options: CpuDemoOptions<'_>,
 ) -> Result<()> {
     let device = NdArrayDevice::Cpu;
-    run_demo::<NdArray<f32, i64>>(text, hyperparameters, model_choice, &device)?;
-    if interactive {
-        if benchmark_generation {
+    run_demo::<NdArray<f32, i64>>(
+        text,
+        hyperparameters,
+        options.model_choice,
+        &device,
+        &options.logger,
+    )?;
+    if options.interactive {
+        if options.benchmark_generation {
             bail!("generation benchmarks cannot run with --interactive-generate");
         }
-        if model_choice != ModelChoice::MiniGpt {
+        if options.model_choice != ModelChoice::MiniGpt {
             bail!("interactive generation requires --model minigpt");
         }
         run_interactive_minigpt_generation::<Autodiff<NdArray<f32, i64>>>(
             text,
             hyperparameters,
             &device,
-            checkpoint_path,
+            options.logger,
+            options.checkpoint_path,
         )
     } else {
         run_training_demo::<Autodiff<NdArray<f32, i64>>>(
             text,
             hyperparameters,
-            model_choice,
+            options.model_choice,
             &device,
-            checkpoint_path,
+            options.checkpoint_path,
             TrainingDemoOptions {
                 backend_label: "cpu",
-                log_format: TrainingLogFormat::Plain,
-                benchmark_generation,
+                logger: options.logger,
+                benchmark_generation: options.benchmark_generation,
+                benchmark_config: options.benchmark_config.clone(),
             },
         )
     }
 }
 
+struct ServerRuntimeOptions<'a> {
+    server_addr: SocketAddr,
+    checkpoint_path: &'a Path,
+    load_checkpoint_enabled: bool,
+    load_latest_checkpoint_enabled: bool,
+    backend_label: &'static str,
+    logger: EventLogger,
+}
+
 fn run_http_server_with_runtime<B>(
     text: &str,
     hyperparameters: Hyperparameters,
-    server_addr: SocketAddr,
-    checkpoint_path: &Path,
-    load_checkpoint_enabled: bool,
-    load_latest_checkpoint_enabled: bool,
+    options: ServerRuntimeOptions<'_>,
     device: &B::Device,
 ) -> Result<()>
 where
@@ -295,24 +363,13 @@ where
         .build()
         .context("failed to start tokio runtime")?;
 
-    runtime.block_on(run_http_server::<B>(
-        text,
-        hyperparameters,
-        server_addr,
-        checkpoint_path,
-        load_checkpoint_enabled,
-        load_latest_checkpoint_enabled,
-        device,
-    ))
+    runtime.block_on(run_http_server::<B>(text, hyperparameters, options, device))
 }
 
 async fn run_http_server<B>(
     _text: &str,
     hyperparameters: Hyperparameters,
-    server_addr: SocketAddr,
-    checkpoint_path: &Path,
-    load_checkpoint_enabled: bool,
-    load_latest_checkpoint_enabled: bool,
+    options: ServerRuntimeOptions<'_>,
     device: &B::Device,
 ) -> Result<()>
 where
@@ -321,23 +378,35 @@ where
 {
     let tokenizer = load_minigpt_tokenizer()?;
     let template = new_minigpt::<B>(tokenizer.vocab_size(), hyperparameters, device);
-    let model = if load_latest_checkpoint_enabled {
+    let model = if options.load_latest_checkpoint_enabled {
         let latest_checkpoint = latest_checkpoint_path(Path::new(DEFAULT_CHECKPOINT_DIR))?;
-        load_minigpt_checkpoint(template, &latest_checkpoint, device)?
-    } else if load_checkpoint_enabled {
-        load_minigpt_checkpoint(template, checkpoint_path, device)?
+        load_minigpt_checkpoint(template, &latest_checkpoint, device, &options.logger)?
+    } else if options.load_checkpoint_enabled {
+        load_minigpt_checkpoint(template, options.checkpoint_path, device, &options.logger)?
     } else {
         template
     };
-    let state = Arc::new(ServerState::new(model, tokenizer, device.clone()));
+    let state = Arc::new(ServerState::new(
+        model,
+        tokenizer,
+        device.clone(),
+        options.logger.clone(),
+    ));
+    let vocab_size = state.model_vocab_size();
+    let block_size = state.model_block_size();
     let app = Router::new()
         .nest("/api", server::router::<B>())
-        .with_state(state);
-    let listener = tokio::net::TcpListener::bind(server_addr)
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind(options.server_addr)
         .await
-        .with_context(|| format!("failed to bind HTTP server on {server_addr}"))?;
+        .with_context(|| format!("failed to bind HTTP server on {}", options.server_addr))?;
 
-    println!("Serving GPT API on http://{server_addr}");
+    options.logger.log(RuntimeEvent::ServerStarted {
+        addr: options.server_addr.to_string(),
+        backend: options.backend_label.to_string(),
+        vocab_size,
+        block_size,
+    });
     axum::serve(listener, app)
         .await
         .context("HTTP server failed")
@@ -348,32 +417,10 @@ fn run_demo<B: Backend>(
     hyperparameters: Hyperparameters,
     model_choice: ModelChoice,
     device: &B::Device,
+    logger: &EventLogger,
 ) -> Result<()> {
     let tokenizer = tokenizer_for_model(text, model_choice)?;
     let encoded = tokenizer.encode(text);
-    println!("Vocab size: {}", tokenizer.vocab_size());
-    println!("Input chars: {}", text.chars().count());
-    println!(
-        "Hyperparameters: block_size={}, batch_size={}, embed_dim={}, num_heads={}, head_dim={}, num_layers={}, dropout={}, lr={}, train_steps={}, eval_interval={}, generate_tokens={}, minigpt_grad_clip_norm={}, prefetch_batches={}",
-        hyperparameters.block_size,
-        hyperparameters.batch_size,
-        hyperparameters.embed_dim,
-        hyperparameters.num_heads,
-        hyperparameters.head_dim,
-        hyperparameters.num_layers,
-        hyperparameters.dropout,
-        hyperparameters.learning_rate,
-        hyperparameters.train_steps,
-        hyperparameters.eval_interval,
-        hyperparameters.generate_tokens,
-        hyperparameters.minigpt_grad_clip_norm,
-        hyperparameters.prefetch_batches
-    );
-    let preview_len = encoded.len().min(80);
-    println!(
-        "Decoded preview: {:?}",
-        tokenizer.decode(&encoded[..preview_len])
-    );
 
     let data_loader = DataLoader {
         tokens: encoded,
@@ -384,6 +431,14 @@ fn run_demo<B: Backend>(
         .next_batch::<B>(device)
         .map_err(anyhow::Error::msg)
         .context("failed to build demo batch")?;
+    logger.log(RuntimeEvent::RuntimeBatchPrepared {
+        vocab_size: tokenizer.vocab_size(),
+        input_chars: text.chars().count(),
+        encoded_tokens: data_loader.tokens.len(),
+        batch_size: hyperparameters.batch_size,
+        block_size: hyperparameters.block_size,
+        dropout: hyperparameters.dropout,
+    });
     for model_choice in model_choice.comparison_models() {
         let logits = run_model_forward(
             model_choice,
@@ -392,14 +447,13 @@ fn run_demo<B: Backend>(
             x.clone(),
             device,
         );
-        println!(
-            "{} logits shape: {:?}",
-            model_choice.label(),
-            logits.shape().dims::<3>()
-        );
+        logger.log(RuntimeEvent::ModelForwardCompleted {
+            model: model_choice.label().to_string(),
+            logits_shape: logits.shape().dims::<3>(),
+            input_shape: x.shape().dims::<2>(),
+            target_shape: y.shape().dims::<2>(),
+        });
     }
-    println!("x shape: {:?}", x.shape().dims::<2>());
-    println!("y shape: {:?}", y.shape().dims::<2>());
 
     Ok(())
 }
@@ -408,11 +462,12 @@ fn run_interactive_minigpt_generation<B: burn::tensor::backend::AutodiffBackend>
     _text: &str,
     hyperparameters: Hyperparameters,
     device: &B::Device,
+    logger: EventLogger,
     checkpoint_path: &Path,
 ) -> Result<()> {
     let tokenizer = load_minigpt_tokenizer()?;
     let template = new_minigpt::<B>(tokenizer.vocab_size(), hyperparameters, device);
-    let model = load_minigpt_checkpoint(template, checkpoint_path, device)?;
+    let model = load_minigpt_checkpoint(template, checkpoint_path, device, &logger)?;
 
     interactive_generation_loop(&model, &tokenizer, hyperparameters.generate_tokens, device)
 }
@@ -421,17 +476,19 @@ fn load_minigpt_checkpoint<B: Backend>(
     template: MiniGpt<B>,
     checkpoint_path: &Path,
     device: &B::Device,
+    logger: &EventLogger,
 ) -> Result<MiniGpt<B>> {
+    let started_at = Instant::now();
     let model = load_model(template, checkpoint_path, device).with_context(|| {
         format!(
             "failed to load minigpt checkpoint from {:?}",
             checkpoint_path.with_extension("mpk")
         )
     })?;
-    println!(
-        "Loaded minigpt checkpoint from {:?}",
-        checkpoint_path.with_extension("mpk")
-    );
+    logger.log(RuntimeEvent::CheckpointLoaded {
+        path: checkpoint_path.with_extension("mpk").display().to_string(),
+        elapsed_ms: started_at.elapsed().as_millis(),
+    });
 
     Ok(model)
 }
@@ -445,13 +502,16 @@ fn tokenizer_for_model(text: &str, model_choice: ModelChoice) -> Result<RuntimeT
 }
 
 fn load_minigpt_tokenizer() -> Result<RuntimeTokenizer> {
-    let tokenizer_path =
-        env::var(BPE_TOKENIZER_ENV).unwrap_or_else(|_| DEFAULT_BPE_TOKENIZER_PATH.to_string());
+    let tokenizer_path = minigpt_tokenizer_path();
     RuntimeTokenizer::load_bpe(Path::new(&tokenizer_path)).with_context(|| {
         format!(
             "failed to load MiniGPT BPE tokenizer from {tokenizer_path}; train one with `cargo run --bin train-tokenizer -- --corpus data/fafolang.txt --vocab-size 2048 --output {DEFAULT_BPE_TOKENIZER_PATH}`"
         )
     })
+}
+
+fn minigpt_tokenizer_path() -> String {
+    env::var(BPE_TOKENIZER_ENV).unwrap_or_else(|_| DEFAULT_BPE_TOKENIZER_PATH.to_string())
 }
 
 fn latest_checkpoint_path(checkpoint_dir: &Path) -> Result<PathBuf> {
@@ -618,14 +678,18 @@ fn new_minigpt<B: Backend>(
     )
 }
 
-fn run_training_demo<B: burn::tensor::backend::AutodiffBackend>(
+fn run_training_demo<B>(
     text: &str,
     hyperparameters: Hyperparameters,
     model_choice: ModelChoice,
     device: &B::Device,
     checkpoint_path: &Path,
     options: TrainingDemoOptions,
-) -> Result<()> {
+) -> Result<()>
+where
+    B: burn::tensor::backend::AutodiffBackend,
+    B::FloatElem: Into<f64>,
+{
     if options.benchmark_generation && !model_choice.includes_minigpt() {
         bail!("generation benchmarks require --model minigpt or compare");
     }
@@ -646,7 +710,6 @@ fn run_training_demo<B: burn::tensor::backend::AutodiffBackend>(
     };
 
     for model_choice in model_choice.comparison_models() {
-        println!("Training {} model", model_choice.label());
         train_model(TrainingRun::<B> {
             model_choice,
             data_loader: &data_loader,
@@ -656,19 +719,21 @@ fn run_training_demo<B: burn::tensor::backend::AutodiffBackend>(
             hyperparameters,
             checkpoint_path,
             backend_label: options.backend_label,
-            log_format: options.log_format,
+            logger: options.logger.clone(),
             benchmark_generation: options.benchmark_generation,
+            benchmark_config: options.benchmark_config.clone(),
         })?;
     }
 
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 struct TrainingDemoOptions {
     backend_label: &'static str,
-    log_format: TrainingLogFormat,
+    logger: EventLogger,
     benchmark_generation: bool,
+    benchmark_config: BenchmarkConfig,
 }
 
 struct TrainingRun<'a, B: burn::tensor::backend::AutodiffBackend> {
@@ -680,15 +745,20 @@ struct TrainingRun<'a, B: burn::tensor::backend::AutodiffBackend> {
     hyperparameters: Hyperparameters,
     checkpoint_path: &'a Path,
     backend_label: &'static str,
-    log_format: TrainingLogFormat,
+    logger: EventLogger,
     benchmark_generation: bool,
+    benchmark_config: BenchmarkConfig,
 }
 
-fn train_model<B: burn::tensor::backend::AutodiffBackend>(run: TrainingRun<'_, B>) -> Result<()> {
+fn train_model<B>(run: TrainingRun<'_, B>) -> Result<()>
+where
+    B: burn::tensor::backend::AutodiffBackend,
+    B::FloatElem: Into<f64>,
+{
     let log_context = TrainingLogContext {
         backend: run.backend_label,
         model: run.model_choice.label(),
-        format: run.log_format,
+        logger: run.logger.clone(),
     };
     let params = TrainingParams::new(
         run.hyperparameters.learning_rate,
@@ -700,6 +770,15 @@ fn train_model<B: burn::tensor::backend::AutodiffBackend>(run: TrainingRun<'_, B
 
     match run.model_choice {
         ModelChoice::Trivial => {
+            run.logger.log(RuntimeEvent::TrainingStarted {
+                backend: run.backend_label.to_string(),
+                model: run.model_choice.label().to_string(),
+                vocab_size: run.vocab_size,
+                batch_size: run.hyperparameters.batch_size,
+                block_size: run.hyperparameters.block_size,
+                total_steps: run.hyperparameters.train_steps,
+            });
+            let started_at = Instant::now();
             let _model = TrivialModel::<B>::train(
                 run.data_loader,
                 run.value_loader,
@@ -710,8 +789,23 @@ fn train_model<B: burn::tensor::backend::AutodiffBackend>(run: TrainingRun<'_, B
             )
             .map_err(anyhow::Error::msg)
             .context("failed to train trivial model")?;
+            run.logger.log(RuntimeEvent::TrainingCompleted {
+                backend: run.backend_label.to_string(),
+                model: run.model_choice.label().to_string(),
+                total_steps: run.hyperparameters.train_steps,
+                elapsed_ms: started_at.elapsed().as_millis(),
+            });
         }
         ModelChoice::SingleAttention => {
+            run.logger.log(RuntimeEvent::TrainingStarted {
+                backend: run.backend_label.to_string(),
+                model: run.model_choice.label().to_string(),
+                vocab_size: run.vocab_size,
+                batch_size: run.hyperparameters.batch_size,
+                block_size: run.hyperparameters.block_size,
+                total_steps: run.hyperparameters.train_steps,
+            });
+            let started_at = Instant::now();
             let _model = SingleAttentionModel::<B>::train(
                 run.data_loader,
                 run.value_loader,
@@ -723,8 +817,23 @@ fn train_model<B: burn::tensor::backend::AutodiffBackend>(run: TrainingRun<'_, B
             )
             .map_err(anyhow::Error::msg)
             .context("failed to train single attention model")?;
+            run.logger.log(RuntimeEvent::TrainingCompleted {
+                backend: run.backend_label.to_string(),
+                model: run.model_choice.label().to_string(),
+                total_steps: run.hyperparameters.train_steps,
+                elapsed_ms: started_at.elapsed().as_millis(),
+            });
         }
         ModelChoice::MultiAttention => {
+            run.logger.log(RuntimeEvent::TrainingStarted {
+                backend: run.backend_label.to_string(),
+                model: run.model_choice.label().to_string(),
+                vocab_size: run.vocab_size,
+                batch_size: run.hyperparameters.batch_size,
+                block_size: run.hyperparameters.block_size,
+                total_steps: run.hyperparameters.train_steps,
+            });
+            let started_at = Instant::now();
             let _model = MultiAttentionModel::<B>::train(
                 run.data_loader,
                 run.value_loader,
@@ -736,8 +845,23 @@ fn train_model<B: burn::tensor::backend::AutodiffBackend>(run: TrainingRun<'_, B
             )
             .map_err(anyhow::Error::msg)
             .context("failed to train multi attention model")?;
+            run.logger.log(RuntimeEvent::TrainingCompleted {
+                backend: run.backend_label.to_string(),
+                model: run.model_choice.label().to_string(),
+                total_steps: run.hyperparameters.train_steps,
+                elapsed_ms: started_at.elapsed().as_millis(),
+            });
         }
         ModelChoice::MiniGpt => {
+            run.logger.log(RuntimeEvent::TrainingStarted {
+                backend: run.backend_label.to_string(),
+                model: run.model_choice.label().to_string(),
+                vocab_size: run.vocab_size,
+                batch_size: run.hyperparameters.batch_size,
+                block_size: run.hyperparameters.block_size,
+                total_steps: run.hyperparameters.train_steps,
+            });
+            let started_at = Instant::now();
             let model = MiniGpt::<B>::train(
                 run.data_loader,
                 run.value_loader,
@@ -753,10 +877,18 @@ fn train_model<B: burn::tensor::backend::AutodiffBackend>(run: TrainingRun<'_, B
             )
             .map_err(anyhow::Error::msg)
             .context("failed to train minigpt model")?;
+            run.logger.log(RuntimeEvent::TrainingCompleted {
+                backend: run.backend_label.to_string(),
+                model: run.model_choice.label().to_string(),
+                total_steps: run.hyperparameters.train_steps,
+                elapsed_ms: started_at.elapsed().as_millis(),
+            });
             if run.benchmark_generation {
-                benchmark_generation(&model, run.device);
+                benchmark_generation(&model, run.device, &run.benchmark_config, &run.logger)
+                    .map_err(anyhow::Error::msg)
+                    .context("failed to benchmark minigpt generation")?;
             }
-            save_minigpt_checkpoint(model, run.checkpoint_path)?;
+            save_minigpt_checkpoint(model, run.checkpoint_path, &run.logger)?;
         }
         ModelChoice::Compare => unreachable!("compare should be expanded before training dispatch"),
     }
@@ -767,6 +899,7 @@ fn train_model<B: burn::tensor::backend::AutodiffBackend>(run: TrainingRun<'_, B
 fn save_minigpt_checkpoint<B: burn::tensor::backend::AutodiffBackend>(
     model: MiniGpt<B>,
     checkpoint_path: &Path,
+    logger: &EventLogger,
 ) -> Result<()> {
     if let Some(parent) = checkpoint_path.parent()
         && !parent.as_os_str().is_empty()
@@ -775,12 +908,13 @@ fn save_minigpt_checkpoint<B: burn::tensor::backend::AutodiffBackend>(
             .with_context(|| format!("failed to create checkpoint directory {:?}", parent))?;
     }
 
+    let started_at = Instant::now();
     save_model(model, checkpoint_path)
         .with_context(|| format!("failed to save minigpt checkpoint to {:?}", checkpoint_path))?;
-    println!(
-        "Saved minigpt checkpoint to {:?}",
-        checkpoint_path.with_extension("mpk")
-    );
+    logger.log(RuntimeEvent::CheckpointSaved {
+        path: checkpoint_path.with_extension("mpk").display().to_string(),
+        elapsed_ms: started_at.elapsed().as_millis(),
+    });
 
     Ok(())
 }
@@ -824,6 +958,22 @@ struct RuntimeConfig {
     load_latest_checkpoint: bool,
     serve: bool,
     server_addr: SocketAddr,
+    log_format: LogFormat,
+    benchmark_config: BenchmarkConfig,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RuntimeEnv {
+    backend: Option<String>,
+    input: Option<String>,
+    model: Option<String>,
+    checkpoint: Option<String>,
+    server_addr: Option<String>,
+    log_format: Option<String>,
+    benchmark_prompt_lens: Option<String>,
+    benchmark_gen_lens: Option<String>,
+    benchmark_warmups: Option<String>,
+    benchmark_iterations: Option<String>,
 }
 
 fn load_input_text(path: &Path) -> Result<String> {
@@ -841,17 +991,18 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    parse_runtime_config_with_checkpoint(args, env_backend, env_input, env_model, None, None)
+    parse_runtime_config_with_checkpoint(
+        args,
+        RuntimeEnv {
+            backend: env_backend.map(str::to_string),
+            input: env_input.map(str::to_string),
+            model: env_model.map(str::to_string),
+            ..RuntimeEnv::default()
+        },
+    )
 }
 
-fn parse_runtime_config_with_checkpoint<I, S>(
-    args: I,
-    env_backend: Option<&str>,
-    env_input: Option<&str>,
-    env_model: Option<&str>,
-    env_checkpoint: Option<&str>,
-    env_server_addr: Option<&str>,
-) -> Result<RuntimeConfig>
+fn parse_runtime_config_with_checkpoint<I, S>(args: I, env: RuntimeEnv) -> Result<RuntimeConfig>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
@@ -865,6 +1016,11 @@ where
     let mut arg_model = None;
     let mut arg_checkpoint = None;
     let mut arg_server_addr = None;
+    let mut arg_log_format = None;
+    let mut arg_benchmark_prompt_lens = None;
+    let mut arg_benchmark_gen_lens = None;
+    let mut arg_benchmark_warmups = None;
+    let mut arg_benchmark_iterations = None;
     let mut interactive = false;
     let mut benchmark_generation = false;
     let mut load_checkpoint = false;
@@ -909,6 +1065,41 @@ where
                 arg_server_addr = Some(value.as_str());
                 index += 2;
             }
+            "--log-format" => {
+                let value = args
+                    .get(index + 1)
+                    .context("--log-format requires a value: plain or json")?;
+                arg_log_format = Some(value.as_str());
+                index += 2;
+            }
+            "--benchmark-prompt-lens" => {
+                let value = args
+                    .get(index + 1)
+                    .context("--benchmark-prompt-lens requires a comma-separated list")?;
+                arg_benchmark_prompt_lens = Some(value.as_str());
+                index += 2;
+            }
+            "--benchmark-gen-lens" => {
+                let value = args
+                    .get(index + 1)
+                    .context("--benchmark-gen-lens requires a comma-separated list")?;
+                arg_benchmark_gen_lens = Some(value.as_str());
+                index += 2;
+            }
+            "--benchmark-warmups" => {
+                let value = args
+                    .get(index + 1)
+                    .context("--benchmark-warmups requires an integer")?;
+                arg_benchmark_warmups = Some(value.as_str());
+                index += 2;
+            }
+            "--benchmark-iterations" => {
+                let value = args
+                    .get(index + 1)
+                    .context("--benchmark-iterations requires an integer")?;
+                arg_benchmark_iterations = Some(value.as_str());
+                index += 2;
+            }
             "--interactive-generate" => {
                 interactive = true;
                 index += 1;
@@ -938,19 +1129,48 @@ where
     }
 
     let server_addr_text = arg_server_addr
-        .or(env_server_addr)
+        .or(env.server_addr.as_deref())
         .unwrap_or(DEFAULT_SERVER_ADDR);
     let server_addr = server_addr_text
         .parse()
         .with_context(|| format!("invalid server address '{server_addr_text}'"))?;
+    let backend = parse_backend_name(arg_backend.or(env.backend.as_deref()).unwrap_or("cpu"))?;
+    let log_format = match arg_log_format.or(env.log_format.as_deref()) {
+        Some(value) => LogFormat::parse(value)?,
+        None => default_log_format(backend),
+    };
+    let mut benchmark_config = BenchmarkConfig::default();
+    if let Some(value) = arg_benchmark_prompt_lens.or(env.benchmark_prompt_lens.as_deref()) {
+        benchmark_config.prompt_lens = parse_usize_list(value, "benchmark prompt lengths")
+            .with_context(|| format!("invalid benchmark prompt lengths '{value}'"))?;
+    }
+    if let Some(value) = arg_benchmark_gen_lens.or(env.benchmark_gen_lens.as_deref()) {
+        benchmark_config.gen_lens = parse_usize_list(value, "benchmark generation lengths")
+            .with_context(|| format!("invalid benchmark generation lengths '{value}'"))?;
+    }
+    if let Some(value) = arg_benchmark_warmups.or(env.benchmark_warmups.as_deref()) {
+        benchmark_config.warmups = value
+            .parse()
+            .with_context(|| format!("invalid benchmark warmups '{value}'"))?;
+    }
+    if let Some(value) = arg_benchmark_iterations.or(env.benchmark_iterations.as_deref()) {
+        benchmark_config.iterations = value
+            .parse()
+            .with_context(|| format!("invalid benchmark iterations '{value}'"))?;
+    }
+    benchmark_config.validate()?;
 
     Ok(RuntimeConfig {
-        backend: parse_backend_name(arg_backend.or(env_backend).unwrap_or("cpu"))?,
-        model: parse_model_name(arg_model.or(env_model).unwrap_or("trivial"))?,
-        input_path: PathBuf::from(arg_input.or(env_input).unwrap_or(DEFAULT_INPUT_PATH)),
+        backend,
+        model: parse_model_name(arg_model.or(env.model.as_deref()).unwrap_or("trivial"))?,
+        input_path: PathBuf::from(
+            arg_input
+                .or(env.input.as_deref())
+                .unwrap_or(DEFAULT_INPUT_PATH),
+        ),
         checkpoint_path: PathBuf::from(
             arg_checkpoint
-                .or(env_checkpoint)
+                .or(env.checkpoint.as_deref())
                 .unwrap_or(DEFAULT_MINIGPT_CHECKPOINT_PATH),
         ),
         interactive,
@@ -959,7 +1179,17 @@ where
         load_latest_checkpoint,
         serve,
         server_addr,
+        log_format,
+        benchmark_config,
     })
+}
+
+fn default_log_format(backend: BackendChoice) -> LogFormat {
+    match backend {
+        BackendChoice::Cpu => LogFormat::Plain,
+        #[cfg(feature = "cuda")]
+        BackendChoice::Cuda => LogFormat::Json,
+    }
 }
 
 fn parse_backend_name(name: &str) -> Result<BackendChoice> {
@@ -1005,9 +1235,92 @@ mod tests {
         assert!(!config.benchmark_generation);
         assert!(!config.load_checkpoint);
         assert!(!config.load_latest_checkpoint);
+        assert_eq!(LogFormat::Plain, config.log_format);
+        assert_eq!(BenchmarkConfig::default(), config.benchmark_config);
         assert_eq!(
             DEFAULT_SERVER_ADDR.parse::<SocketAddr>().unwrap(),
             config.server_addr
+        );
+    }
+
+    #[test]
+    fn log_format_can_be_selected_from_args() {
+        let config = parse_runtime_config(
+            ["--log-format".to_string(), "json".to_string()],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(LogFormat::Json, config.log_format);
+    }
+
+    #[test]
+    fn log_format_arg_takes_precedence_over_env() {
+        let config = parse_runtime_config_with_checkpoint(
+            ["--log-format".to_string(), "plain".to_string()],
+            RuntimeEnv {
+                log_format: Some("json".to_string()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(LogFormat::Plain, config.log_format);
+    }
+
+    #[test]
+    fn invalid_log_format_returns_clear_error() {
+        let err = parse_runtime_config(
+            ["--log-format".to_string(), "yaml".to_string()],
+            None,
+            None,
+            None,
+        )
+        .expect_err("invalid log format should fail");
+
+        assert!(err.to_string().contains("unsupported log format"));
+    }
+
+    #[test]
+    fn benchmark_config_can_be_selected_from_args() {
+        let config = parse_runtime_config(
+            [
+                "--benchmark-prompt-lens".to_string(),
+                "2,4".to_string(),
+                "--benchmark-gen-lens".to_string(),
+                "1,3".to_string(),
+                "--benchmark-warmups".to_string(),
+                "2".to_string(),
+                "--benchmark-iterations".to_string(),
+                "7".to_string(),
+            ],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(vec![2, 4], config.benchmark_config.prompt_lens);
+        assert_eq!(vec![1, 3], config.benchmark_config.gen_lens);
+        assert_eq!(2, config.benchmark_config.warmups);
+        assert_eq!(7, config.benchmark_config.iterations);
+    }
+
+    #[test]
+    fn invalid_benchmark_config_returns_clear_error() {
+        let err = parse_runtime_config(
+            ["--benchmark-iterations".to_string(), "0".to_string()],
+            None,
+            None,
+            None,
+        )
+        .expect_err("zero iterations should fail");
+
+        assert!(
+            err.to_string()
+                .contains("benchmark iterations must be greater than zero")
         );
     }
 
@@ -1149,8 +1462,9 @@ mod tests {
             &checkpoint_path,
             TrainingDemoOptions {
                 backend_label: "cpu",
-                log_format: TrainingLogFormat::Plain,
+                logger: EventLogger::stdout(LogFormat::Plain),
                 benchmark_generation: false,
+                benchmark_config: BenchmarkConfig::default(),
             },
         )
         .unwrap();
@@ -1174,6 +1488,11 @@ mod tests {
     fn backend_can_be_selected_from_args() {
         let config = parse_runtime_config(
             ["--backend".to_string(), "cuda".to_string()],
+            None,
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -1247,11 +1566,7 @@ mod tests {
     fn checkpoint_path_can_be_selected_from_args() {
         let config = parse_runtime_config_with_checkpoint(
             ["--checkpoint".to_string(), "checkpoints/custom".to_string()],
-            None,
-            None,
-            None,
-            None,
-            None,
+            RuntimeEnv::default(),
         )
         .unwrap();
 
@@ -1265,11 +1580,10 @@ mod tests {
                 "--checkpoint".to_string(),
                 "checkpoints/from-arg".to_string(),
             ],
-            None,
-            None,
-            None,
-            Some("checkpoints/from-env"),
-            None,
+            RuntimeEnv {
+                checkpoint: Some("checkpoints/from-env".to_string()),
+                ..RuntimeEnv::default()
+            },
         )
         .unwrap();
 
@@ -1283,11 +1597,7 @@ mod tests {
     fn missing_checkpoint_arg_value_returns_clear_error() {
         let err = parse_runtime_config_with_checkpoint(
             ["--checkpoint".to_string()],
-            None,
-            None,
-            None,
-            None,
-            None,
+            RuntimeEnv::default(),
         )
         .expect_err("missing checkpoint value should fail");
 
@@ -1488,8 +1798,9 @@ mod tests {
             &checkpoint_path,
             TrainingDemoOptions {
                 backend_label: "cpu",
-                log_format: TrainingLogFormat::Plain,
+                logger: EventLogger::stdout(LogFormat::Plain),
                 benchmark_generation: true,
+                benchmark_config: BenchmarkConfig::default(),
             },
         )
         .expect_err("benchmarking should require minigpt or compare");

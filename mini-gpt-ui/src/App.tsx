@@ -41,26 +41,28 @@ function App() {
       </div>
       {response && (
         <div className="response">
-          <h2>Generated Text:</h2>
-          <p>{response.generated}</p>
-          <h2>Generated Tokens:</h2>
-          <ul className="token-list" aria-label="Generated tokens">
-            {response.tokens.map((token, index) => (
-              <li
-                key={index}
-                className={index === selectedToken ? 'selected' : ''}
-              >
-                <button type="button" onClick={() => setSelectedToken(index)}>
-                  {token}
-                </button>
-              </li>
-            ))}
-          </ul>
-          {selectedToken !== null && (
-            <div className="logprobs">
-              <h3>Selected Token: "{response.tokens[selectedToken]}"</h3>
-            </div>
-          )}
+          <div className="generation-panel">
+            <h2>Generated Text:</h2>
+            <p>{response.generated}</p>
+            <h2>Generated Tokens:</h2>
+            <ul className="token-list" aria-label="Generated tokens">
+              {response.tokens.map((token, index) => (
+                <li
+                  key={index}
+                  className={index === selectedToken ? 'selected' : ''}
+                >
+                  <button type="button" onClick={() => setSelectedToken(index)}>
+                    {token}
+                  </button>
+                </li>
+              ))}
+            </ul>
+            {selectedToken !== null && (
+              <div className="logprobs">
+                <h3>Selected Token: "{response.tokens[selectedToken]}"</h3>
+              </div>
+            )}
+          </div>
           {selectedAttention && (
             <section className="attention-panel" aria-labelledby="attention-heading">
               <div className="attention-header">

@@ -87,6 +87,7 @@ CLI flags and `RUSTY_GPT_*` environment variables can both drive runtime behavio
 | `--input <path>` | `RUSTY_GPT_INPUT` | `data/input.txt` | Plain UTF-8 text. |
 | `--model <name>` | `RUSTY_GPT_MODEL` | `trivial` | `trivial`, `single-attention`, `multi-attention`, `minigpt` (alias `mini-gpt`), `compare`. |
 | `--checkpoint <path>` | `RUSTY_GPT_MINIGPT_CHECKPOINT` | `checkpoints/mini_gpt` | Path without `.mpk` — Burn appends it. |
+| `--log-format plain\|json` | `RUSTY_GPT_LOG_FORMAT` | backend default | CPU defaults to plain text; CUDA defaults to JSON Lines. |
 | — | `RUSTY_GPT_BPE_TOKENIZER` | `checkpoints/tokenizer.json` | BPE tokenizer JSON used by MiniGPT and `compare` runs. |
 | `--interactive-generate` | — | off | Requires `--backend cpu` and `--model minigpt`. |
 | `--serve` | — | off | Starts the HTTP API under `/api`; supports `cpu` and compiled-in `cuda` backends. |
@@ -97,6 +98,10 @@ CLI flags and `RUSTY_GPT_*` environment variables can both drive runtime behavio
 | — | `RUSTY_GPT_EVAL_INTERVAL` | `100` | `0` ⇒ log only the final step. |
 | — | `RUSTY_GPT_GENERATE_TOKENS` | `80` | |
 | — | `RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM` | `1.0` | Must be > 0. |
+| `--benchmark-prompt-lens <list>` | `RUSTY_GPT_BENCHMARK_PROMPT_LENS` | `10,50,100` | Comma-separated prompt lengths for `--benchmark-generation`. |
+| `--benchmark-gen-lens <list>` | `RUSTY_GPT_BENCHMARK_GEN_LENS` | `50,100,200` | Comma-separated generated-token lengths for `--benchmark-generation`. |
+| `--benchmark-warmups <n>` | `RUSTY_GPT_BENCHMARK_WARMUPS` | `1` | Warmup iterations per benchmark case. |
+| `--benchmark-iterations <n>` | `RUSTY_GPT_BENCHMARK_ITERATIONS` | `5` | Measured iterations per benchmark case. |
 
 Model-shape hyperparameters (`BLOCK_SIZE`, `BATCH_SIZE`, `EMBED_DIM`, `NUM_HEADS`, `NUM_LAYERS`, `DROPOUT`, `LEARNING_RATE`) are compile-time constants at the top of `src/main.rs`.
 
