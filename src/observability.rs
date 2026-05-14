@@ -115,6 +115,9 @@ pub enum RuntimeEvent {
         training_loss: f64,
         value_loss: f64,
         elapsed_ms: u128,
+        tokens_per_second: f64,
+        steps_per_second: f64,
+        step_ms_mean: f64,
     },
     TrainingCompleted {
         backend: String,
@@ -238,9 +241,12 @@ impl RuntimeEvent {
                 training_loss,
                 value_loss,
                 elapsed_ms,
+                tokens_per_second,
+                steps_per_second,
+                step_ms_mean,
                 ..
             } => format!(
-                "Step {step}/{total_steps}: training loss = {training_loss:.4}, value loss = {value_loss:.4}, elapsed={elapsed_ms}ms"
+                "Step {step}/{total_steps}: training loss = {training_loss:.4}, value loss = {value_loss:.4}, elapsed={elapsed_ms}ms, tokens_per_second={tokens_per_second:.2}, steps_per_second={steps_per_second:.4}, step_ms_mean={step_ms_mean:.2}"
             ),
             Self::TrainingCompleted {
                 backend,
@@ -343,5 +349,34 @@ mod tests {
         assert_eq!(3, parsed["prompt_tokens"]);
         assert_eq!(5, parsed["generated_tokens"]);
         assert_eq!(7, parsed["elapsed_ms"]);
+    }
+
+    #[test]
+    fn json_training_progress_includes_throughput_fields() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&lines);
+        let logger = EventLogger::with_sink(LogFormat::Json, move |line| {
+            captured.lock().unwrap().push(line);
+        });
+
+        logger.log(RuntimeEvent::TrainingProgress {
+            backend: "cuda".to_string(),
+            model: "minigpt".to_string(),
+            step: 9,
+            total_steps: 100,
+            training_loss: 1.25,
+            value_loss: 1.5,
+            elapsed_ms: 250,
+            tokens_per_second: 8192.0,
+            steps_per_second: 40.0,
+            step_ms_mean: 25.0,
+        });
+
+        let lines = lines.lock().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!("training_progress", parsed["event"]);
+        assert_eq!(8192.0, parsed["tokens_per_second"]);
+        assert_eq!(40.0, parsed["steps_per_second"]);
+        assert_eq!(25.0, parsed["step_ms_mean"]);
     }
 }

@@ -115,16 +115,57 @@ fn training_progress_log_line<B: Backend>(
     steps: usize,
     training_loss: B::FloatElem,
     value_loss: B::FloatElem,
+    throughput: TrainingThroughput,
 ) -> String {
     match context.logger.format() {
         LogFormat::Plain => {
-            format!("Step {step}: training loss = {training_loss:.4}, value loss = {value_loss:.4}")
+            format!(
+                "Step {step}: training loss = {training_loss:.4}, value loss = {value_loss:.4}, tokens_per_second={:.2}, steps_per_second={:.4}, step_ms_mean={:.2}",
+                throughput.tokens_per_second, throughput.steps_per_second, throughput.step_ms_mean
+            )
         }
         LogFormat::Json => {
             format!(
-                r#"{{"event":"training_progress","backend":"{}","model":"{}","step":{},"total_steps":{},"training_loss":{:.6},"value_loss":{:.6}}}"#,
-                context.backend, context.model, step, steps, training_loss, value_loss
+                r#"{{"event":"training_progress","backend":"{}","model":"{}","step":{},"total_steps":{},"training_loss":{:.6},"value_loss":{:.6},"elapsed_ms":{},"tokens_per_second":{:.6},"steps_per_second":{:.6},"step_ms_mean":{:.6}}}"#,
+                context.backend,
+                context.model,
+                step,
+                steps,
+                training_loss,
+                value_loss,
+                throughput.elapsed_ms,
+                throughput.tokens_per_second,
+                throughput.steps_per_second,
+                throughput.step_ms_mean
             )
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrainingThroughput {
+    elapsed_ms: u128,
+    tokens_per_second: f64,
+    steps_per_second: f64,
+    step_ms_mean: f64,
+}
+
+impl TrainingThroughput {
+    fn from_progress(
+        completed_steps: usize,
+        batch_size: usize,
+        block_size: usize,
+        elapsed_ms: u128,
+    ) -> Self {
+        let elapsed_seconds = elapsed_ms.max(1) as f64 / 1000.0;
+        let completed_steps = completed_steps as f64;
+        let processed_tokens = completed_steps * batch_size as f64 * block_size as f64;
+
+        Self {
+            elapsed_ms,
+            tokens_per_second: processed_tokens / elapsed_seconds,
+            steps_per_second: completed_steps / elapsed_seconds,
+            step_ms_mean: elapsed_ms as f64 / completed_steps.max(1.0),
         }
     }
 }
@@ -135,7 +176,7 @@ fn log_training_progress<B: Backend>(
     steps: usize,
     training_loss: B::FloatElem,
     value_loss: B::FloatElem,
-    elapsed_ms: u128,
+    throughput: TrainingThroughput,
 ) where
     B::FloatElem: Into<f64>,
 {
@@ -146,7 +187,10 @@ fn log_training_progress<B: Backend>(
         total_steps: steps,
         training_loss: training_loss.into(),
         value_loss: value_loss.into(),
-        elapsed_ms,
+        elapsed_ms: throughput.elapsed_ms,
+        tokens_per_second: throughput.tokens_per_second,
+        steps_per_second: throughput.steps_per_second,
+        step_ms_mean: throughput.step_ms_mean,
     });
 }
 
@@ -201,6 +245,12 @@ where
         model = optimizer.step(params.learning_rate, model, grads);
 
         if should_log_training_step(step, params.steps, params.eval_interval) {
+            let throughput = TrainingThroughput::from_progress(
+                step + 1,
+                loader.batch_size,
+                loader.block_size,
+                started_at.elapsed().as_millis(),
+            );
             let training_loss = loss.into_scalar();
             let value_loss = value_loss(value_loader, device, &loss_fn, |inputs| {
                 forward(&model, inputs)
@@ -211,7 +261,7 @@ where
                 params.steps,
                 training_loss,
                 value_loss,
-                started_at.elapsed().as_millis(),
+                throughput,
             );
         }
     }
@@ -467,8 +517,25 @@ impl<B: Backend> MultiHeadAttention<B> {
         output
     }
 
+    pub fn forward_with_mask(&self, x: Tensor<B, 3>, mask: Tensor<B, 4, Bool>) -> Tensor<B, 3> {
+        let (output, _attn_weights) = self.forward_inner_with_mask(x, mask, false);
+        output
+    }
+
     pub fn forward_with_weights(&self, x: Tensor<B, 3>) -> (Tensor<B, 3>, Tensor<B, 4>) {
         let (output, attn_weights) = self.forward_inner(x, true);
+        (
+            output,
+            attn_weights.expect("attention weights should be returned when requested"),
+        )
+    }
+
+    pub fn forward_with_weights_and_mask(
+        &self,
+        x: Tensor<B, 3>,
+        mask: Tensor<B, 4, Bool>,
+    ) -> (Tensor<B, 3>, Tensor<B, 4>) {
+        let (output, attn_weights) = self.forward_inner_with_mask(x, mask, true);
         (
             output,
             attn_weights.expect("attention weights should be returned when requested"),
@@ -526,12 +593,22 @@ impl<B: Backend> MultiHeadAttention<B> {
         x: Tensor<B, 3>,
         return_weights: bool,
     ) -> (Tensor<B, 3>, Option<Tensor<B, 4>>) {
+        let [batch_size, seq_len, _] = x.shape().dims();
+        let mask = Self::causal_mask(batch_size, self.num_heads, seq_len, &x.device());
+        self.forward_inner_with_mask(x, mask, return_weights)
+    }
+
+    fn forward_inner_with_mask(
+        &self,
+        x: Tensor<B, 3>,
+        mask: Tensor<B, 4, Bool>,
+        return_weights: bool,
+    ) -> (Tensor<B, 3>, Option<Tensor<B, 4>>) {
         let embed_dim = self.num_heads * self.head_dim;
         let (q, k, v) = self.project_qkv(x);
         let [batch_size, _, seq_len, _] = q.shape().dims();
 
         let scores = q.matmul(k.swap_dims(2, 3)) / (self.head_dim as f32).sqrt();
-        let mask = Self::causal_mask(batch_size, self.num_heads, seq_len, &scores.device());
         let scores = scores.mask_fill(mask, f32::NEG_INFINITY);
         let attn_weights = softmax(scores, 3);
         let (context, attn_weights) = if return_weights {
@@ -680,9 +757,27 @@ impl<B: Backend> Block<B> {
         x.clone() + self.mlp.forward(self.ln2.forward(x))
     }
 
+    pub fn forward_with_mask(&self, x: Tensor<B, 3>, mask: Tensor<B, 4, Bool>) -> Tensor<B, 3> {
+        let x = x.clone() + self.attn.forward_with_mask(self.ln1.forward(x), mask);
+        x.clone() + self.mlp.forward(self.ln2.forward(x))
+    }
+
     pub fn forward_with_weights(&self, x: Tensor<B, 3>) -> (Tensor<B, 3>, Tensor<B, 4>) {
         let (attn_output, attn_weights) =
             self.attn.forward_with_weights(self.ln1.forward(x.clone()));
+        let x = x + attn_output;
+        let x = x.clone() + self.mlp.forward(self.ln2.forward(x));
+        (x, attn_weights)
+    }
+
+    pub fn forward_with_weights_and_mask(
+        &self,
+        x: Tensor<B, 3>,
+        mask: Tensor<B, 4, Bool>,
+    ) -> (Tensor<B, 3>, Tensor<B, 4>) {
+        let (attn_output, attn_weights) = self
+            .attn
+            .forward_with_weights_and_mask(self.ln1.forward(x.clone()), mask);
         let x = x + attn_output;
         let x = x.clone() + self.mlp.forward(self.ln2.forward(x));
         (x, attn_weights)
@@ -787,8 +882,17 @@ impl<B: Backend> MiniGpt<B> {
     }
 
     pub fn forward(&self, mut x: Tensor<B, 3>) -> Tensor<B, 3> {
-        for block in &self.blocks {
-            x = block.forward(x);
+        if let Some(first_block) = self.blocks.first() {
+            let [batch_size, seq_len, _] = x.shape().dims();
+            let mask = MultiHeadAttention::<B>::causal_mask(
+                batch_size,
+                first_block.num_heads(),
+                seq_len,
+                &x.device(),
+            );
+            for block in &self.blocks {
+                x = block.forward_with_mask(x, mask.clone());
+            }
         }
 
         let x = self.ln_final.forward(x);
@@ -837,10 +941,19 @@ impl<B: Backend> MiniGpt<B> {
 
     pub fn forward_with_attention(&self, mut x: Tensor<B, 3>) -> (Tensor<B, 3>, Vec<Tensor<B, 4>>) {
         let mut attentions = Vec::with_capacity(self.blocks.len());
-        for block in &self.blocks {
-            let (next_x, attention) = block.forward_with_weights(x);
-            x = next_x;
-            attentions.push(attention);
+        if let Some(first_block) = self.blocks.first() {
+            let [batch_size, seq_len, _] = x.shape().dims();
+            let mask = MultiHeadAttention::<B>::causal_mask(
+                batch_size,
+                first_block.num_heads(),
+                seq_len,
+                &x.device(),
+            );
+            for block in &self.blocks {
+                let (next_x, attention) = block.forward_with_weights_and_mask(x, mask.clone());
+                x = next_x;
+                attentions.push(attention);
+            }
         }
 
         let x = self.ln_final.forward(x);
@@ -1028,6 +1141,7 @@ mod tests {
             100,
             1.25,
             2.5,
+            TrainingThroughput::from_progress(11, 32, 128, 250),
         );
         let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
 
@@ -1038,6 +1152,10 @@ mod tests {
         assert_eq!(100, parsed["total_steps"]);
         assert_eq!(1.25, parsed["training_loss"]);
         assert_eq!(2.5, parsed["value_loss"]);
+        assert_eq!(250, parsed["elapsed_ms"]);
+        assert!(parsed["tokens_per_second"].as_f64().unwrap() > 0.0);
+        assert!(parsed["steps_per_second"].as_f64().unwrap() > 0.0);
+        assert!(parsed["step_ms_mean"].as_f64().unwrap() > 0.0);
     }
 
     #[test]
@@ -1074,6 +1192,9 @@ mod tests {
         assert_eq!("training_progress", final_progress["event"]);
         assert_eq!(2, final_progress["step"]);
         assert_eq!(3, final_progress["total_steps"]);
+        assert!(final_progress["tokens_per_second"].as_f64().unwrap() > 0.0);
+        assert!(final_progress["steps_per_second"].as_f64().unwrap() > 0.0);
+        assert!(final_progress["step_ms_mean"].as_f64().unwrap() > 0.0);
     }
 
     #[test]
@@ -1315,6 +1436,32 @@ mod tests {
         let logits = model.forward(input);
 
         assert_eq!([2, 3, 7], logits.shape().dims());
+    }
+
+    #[test]
+    fn minigpt_shared_mask_forward_matches_per_block_mask_forward() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let model = MiniGpt::<TestBackend>::new(7, 8, 2, 6, 2, &device);
+        let input = Tensor::<TestBackend, 3>::zeros([2, 3, 8], &device);
+
+        let shared_mask_logits = model
+            .forward(input.clone())
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let mut x = input;
+        for block in &model.blocks {
+            x = block.forward(x);
+        }
+        let per_block_mask_logits = model
+            .lm_head
+            .forward(model.ln_final.forward(x))
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+
+        assert_eq!(per_block_mask_logits, shared_mask_logits);
     }
 
     #[test]

@@ -14,7 +14,8 @@ cargo run --release --bin rusty-gpt -- --model minigpt
 # Train on CUDA (requires the CUDA toolkit installed; opt in via the `cuda` Cargo feature)
 cargo run --release --features cuda --bin rusty-gpt -- --backend cuda --model minigpt
 
-# Train from a file on CUDA via the helper script
+# Train from a file on CUDA via the helper script.
+# The script uses cargo --release by default and CUDA-friendly logging defaults.
 ./scripts/run_training.sh --backend cuda --checkpoint checkpoints/mini_gpt data/input.txt
 
 # Train a BPE tokenizer from a corpus
@@ -96,12 +97,15 @@ CLI flags and `RUSTY_GPT_*` environment variables can both drive runtime behavio
 | `--server-addr <host:port>` | `RUSTY_GPT_SERVER_ADDR` | `127.0.0.1:8787` | Address used by `--serve`. |
 | — | `RUSTY_GPT_TRAIN_STEPS` | `1000` | |
 | — | `RUSTY_GPT_EVAL_INTERVAL` | `100` | `0` ⇒ log only the final step. |
+| — | `RUSTY_GPT_PREFETCH_BATCHES` | `2` | Number of prepared CPU batches queued ahead of training. |
 | — | `RUSTY_GPT_GENERATE_TOKENS` | `80` | |
 | — | `RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM` | `1.0` | Must be > 0. |
 | `--benchmark-prompt-lens <list>` | `RUSTY_GPT_BENCHMARK_PROMPT_LENS` | `10,50,100` | Comma-separated prompt lengths for `--benchmark-generation`. |
 | `--benchmark-gen-lens <list>` | `RUSTY_GPT_BENCHMARK_GEN_LENS` | `50,100,200` | Comma-separated generated-token lengths for `--benchmark-generation`. |
 | `--benchmark-warmups <n>` | `RUSTY_GPT_BENCHMARK_WARMUPS` | `1` | Warmup iterations per benchmark case. |
 | `--benchmark-iterations <n>` | `RUSTY_GPT_BENCHMARK_ITERATIONS` | `5` | Measured iterations per benchmark case. |
+
+`scripts/run_training.sh` defaults to `cargo run --release`. Set `RUSTY_GPT_CARGO_PROFILE=dev` for faster debug builds while iterating. For `--backend cuda`, the script defaults to JSON logs, `RUSTY_GPT_PREFETCH_BATCHES=2`, and `RUSTY_GPT_EVAL_INTERVAL=500` unless those values are already provided.
 
 Model-shape hyperparameters (`BLOCK_SIZE`, `BATCH_SIZE`, `EMBED_DIM`, `NUM_HEADS`, `NUM_LAYERS`, `DROPOUT`, `LEARNING_RATE`) are compile-time constants at the top of `src/main.rs`.
 
