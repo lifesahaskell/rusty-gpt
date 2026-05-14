@@ -84,6 +84,8 @@ RUSTY_GPT_BACKEND=cuda ./scripts/build_release_candidate.sh
 
 Artifacts are written to `target/release-candidates/`.
 
+See [docs/release-and-evaluation.md](docs/release-and-evaluation.md) for CPU/CUDA artifact expectations, package smoke checks, packaged API startup, and repeatable training/benchmark artifact capture.
+
 ## Configuration
 
 CLI flags and `RUSTY_GPT_*` environment variables can both drive runtime behavior; the CLI wins when both are set.
@@ -186,6 +188,8 @@ The CUDA backend is compiled into the binary with `--features cuda`, but it stil
 - `scripts/run_local.sh` — starts the local UI dev server.
 - `scripts/run_e2e_tests.sh` — runs the full-stack E2E suite.
 - `scripts/build_release_candidate.sh` — packages a deployable release-candidate tarball.
+- `docs/project-refinement-phase.md` — engineering backlog for runtime hardening, maintainability, and follow-on exploration.
+- `docs/release-and-evaluation.md` — release packaging and lightweight evaluation runbook.
 - `tests/default_runtime.rs` — runs the binary and asserts the CPU default path never loads `libcuda`.
 
 ## License

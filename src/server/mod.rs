@@ -43,6 +43,14 @@ impl<B: Backend> ServerState<B> {
     pub fn model_block_size(&self) -> usize {
         self.model.block_size()
     }
+
+    pub fn tokenizer_vocab_size(&self) -> usize {
+        self.tokenizer.vocab_size()
+    }
+
+    pub fn model_tokenizer_vocab_match(&self) -> bool {
+        self.model.vocab_size() == self.tokenizer.vocab_size()
+    }
 }
 
 pub fn router<B>() -> Router<SharedServerState<B>>
@@ -83,6 +91,8 @@ pub struct InfoResponse {
     pub num_layers: usize,
     pub num_heads: usize,
     pub block_size: usize,
+    pub tokenizer_vocab_size: usize,
+    pub model_tokenizer_vocab_match: bool,
 }
 
 async fn generate<B>(
@@ -190,6 +200,8 @@ where
         num_layers: state.model.num_layers(),
         num_heads: state.model.num_heads(),
         block_size: state.model.block_size(),
+        tokenizer_vocab_size: state.tokenizer.vocab_size(),
+        model_tokenizer_vocab_match: state.model_tokenizer_vocab_match(),
     })
 }
 
@@ -275,6 +287,28 @@ mod tests {
         assert_eq!(2, state.model.num_layers());
         assert_eq!(2, state.model.num_heads());
         assert_eq!(6, state.model.block_size());
+        assert_eq!(7, state.tokenizer_vocab_size());
+        assert!(state.model_tokenizer_vocab_match());
+    }
+
+    #[tokio::test]
+    async fn info_exposes_runtime_tokenizer_compatibility() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let model = MiniGpt::<TestBackend>::new(8, 8, 1, 6, 2, &device);
+        let tokenizer = RuntimeTokenizer::char_from_text("abcdefg");
+        let state = Arc::new(ServerState::new(
+            model,
+            tokenizer,
+            device,
+            EventLogger::stdout(LogFormat::Plain),
+        ));
+
+        let Json(response) = info(State(state)).await;
+
+        assert_eq!(8, response.vocab_size);
+        assert_eq!(7, response.tokenizer_vocab_size);
+        assert!(!response.model_tokenizer_vocab_match);
     }
 
     #[test]

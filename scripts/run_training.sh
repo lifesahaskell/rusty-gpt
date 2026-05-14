@@ -20,6 +20,7 @@ Options:
   --benchmark-gen-lens list              Comma-separated generation lengths, e.g. 50,100,200
   --benchmark-warmups n                  Warmup iterations per benchmark case
   --benchmark-iterations n               Measured iterations per benchmark case
+  --artifacts-dir path                   Save run manifest and combined training/benchmark log
   -h, --help                             Show this help
 
 Environment overrides:
@@ -36,6 +37,7 @@ Environment overrides:
   RUSTY_GPT_BENCHMARK_GEN_LENS=list       Default: app default
   RUSTY_GPT_BENCHMARK_WARMUPS=<int>       Default: app default
   RUSTY_GPT_BENCHMARK_ITERATIONS=<int>    Default: app default
+  RUSTY_GPT_RUN_ARTIFACT_DIR=<path>        Save manifest.txt and training.log for repeatable runs
 USAGE
 }
 
@@ -51,6 +53,7 @@ TRAIN_TOKENIZER=0
 TOKENIZER_VOCAB_SIZE="${RUSTY_GPT_TOKENIZER_VOCAB_SIZE:-2048}"
 LOG_FORMAT_ARGS=()
 BENCHMARK_ARGS=()
+ARTIFACTS_DIR_ARG=""
 TRAINING_FILE=""
 
 while [[ $# -gt 0 ]]; do
@@ -135,6 +138,18 @@ while [[ $# -gt 0 ]]; do
       BENCHMARK_ARGS+=("${1%%=*}" "${1#*=}")
       shift
       ;;
+    --artifacts-dir)
+      if [[ $# -lt 2 ]]; then
+        echo "--artifacts-dir requires a path" >&2
+        exit 2
+      fi
+      ARTIFACTS_DIR_ARG="$2"
+      shift 2
+      ;;
+    --artifacts-dir=*)
+      ARTIFACTS_DIR_ARG="${1#--artifacts-dir=}"
+      shift
+      ;;
     -*)
       echo "Unsupported argument: $1" >&2
       usage >&2
@@ -163,6 +178,7 @@ RUSTY_GPT_MODEL="${RUSTY_GPT_MODEL:-minigpt}"
 RUSTY_GPT_MINIGPT_CHECKPOINT="${CHECKPOINT_ARG:-${RUSTY_GPT_MINIGPT_CHECKPOINT:-checkpoints/mini_gpt}}"
 RUSTY_GPT_CARGO_PROFILE="${RUSTY_GPT_CARGO_PROFILE:-release}"
 RUSTY_GPT_BPE_TOKENIZER="${TOKENIZER_ARG:-${RUSTY_GPT_BPE_TOKENIZER:-checkpoints/tokenizer.json}}"
+RUSTY_GPT_RUN_ARTIFACT_DIR="${ARTIFACTS_DIR_ARG:-${RUSTY_GPT_RUN_ARTIFACT_DIR:-}}"
 
 if [[ "$TRAINING_FILE" == hf://* ]]; then
   :
@@ -206,14 +222,52 @@ mkdir -p "$(dirname "$RUSTY_GPT_MINIGPT_CHECKPOINT")"
 mkdir -p "$(dirname "$RUSTY_GPT_BPE_TOKENIZER")"
 export RUSTY_GPT_BPE_TOKENIZER
 
+ARTIFACT_LOG=""
+if [[ -n "$RUSTY_GPT_RUN_ARTIFACT_DIR" ]]; then
+  mkdir -p "$RUSTY_GPT_RUN_ARTIFACT_DIR"
+  RUSTY_GPT_RUN_ARTIFACT_DIR="$(cd "$RUSTY_GPT_RUN_ARTIFACT_DIR" && pwd)"
+  ARTIFACT_LOG="$RUSTY_GPT_RUN_ARTIFACT_DIR/training.log"
+  : > "$ARTIFACT_LOG"
+  cat > "$RUSTY_GPT_RUN_ARTIFACT_DIR/manifest.txt" <<MANIFEST
+created_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+backend=$RUSTY_GPT_BACKEND
+model=$RUSTY_GPT_MODEL
+input=$TRAINING_FILE
+checkpoint=$RUSTY_GPT_MINIGPT_CHECKPOINT
+tokenizer=$RUSTY_GPT_BPE_TOKENIZER
+cargo_profile=$RUSTY_GPT_CARGO_PROFILE
+train_tokenizer=$TRAIN_TOKENIZER
+tokenizer_vocab_size=$TOKENIZER_VOCAB_SIZE
+benchmark_args=${BENCHMARK_ARGS[*]-}
+log_format_args=${LOG_FORMAT_ARGS[*]-}
+MANIFEST
+fi
+
+run_logged() {
+  local label="$1"
+  shift
+
+  if [[ -n "$ARTIFACT_LOG" ]]; then
+    {
+      printf '\n[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$label"
+      printf '$'
+      printf ' %q' "$@"
+      printf '\n'
+    } | tee -a "$ARTIFACT_LOG"
+    "$@" 2>&1 | tee -a "$ARTIFACT_LOG"
+  else
+    "$@"
+  fi
+}
+
 if [[ "$TRAIN_TOKENIZER" == "1" ]]; then
-  cargo run "${CARGO_PROFILE_ARGS[@]}" --bin train-tokenizer -- \
+  run_logged "train tokenizer" cargo run "${CARGO_PROFILE_ARGS[@]}" --bin train-tokenizer -- \
     --corpus "$TRAINING_FILE" \
     --vocab-size "$TOKENIZER_VOCAB_SIZE" \
     --output "$RUSTY_GPT_BPE_TOKENIZER"
 fi
 
-cargo run "${CARGO_PROFILE_ARGS[@]}" "${CARGO_FEATURE_ARGS[@]}" --bin rusty-gpt -- \
+run_logged "train and evaluate" cargo run "${CARGO_PROFILE_ARGS[@]}" "${CARGO_FEATURE_ARGS[@]}" --bin rusty-gpt -- \
   --input "$TRAINING_FILE" \
   --model "$RUSTY_GPT_MODEL" \
   --checkpoint "$RUSTY_GPT_MINIGPT_CHECKPOINT" \

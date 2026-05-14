@@ -28,6 +28,15 @@ const generateResponse = {
   ],
 }
 
+const modelInfo = {
+  vocab_size: 2048,
+  num_layers: 4,
+  num_heads: 4,
+  block_size: 128,
+  tokenizer_vocab_size: 2048,
+  model_tokenizer_vocab_match: true,
+}
+
 describe('App generation flow', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
@@ -35,25 +44,40 @@ describe('App generation flow', () => {
 
   it('posts the prompt and renders generated text, tokens, and attention controls', async () => {
     const user = userEvent.setup()
-    const fetchMock = vi.fn().mockResolvedValue({
-      json: vi.fn().mockResolvedValue(generateResponse),
-    })
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ json: vi.fn().mockResolvedValue(modelInfo) })
+      .mockResolvedValueOnce({ json: vi.fn().mockResolvedValue(generateResponse) })
     vi.stubGlobal('fetch', fetchMock)
 
     render(<App />)
 
-    await user.clear(screen.getByLabelText(/prompt/i))
-    await user.type(screen.getByLabelText(/prompt/i), 'hello')
+    await screen.findByText('Ready')
+    expect(screen.getByRole('tab', { name: /prompt/i })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.queryByRole('heading', { name: /training dashboard/i })).not.toBeInTheDocument()
+
+    await user.clear(screen.getByRole('textbox', { name: /prompt/i }))
+    await user.type(screen.getByRole('textbox', { name: /prompt/i }), 'hello')
+    await user.clear(screen.getByLabelText(/max tokens/i))
+    await user.type(screen.getByLabelText(/max tokens/i), '12')
+    await user.clear(screen.getByLabelText(/temperature/i))
+    await user.type(screen.getByLabelText(/temperature/i), '0.75')
+    await user.type(screen.getByLabelText(/top k/i), '4')
     await user.click(screen.getByRole('button', { name: /generate/i }))
 
     await screen.findByText('ROMEO: hi')
 
+    expect(fetchMock).toHaveBeenCalledWith('/api/info')
     expect(fetchMock).toHaveBeenCalledWith('/api/generate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt: 'hello', max_tokens: 80, temperature: 1 }),
+      body: JSON.stringify({ prompt: 'hello', max_tokens: 12, temperature: 0.75, top_k: 4 }),
     })
     expect(screen.getByRole('list', { name: /generated tokens/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^attention$/i })).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: /^attention$/i }))
+
     expect(screen.getByRole('combobox', { name: /layer \/ head/i })).toHaveValue('0')
     expect(screen.getByRole('img', { name: /attention weight heatmap/i })).toBeInTheDocument()
   })
@@ -62,33 +86,64 @@ describe('App generation flow', () => {
     const user = userEvent.setup()
     const fetchMock = vi
       .fn()
+      .mockResolvedValueOnce({ json: vi.fn().mockResolvedValue(modelInfo) })
       .mockResolvedValueOnce({ json: vi.fn().mockResolvedValue(generateResponse) })
       .mockResolvedValueOnce({ json: vi.fn().mockResolvedValue(generateResponse) })
     vi.stubGlobal('fetch', fetchMock)
 
     render(<App />)
 
+    await screen.findByText('Ready')
     await user.click(screen.getByRole('button', { name: /generate/i }))
     await screen.findByText('ROMEO: hi')
     await user.click(screen.getByRole('button', { name: 'E' }))
+    await user.click(screen.getByRole('button', { name: /^attention$/i }))
     await user.selectOptions(screen.getByRole('combobox', { name: /layer \/ head/i }), '1')
 
-    expect(screen.getByText('Selected Token: "E"')).toBeInTheDocument()
+    expect(screen.getByText('Focused token: "E"')).toBeInTheDocument()
     expect(screen.getByRole('combobox', { name: /layer \/ head/i })).toHaveValue('1')
 
+    await user.click(screen.getByRole('button', { name: /back to tokens/i }))
     await user.click(screen.getByRole('button', { name: /generate/i }))
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
     expect(screen.queryByText(/selected token/i)).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /^attention$/i }))
     expect(screen.getByRole('combobox', { name: /layer \/ head/i })).toHaveValue('0')
+  })
+
+  it('keeps prompt, attention, and training concerns in separate workspaces', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ json: vi.fn().mockResolvedValue(modelInfo) }))
+
+    render(<App />)
+
+    await screen.findByText('Ready')
+    expect(screen.getByRole('heading', { name: /generation/i })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: /attention visualization/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: /training dashboard/i })).not.toBeInTheDocument()
+
+    screen.getByRole('tab', { name: /prompt/i }).focus()
+    await user.keyboard('{ArrowRight}')
+    expect(screen.getByRole('heading', { name: /attention visualization/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^prompt$/i })).toBeInTheDocument()
+    expect(screen.queryByRole('textbox', { name: /prompt/i })).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('tab', { name: /training/i }))
+    expect(screen.getByRole('heading', { name: /training dashboard/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /start training/i })).toBeDisabled()
+    expect(screen.queryByRole('heading', { name: /generation/i })).not.toBeInTheDocument()
   })
 
   it('keeps generated token buttons inside the generated-token list', async () => {
     const user = userEvent.setup()
-    vi.stubGlobal(
-      'fetch',
-      vi.fn().mockResolvedValue({ json: vi.fn().mockResolvedValue(generateResponse) }),
-    )
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string) => {
+      if (url === '/api/info') {
+        return Promise.resolve({ json: vi.fn().mockResolvedValue(modelInfo) })
+      }
+
+      return Promise.resolve({ json: vi.fn().mockResolvedValue(generateResponse) })
+    }))
 
     render(<App />)
 
@@ -96,5 +151,30 @@ describe('App generation flow', () => {
 
     const tokenList = await screen.findByRole('list', { name: /generated tokens/i })
     expect(within(tokenList).getAllByRole('button')).toHaveLength(generateResponse.tokens.length)
+  })
+
+  it('surfaces API validation errors from generation requests', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string) => {
+      if (url === '/api/info') {
+        return Promise.resolve({ json: vi.fn().mockResolvedValue(modelInfo) })
+      }
+
+      return Promise.resolve({
+        ok: false,
+        status: 400,
+        statusText: 'Bad Request',
+        text: vi.fn().mockResolvedValue('temperature must be greater than zero'),
+      })
+    }))
+
+    render(<App />)
+
+    await screen.findByText('Ready')
+    await user.click(screen.getByRole('button', { name: /generate/i }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'temperature must be greater than zero',
+    )
   })
 })
