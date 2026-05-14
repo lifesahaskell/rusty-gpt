@@ -1,9 +1,13 @@
 use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const DATASETS_SERVER_ROWS_URL: &str = "https://datasets-server.huggingface.co/rows";
 const DEFAULT_CONFIG: &str = "default";
@@ -11,6 +15,8 @@ const DEFAULT_SPLIT: &str = "train";
 const DEFAULT_COLUMN: &str = "text";
 const DEFAULT_ROWS: usize = 1_000;
 const MAX_PAGE_ROWS: usize = 100;
+const DEFAULT_CACHE_DIR: &str = "data/huggingface-cache";
+const CACHE_DIR_ENV: &str = "RUSTY_GPT_HF_DATASET_CACHE";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HuggingFaceDatasetSpec {
@@ -67,6 +73,25 @@ impl HuggingFaceDatasetSpec {
             percent_encode(&self.split)
         )
     }
+
+    fn cache_key(&self) -> String {
+        format!(
+            "dataset={}\nconfig={}\nsplit={}\ncolumn={}\noffset={}\nrows={}\n",
+            self.dataset, self.config, self.split, self.column, self.offset, self.rows
+        )
+    }
+
+    fn cache_path(&self, cache_dir: &Path) -> PathBuf {
+        let digest = Sha256::digest(self.cache_key());
+        let dataset = safe_cache_component(&self.dataset);
+        let config = safe_cache_component(&self.config);
+        let split = safe_cache_component(&self.split);
+        let column = safe_cache_component(&self.column);
+        cache_dir.join(format!(
+            "{dataset}__{config}__{split}__{column}__offset-{}__rows-{}__{digest:x}.txt",
+            self.offset, self.rows,
+        ))
+    }
 }
 
 pub fn load_text_from_uri(input: &str) -> Result<Option<String>> {
@@ -74,7 +99,59 @@ pub fn load_text_from_uri(input: &str) -> Result<Option<String>> {
         return Ok(None);
     };
 
-    load_text(&spec).map(Some)
+    load_text_cached(&spec, &cache_dir()).map(Some)
+}
+
+pub fn load_text_from_uri_with_cache_dir(
+    input: &str,
+    cache_dir: impl AsRef<Path>,
+) -> Result<Option<String>> {
+    let Some(spec) = HuggingFaceDatasetSpec::parse(input)? else {
+        return Ok(None);
+    };
+
+    load_text_cached(&spec, cache_dir.as_ref()).map(Some)
+}
+
+fn cache_dir() -> PathBuf {
+    env::var(CACHE_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_CACHE_DIR))
+}
+
+fn load_text_cached(spec: &HuggingFaceDatasetSpec, cache_dir: &Path) -> Result<String> {
+    let cache_path = spec.cache_path(cache_dir);
+    if cache_path.is_file() {
+        let cached = fs::read_to_string(&cache_path).with_context(|| {
+            format!(
+                "failed to read cached Hugging Face dataset from {:?}",
+                cache_path
+            )
+        })?;
+        if !cached.trim().is_empty() {
+            return Ok(cached);
+        }
+    }
+
+    let text = load_text(spec)?;
+    if let Some(parent) = cache_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create Hugging Face dataset cache directory {:?}",
+                parent
+            )
+        })?;
+    }
+    fs::write(&cache_path, &text).with_context(|| {
+        format!(
+            "failed to write Hugging Face dataset cache to {:?}",
+            cache_path
+        )
+    })?;
+
+    Ok(text)
 }
 
 fn load_text(spec: &HuggingFaceDatasetSpec) -> Result<String> {
@@ -241,6 +318,23 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
+fn safe_cache_component(value: &str) -> String {
+    let mut component = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            component.push(ch);
+        } else {
+            component.push('-');
+        }
+    }
+
+    if component.is_empty() {
+        "default".to_string()
+    } else {
+        component.chars().take(64).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,6 +392,43 @@ mod tests {
             "https://datasets-server.huggingface.co/rows?dataset=Salesforce%2Fwikitext&config=wikitext-2-raw-v1&split=train&offset=5&length=10",
             spec.rows_url(5, 10)
         );
+    }
+
+    #[test]
+    fn cache_path_changes_when_requested_rows_change() {
+        let cache_dir =
+            std::env::temp_dir().join(format!("rusty-gpt-hf-cache-path-{}", std::process::id()));
+        let mut first = HuggingFaceDatasetSpec::parse(
+            "hf://Salesforce/wikitext?config=wikitext-2-raw-v1&rows=100",
+        )
+        .unwrap()
+        .unwrap();
+        let first_path = first.cache_path(&cache_dir);
+
+        first.rows = 200;
+
+        assert_ne!(first_path, first.cache_path(&cache_dir));
+    }
+
+    #[test]
+    fn load_text_from_uri_reads_cache_before_fetching() {
+        let cache_dir =
+            std::env::temp_dir().join(format!("rusty-gpt-hf-cache-read-{}", std::process::id()));
+        let uri =
+            "hf://Salesforce/wikitext?config=wikitext-2-raw-v1&split=train&column=text&rows=7";
+        let spec = HuggingFaceDatasetSpec::parse(uri).unwrap().unwrap();
+        let cache_path = spec.cache_path(&cache_dir);
+        fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        fs::write(&cache_path, "cached dataset text").unwrap();
+
+        let loaded = load_text_from_uri_with_cache_dir(uri, &cache_dir)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!("cached dataset text", loaded);
+
+        let _ = fs::remove_file(cache_path);
+        let _ = fs::remove_dir_all(cache_dir);
     }
 
     #[test]

@@ -5,7 +5,7 @@ A GPT playground built from scratch in Rust on top of the [Burn](https://burn.de
 ## Quick start
 
 ```bash
-# Default: CPU, trivial model, data/input.txt
+# Default: CPU, MiniGPT, data/input.txt, checkpoints/tokenizer.json
 cargo run --bin rusty-gpt
 
 # Train the full MiniGPT (CPU)
@@ -92,10 +92,11 @@ CLI flags and `RUSTY_GPT_*` environment variables can both drive runtime behavio
 |---|---|---|---|
 | `--backend cpu\|cuda` | `RUSTY_GPT_BACKEND` | `cpu` | `cuda` is only available when the crate is built with `--features cuda` (requires the CUDA toolkit). |
 | `--input <path>` | `RUSTY_GPT_INPUT` | `data/input.txt` | Plain UTF-8 text. |
-| `--model <name>` | `RUSTY_GPT_MODEL` | `trivial` | `trivial`, `single-attention`, `multi-attention`, `minigpt` (alias `mini-gpt`), `compare`. |
+| `--model <name>` | `RUSTY_GPT_MODEL` | `minigpt` | `trivial`, `single-attention`, `multi-attention`, `minigpt` (alias `mini-gpt`), `compare`. |
 | `--checkpoint <path>` | `RUSTY_GPT_MINIGPT_CHECKPOINT` | `checkpoints/mini_gpt` | Path without `.mpk` — Burn appends it. |
 | `--log-format plain\|json` | `RUSTY_GPT_LOG_FORMAT` | backend default | CPU defaults to plain text; CUDA defaults to JSON Lines. |
 | — | `RUSTY_GPT_BPE_TOKENIZER` | `checkpoints/tokenizer.json` | BPE tokenizer JSON used by MiniGPT and `compare` runs. |
+| — | `RUSTY_GPT_HF_DATASET_CACHE` | `data/huggingface-cache` | Directory for cached `hf://` dataset text slices. |
 | `--interactive-generate` | — | off | Requires `--backend cpu` and `--model minigpt`. |
 | `--serve` | — | off | Starts the HTTP API under `/api`; supports `cpu` and compiled-in `cuda` backends. |
 | `--load-checkpoint` | — | off | With `--serve`, loads MiniGPT API weights from `--checkpoint`. The checkpoint must match the model shape and tokenizer vocabulary from `--input`. |
@@ -120,7 +121,7 @@ CLI flags and `RUSTY_GPT_*` environment variables can both drive runtime behavio
 
 `scripts/run_training.sh` defaults to `cargo run --release`. Set `RUSTY_GPT_CARGO_PROFILE=dev` for faster debug builds while iterating. For `--backend cuda`, the script defaults to JSON logs, `RUSTY_GPT_PREFETCH_BATCHES=2`, and `RUSTY_GPT_EVAL_INTERVAL=500` unless those values are already provided.
 
-`--input` also accepts Hugging Face dataset URIs in the form `hf://<dataset-id>?config=<config>&split=<split>&column=<column>&rows=<n>&offset=<n>`. The loader uses the Hugging Face datasets-server rows API, concatenates the selected column with newlines, and defaults to `config=default`, `split=train`, `column=text`, `rows=1000`, and `offset=0`.
+`--input` also accepts Hugging Face dataset URIs in the form `hf://<dataset-id>?config=<config>&split=<split>&column=<column>&rows=<n>&offset=<n>`. The loader uses the Hugging Face datasets-server rows API, concatenates the selected column with newlines, and defaults to `config=default`, `split=train`, `column=text`, `rows=1000`, and `offset=0`. Resolved dataset text is cached under `RUSTY_GPT_HF_DATASET_CACHE` before training; subsequent runs with the same dataset/config/split/column/offset/rows read the local copy before attempting a download.
 
 `POST /api/generate` accepts optional `top_k` in addition to `prompt`, `max_tokens`, and `temperature`. API requests require `temperature > 0`; internal greedy generation remains available for benchmarks and tests via zero-temperature generation options.
 

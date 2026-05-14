@@ -1,5 +1,6 @@
 /target/
 /checkpoints/
+data/huggingface-cache/
 .codex
 .vscode/
 .idea/
