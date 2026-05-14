@@ -114,6 +114,7 @@ pub enum RuntimeEvent {
         total_steps: usize,
         training_loss: f64,
         value_loss: f64,
+        value_perplexity: f64,
         elapsed_ms: u128,
         tokens_per_second: f64,
         steps_per_second: f64,
@@ -124,6 +125,8 @@ pub enum RuntimeEvent {
         model: String,
         total_steps: usize,
         elapsed_ms: u128,
+        final_value_loss: f64,
+        final_perplexity: f64,
     },
     CheckpointLoaded {
         path: String,
@@ -240,21 +243,24 @@ impl RuntimeEvent {
                 total_steps,
                 training_loss,
                 value_loss,
+                value_perplexity,
                 elapsed_ms,
                 tokens_per_second,
                 steps_per_second,
                 step_ms_mean,
                 ..
             } => format!(
-                "Step {step}/{total_steps}: training loss = {training_loss:.4}, value loss = {value_loss:.4}, elapsed={elapsed_ms}ms, tokens_per_second={tokens_per_second:.2}, steps_per_second={steps_per_second:.4}, step_ms_mean={step_ms_mean:.2}"
+                "Step {step}/{total_steps}: training loss = {training_loss:.4}, value loss = {value_loss:.4}, perplexity={value_perplexity:.4}, elapsed={elapsed_ms}ms, tokens_per_second={tokens_per_second:.2}, steps_per_second={steps_per_second:.4}, step_ms_mean={step_ms_mean:.2}"
             ),
             Self::TrainingCompleted {
                 backend,
                 model,
                 total_steps,
                 elapsed_ms,
+                final_value_loss,
+                final_perplexity,
             } => format!(
-                "Completed {model} training on {backend}: total_steps={total_steps}, elapsed={elapsed_ms}ms"
+                "Completed {model} training on {backend}: total_steps={total_steps}, final_value_loss={final_value_loss:.4}, final_perplexity={final_perplexity:.4}, elapsed={elapsed_ms}ms"
             ),
             Self::CheckpointLoaded { path, elapsed_ms } => {
                 format!("Loaded minigpt checkpoint from {path} in {elapsed_ms}ms")
@@ -366,6 +372,7 @@ mod tests {
             total_steps: 100,
             training_loss: 1.25,
             value_loss: 1.5,
+            value_perplexity: 4.481689,
             elapsed_ms: 250,
             tokens_per_second: 8192.0,
             steps_per_second: 40.0,
@@ -375,6 +382,7 @@ mod tests {
         let lines = lines.lock().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!("training_progress", parsed["event"]);
+        assert_eq!(4.481689, parsed["value_perplexity"]);
         assert_eq!(8192.0, parsed["tokens_per_second"]);
         assert_eq!(40.0, parsed["steps_per_second"]);
         assert_eq!(25.0, parsed["step_ms_mean"]);

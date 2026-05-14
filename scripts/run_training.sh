@@ -11,6 +11,9 @@ Runs cargo in release mode by default. Set RUSTY_GPT_CARGO_PROFILE=dev for faste
 Options:
   --backend cpu|cuda                     Overrides RUSTY_GPT_BACKEND
   --checkpoint path                      Overrides RUSTY_GPT_MINIGPT_CHECKPOINT
+  --tokenizer path                       Overrides RUSTY_GPT_BPE_TOKENIZER
+  --train-tokenizer                      Train BPE tokenizer from the training input before model training
+  --vocab-size n                         Vocab size for --train-tokenizer (default: 2048)
   --log-format plain|json                Overrides RUSTY_GPT_LOG_FORMAT
   --benchmark                            Run MiniGpt generation benchmarks after training
   --benchmark-prompt-lens list           Comma-separated prompt lengths, e.g. 10,50,100
@@ -43,6 +46,9 @@ fi
 
 BACKEND_ARG=""
 CHECKPOINT_ARG=""
+TOKENIZER_ARG=""
+TRAIN_TOKENIZER=0
+TOKENIZER_VOCAB_SIZE="${RUSTY_GPT_TOKENIZER_VOCAB_SIZE:-2048}"
 LOG_FORMAT_ARGS=()
 BENCHMARK_ARGS=()
 TRAINING_FILE=""
@@ -71,6 +77,34 @@ while [[ $# -gt 0 ]]; do
       ;;
     --checkpoint=*)
       CHECKPOINT_ARG="${1#--checkpoint=}"
+      shift
+      ;;
+    --tokenizer)
+      if [[ $# -lt 2 ]]; then
+        echo "--tokenizer requires a path" >&2
+        exit 2
+      fi
+      TOKENIZER_ARG="$2"
+      shift 2
+      ;;
+    --tokenizer=*)
+      TOKENIZER_ARG="${1#--tokenizer=}"
+      shift
+      ;;
+    --train-tokenizer)
+      TRAIN_TOKENIZER=1
+      shift
+      ;;
+    --vocab-size)
+      if [[ $# -lt 2 ]]; then
+        echo "--vocab-size requires an integer" >&2
+        exit 2
+      fi
+      TOKENIZER_VOCAB_SIZE="$2"
+      shift 2
+      ;;
+    --vocab-size=*)
+      TOKENIZER_VOCAB_SIZE="${1#--vocab-size=}"
       shift
       ;;
     --log-format)
@@ -128,6 +162,7 @@ RUSTY_GPT_BACKEND="${BACKEND_ARG:-${RUSTY_GPT_BACKEND:-cpu}}"
 RUSTY_GPT_MODEL="${RUSTY_GPT_MODEL:-minigpt}"
 RUSTY_GPT_MINIGPT_CHECKPOINT="${CHECKPOINT_ARG:-${RUSTY_GPT_MINIGPT_CHECKPOINT:-checkpoints/mini_gpt}}"
 RUSTY_GPT_CARGO_PROFILE="${RUSTY_GPT_CARGO_PROFILE:-release}"
+RUSTY_GPT_BPE_TOKENIZER="${TOKENIZER_ARG:-${RUSTY_GPT_BPE_TOKENIZER:-checkpoints/tokenizer.json}}"
 
 if [[ "$TRAINING_FILE" == hf://* ]]; then
   :
@@ -168,6 +203,15 @@ esac
 
 cd "$ROOT_DIR"
 mkdir -p "$(dirname "$RUSTY_GPT_MINIGPT_CHECKPOINT")"
+mkdir -p "$(dirname "$RUSTY_GPT_BPE_TOKENIZER")"
+export RUSTY_GPT_BPE_TOKENIZER
+
+if [[ "$TRAIN_TOKENIZER" == "1" ]]; then
+  cargo run "${CARGO_PROFILE_ARGS[@]}" --bin train-tokenizer -- \
+    --corpus "$TRAINING_FILE" \
+    --vocab-size "$TOKENIZER_VOCAB_SIZE" \
+    --output "$RUSTY_GPT_BPE_TOKENIZER"
+fi
 
 cargo run "${CARGO_PROFILE_ARGS[@]}" "${CARGO_FEATURE_ARGS[@]}" --bin rusty-gpt -- \
   --input "$TRAINING_FILE" \
