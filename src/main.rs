@@ -1502,7 +1502,7 @@ where
 
     Ok(RuntimeConfig {
         backend,
-        model: parse_model_name(arg_model.or(env.model.as_deref()).unwrap_or("trivial"))?,
+        model: parse_model_name(arg_model.or(env.model.as_deref()).unwrap_or("minigpt"))?,
         input_path: PathBuf::from(
             arg_input
                 .or(env.input.as_deref())
@@ -1579,7 +1579,7 @@ mod tests {
         let config = parse_runtime_config(Vec::<String>::new(), None, None, None).unwrap();
 
         assert_eq!(BackendChoice::Cpu, config.backend);
-        assert_eq!(ModelChoice::Trivial, config.model);
+        assert_eq!(ModelChoice::MiniGpt, config.model);
         assert_eq!(PathBuf::from(DEFAULT_INPUT_PATH), config.input_path);
         assert_eq!(
             PathBuf::from(DEFAULT_MINIGPT_CHECKPOINT_PATH),

@@ -91,6 +91,8 @@ test(
       [
         'run',
         '--quiet',
+        '--bin',
+        'rusty-gpt',
         '--',
         '--serve',
         '--input',
@@ -98,7 +100,13 @@ test(
         '--server-addr',
         `127.0.0.1:${apiPort}`,
       ],
-      { cwd: ROOT_DIR },
+      {
+        cwd: ROOT_DIR,
+        env: {
+          ...process.env,
+          RUSTY_GPT_BPE_TOKENIZER: 'tests/fixtures/tokenizer.json',
+        },
+      },
     )
     const ui = startProcess(
       'npm',
