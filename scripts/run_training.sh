@@ -3,9 +3,9 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run_training.sh [--backend cpu|cuda] [--checkpoint path] [--log-format plain|json] [--benchmark] [benchmark options] <training-data-file>
+Usage: scripts/run_training.sh [--backend cpu|cuda] [--checkpoint path] [--log-format plain|json] [--benchmark] [benchmark options] <training-data-file|hf-uri>
 
-Runs rusty-gpt training against the provided UTF-8 text file.
+Runs rusty-gpt training against the provided UTF-8 text file or Hugging Face dataset URI.
 Runs cargo in release mode by default. Set RUSTY_GPT_CARGO_PROFILE=dev for faster debug builds.
 
 Options:
@@ -129,11 +129,14 @@ RUSTY_GPT_MODEL="${RUSTY_GPT_MODEL:-minigpt}"
 RUSTY_GPT_MINIGPT_CHECKPOINT="${CHECKPOINT_ARG:-${RUSTY_GPT_MINIGPT_CHECKPOINT:-checkpoints/mini_gpt}}"
 RUSTY_GPT_CARGO_PROFILE="${RUSTY_GPT_CARGO_PROFILE:-release}"
 
-if [[ ! -f "$TRAINING_FILE" ]]; then
+if [[ "$TRAINING_FILE" == hf://* ]]; then
+  :
+elif [[ ! -f "$TRAINING_FILE" ]]; then
   echo "Training data file not found: $TRAINING_FILE" >&2
   exit 1
+else
+  TRAINING_FILE="$(realpath "$TRAINING_FILE")"
 fi
-TRAINING_FILE="$(realpath "$TRAINING_FILE")"
 
 CARGO_FEATURE_ARGS=()
 TRAINING_BACKEND_ARGS=(--backend "$RUSTY_GPT_BACKEND")

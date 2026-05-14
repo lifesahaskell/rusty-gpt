@@ -8,6 +8,7 @@ use burn::backend::cuda::CudaDevice;
 use burn::backend::ndarray::{NdArray, NdArrayDevice};
 use burn::tensor::backend::Backend;
 use rusty_gpt::loader::data::DataLoader;
+use rusty_gpt::loader::huggingface;
 use rusty_gpt::model::persistence::{load_model, save_model};
 use rusty_gpt::model::{
     MiniGpt, MiniGptConfig, MultiAttentionModel, SingleAttentionModel, TrainingLogContext,
@@ -977,6 +978,11 @@ struct RuntimeEnv {
 }
 
 fn load_input_text(path: &Path) -> Result<String> {
+    let input = path.as_os_str().to_string_lossy();
+    if let Some(text) = huggingface::load_text_from_uri(&input)? {
+        return Ok(text);
+    }
+
     fs::read_to_string(path).with_context(|| format!("failed to read input text from {:?}", path))
 }
 

@@ -5396,6 +5396,7 @@ dependencies = [
  "burn",
  "burn-ndarray",
  "rand 0.10.1",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

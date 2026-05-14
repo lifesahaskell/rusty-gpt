@@ -18,6 +18,9 @@ cargo run --release --features cuda --bin rusty-gpt -- --backend cuda --model mi
 # The script uses cargo --release by default and CUDA-friendly logging defaults.
 ./scripts/run_training.sh --backend cuda --checkpoint checkpoints/mini_gpt data/input.txt
 
+# Train from a Hugging Face dataset through the datasets-server rows API
+./scripts/run_training.sh --backend cuda 'hf://Salesforce/wikitext?config=wikitext-2-raw-v1&split=train&column=text&rows=1000'
+
 # Train a BPE tokenizer from a corpus
 cargo run --bin train-tokenizer -- --corpus data/repo-source.txt --vocab-size 2048 --output checkpoints/tokenizer.json
 
@@ -106,6 +109,8 @@ CLI flags and `RUSTY_GPT_*` environment variables can both drive runtime behavio
 | `--benchmark-iterations <n>` | `RUSTY_GPT_BENCHMARK_ITERATIONS` | `5` | Measured iterations per benchmark case. |
 
 `scripts/run_training.sh` defaults to `cargo run --release`. Set `RUSTY_GPT_CARGO_PROFILE=dev` for faster debug builds while iterating. For `--backend cuda`, the script defaults to JSON logs, `RUSTY_GPT_PREFETCH_BATCHES=2`, and `RUSTY_GPT_EVAL_INTERVAL=500` unless those values are already provided.
+
+`--input` also accepts Hugging Face dataset URIs in the form `hf://<dataset-id>?config=<config>&split=<split>&column=<column>&rows=<n>&offset=<n>`. The loader uses the Hugging Face datasets-server rows API, concatenates the selected column with newlines, and defaults to `config=default`, `split=train`, `column=text`, `rows=1000`, and `offset=0`.
 
 Model-shape hyperparameters (`BLOCK_SIZE`, `BATCH_SIZE`, `EMBED_DIM`, `NUM_HEADS`, `NUM_LAYERS`, `DROPOUT`, `LEARNING_RATE`) are compile-time constants at the top of `src/main.rs`.
 
