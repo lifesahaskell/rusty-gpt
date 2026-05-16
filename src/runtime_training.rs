@@ -285,9 +285,8 @@ fn save_minigpt_checkpoint<B: burn::tensor::backend::AutodiffBackend>(
         metadata.interrupted = true;
         metadata.interrupted_at_step = Some(outcome.steps_completed);
     }
-    save_checkpoint_metadata(&save_path, &metadata).with_context(|| {
-        format!("failed to save checkpoint metadata for {:?}", save_path)
-    })?;
+    save_checkpoint_metadata(&save_path, &metadata)
+        .with_context(|| format!("failed to save checkpoint metadata for {:?}", save_path))?;
     let saved_mpk = save_path.with_extension("mpk").display().to_string();
     run.logger.log(RuntimeEvent::CheckpointSaved {
         path: saved_mpk.clone(),

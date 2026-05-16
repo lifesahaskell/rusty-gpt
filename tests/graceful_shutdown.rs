@@ -7,10 +7,19 @@
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Substring printed at the very start of `train_model`'s MiniGPT branch. By
+/// the time this line hits the subprocess's stdout, `run_training_demo` has
+/// already installed the SIGINT/SIGTERM handler — so it's a reliable barrier
+/// for "the handler is now live, you may signal me."
+const TRAINING_STARTED_MARKER: &str = "Training minigpt model";
 
 #[test]
 fn sigint_during_training_saves_interrupted_checkpoint() {
@@ -23,8 +32,7 @@ fn sigint_during_training_saves_interrupted_checkpoint() {
     let checkpoint = tmp.join("mini_gpt");
 
     // 1000 train_steps is plenty of room — each MiniGPT step on CPU takes
-    // ~15+s, so we are guaranteed to interrupt mid-run when we kill after
-    // the first observed step boundary log.
+    // ~15+s, so we are guaranteed to interrupt mid-run.
     let mut child = Command::new(env!("CARGO_BIN_EXE_rusty-gpt"))
         .args([
             "--model",
@@ -43,41 +51,63 @@ fn sigint_during_training_saves_interrupted_checkpoint() {
 
     let child_pid = Pid::from_raw(child.id() as i32);
 
-    // Wait for training to actually start (handler is installed at the top of
-    // run_training_demo, before the "Training" log line is emitted). Once we
-    // observe that line, the signal handler is guaranteed to be live.
-    let mut stdout = child.stdout.take().expect("child stdout");
-    let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    // Stream stdout line-by-line in a background thread so we can detect
+    // `TRAINING_STARTED_MARKER` in real time. The full buffer is preserved
+    // so we can include it in failure messages.
+    let stdout = child.stdout.take().expect("child stdout");
+    let stdout_buf = Arc::new(Mutex::new(String::new()));
+    let training_started = Arc::new(AtomicBool::new(false));
     let stdout_buf_clone = stdout_buf.clone();
+    let training_started_clone = training_started.clone();
     let stdout_thread = thread::spawn(move || {
-        use std::io::Read;
-        let mut local = String::new();
-        let _ = stdout.read_to_string(&mut local);
-        *stdout_buf_clone.lock().unwrap() = local;
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if line.contains(TRAINING_STARTED_MARKER) {
+                training_started_clone.store(true, Ordering::SeqCst);
+            }
+            let mut buf = stdout_buf_clone.lock().unwrap();
+            buf.push_str(&line);
+            buf.push('\n');
+        }
     });
 
-    let mut stderr = child.stderr.take().expect("child stderr");
-    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stderr = child.stderr.take().expect("child stderr");
+    let stderr_buf = Arc::new(Mutex::new(String::new()));
     let stderr_buf_clone = stderr_buf.clone();
     let stderr_thread = thread::spawn(move || {
-        use std::io::Read;
-        let mut local = String::new();
-        let _ = stderr.read_to_string(&mut local);
-        *stderr_buf_clone.lock().unwrap() = local;
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            let mut buf = stderr_buf_clone.lock().unwrap();
+            buf.push_str(&line);
+            buf.push('\n');
+        }
     });
 
-    // Wait long enough for training to have started (tokenizer + data load
-    // can take a few seconds; first step alone is ~15s on CPU). 8s lands
-    // mid-first-step and gives the handler ample time to install.
-    thread::sleep(Duration::from_secs(8));
+    // Wait for the marker (60s ceiling — debug-build CI startup can be
+    // surprisingly slow). Polling sleep keeps this race-free.
+    let marker_deadline = Instant::now() + Duration::from_secs(60);
+    while !training_started.load(Ordering::SeqCst) {
+        if Instant::now() >= marker_deadline {
+            let _ = child.kill();
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            let stdout_text = stdout_buf.lock().unwrap().clone();
+            let stderr_text = stderr_buf.lock().unwrap().clone();
+            panic!(
+                "subprocess never printed {TRAINING_STARTED_MARKER:?} within 60s\nstdout:\n{stdout_text}\nstderr:\n{stderr_text}"
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
     kill(child_pid, Signal::SIGINT).expect("send SIGINT to child");
 
     // Give the handler time to save the checkpoint and exit.
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let exit_deadline = Instant::now() + Duration::from_secs(120);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= deadline => {
+            Ok(None) if Instant::now() >= exit_deadline => {
                 let _ = child.kill();
                 panic!("training subprocess did not exit within 120s of SIGINT");
             }
@@ -86,7 +116,6 @@ fn sigint_during_training_saves_interrupted_checkpoint() {
         }
     };
 
-    // Drain pipe readers so we can include their contents in failure messages.
     let _ = stdout_thread.join();
     let _ = stderr_thread.join();
     let stdout_text = stdout_buf.lock().unwrap().clone();
