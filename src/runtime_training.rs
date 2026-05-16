@@ -115,7 +115,8 @@ where
         run.hyperparameters.eval_interval,
         log_context,
     )
-    .with_prefetch_batches(run.hyperparameters.prefetch_batches);
+    .with_prefetch_batches(run.hyperparameters.prefetch_batches)
+    .with_periodic_checkpoint_interval(run.hyperparameters.checkpoint_interval);
 
     match run.model_choice {
         ModelChoice::Trivial => {
@@ -196,7 +197,18 @@ where
                 total_steps: run.hyperparameters.train_steps,
             });
             let started_at = Instant::now();
-            let outcome = MiniGpt::<B>::train(
+            let interval = run.hyperparameters.checkpoint_interval;
+            let keep = run.hyperparameters.checkpoint_keep;
+            let checkpoint_path = run.checkpoint_path;
+            let logger = run.logger.clone();
+            let metadata_template = checkpoint_metadata(
+                &run,
+                rusty_gpt::model::TrainingMetrics {
+                    final_value_loss: 0.0,
+                    final_perplexity: 0.0,
+                },
+            )?;
+            let outcome = MiniGpt::<B>::train_with_periodic_save(
                 run.data_loader,
                 run.value_loader,
                 run.device,
@@ -208,6 +220,18 @@ where
                     num_heads: run.hyperparameters.num_heads,
                 },
                 params.with_grad_clip_norm(run.hyperparameters.minigpt_grad_clip_norm),
+                |model, step| {
+                    save_periodic_minigpt_checkpoint(
+                        model,
+                        checkpoint_path,
+                        step,
+                        interval,
+                        keep,
+                        &metadata_template,
+                        &logger,
+                    )
+                    .map_err(|err| err.to_string())
+                },
             )
             .map_err(anyhow::Error::msg)
             .context("failed to train minigpt model")?;
@@ -322,6 +346,181 @@ pub(crate) fn interrupted_checkpoint_path(base: &Path, step: usize) -> PathBuf {
     }
 }
 
+/// Sibling of [`interrupted_checkpoint_path`] for the periodic (T3) cadence.
+/// Produces `<base>.step-<N>.mpk` with the same `.mpk`-baked-in trick to
+/// survive Burn's internal `with_extension("mpk")`.
+pub(crate) fn step_checkpoint_path(base: &Path, step: usize) -> PathBuf {
+    let file_name = base
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("checkpoint");
+    let tagged = format!("{file_name}.step-{step}.mpk");
+    match base.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(tagged),
+        _ => PathBuf::from(tagged),
+    }
+}
+
+/// Save a mid-run MiniGPT snapshot to `<checkpoint>.step-<N>.mpk` and prune
+/// older periodic snapshots beyond `keep`. The final end-of-run save and any
+/// `interrupted-step-*` save are **never** pruned — only the periodic
+/// (`.step-N.`) snapshots are subject to retention.
+fn save_periodic_minigpt_checkpoint<B>(
+    model: &MiniGpt<B>,
+    checkpoint_path: &Path,
+    step: usize,
+    interval: usize,
+    keep: usize,
+    metadata_template: &CheckpointMetadata,
+    logger: &EventLogger,
+) -> Result<()>
+where
+    B: burn::tensor::backend::AutodiffBackend,
+{
+    if let Some(parent) = checkpoint_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create checkpoint directory {:?}", parent))?;
+    }
+
+    let save_path = step_checkpoint_path(checkpoint_path, step);
+    let started_at = Instant::now();
+    // Burn's save_file takes ownership; cloning is cheap relative to a
+    // full training step and keeps the in-memory weights available for the
+    // next iteration. For S1 this is fine; async double-buffering is a
+    // Sprint 3 enhancement if profiling shows it matters.
+    save_model(model.clone(), &save_path).with_context(|| {
+        format!("failed to save periodic minigpt checkpoint to {:?}", save_path)
+    })?;
+
+    let mut metadata = metadata_template.clone();
+    metadata.step = Some(step);
+    metadata.interval = Some(interval);
+    save_checkpoint_metadata(&save_path, &metadata).with_context(|| {
+        format!(
+            "failed to save periodic checkpoint metadata for {:?}",
+            save_path
+        )
+    })?;
+
+    let saved_mpk = save_path.display().to_string();
+    logger.log(RuntimeEvent::CheckpointSaved {
+        path: saved_mpk,
+        elapsed_ms: started_at.elapsed().as_millis(),
+    });
+
+    prune_old_step_checkpoints(checkpoint_path, keep);
+    Ok(())
+}
+
+/// Scan the directory containing `checkpoint_base`, find all periodic
+/// `<base>.step-<N>.mpk` snapshots, keep the most recent `keep`, delete the
+/// rest along with their `.step-<N>.metadata.json` sidecars. Orphan
+/// sidecars (no matching `.mpk`) are also removed. Files that don't match
+/// the periodic pattern — including the final `<base>.mpk` and any
+/// `interrupted-step-*` save — are left untouched.
+///
+/// Every deletion is logged to stderr so a curious operator can audit what
+/// the retention policy did.
+fn prune_old_step_checkpoints(checkpoint_base: &Path, keep: usize) {
+    if keep == 0 {
+        return;
+    }
+    let Some(dir) = checkpoint_base.parent() else {
+        return;
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let Some(base_name) = checkpoint_base
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        return;
+    };
+    let mpk_prefix = format!("{base_name}.step-");
+    let sidecar_prefix = format!("{base_name}.step-");
+
+    let Ok(read) = fs::read_dir(dir) else {
+        return;
+    };
+
+    let mut step_mpks: Vec<(usize, PathBuf)> = Vec::new();
+    let mut sidecars_by_step: std::collections::HashMap<usize, PathBuf> =
+        std::collections::HashMap::new();
+    for entry in read.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if let Some(rest) = name.strip_prefix(&mpk_prefix)
+            && let Some(step_str) = rest.strip_suffix(".mpk")
+            && let Ok(step) = step_str.parse::<usize>()
+        {
+            step_mpks.push((step, path.clone()));
+            continue;
+        }
+        if let Some(rest) = name.strip_prefix(&sidecar_prefix)
+            && let Some(step_str) = rest.strip_suffix(".metadata.json")
+            && let Ok(step) = step_str.parse::<usize>()
+        {
+            sidecars_by_step.insert(step, path);
+        }
+    }
+
+    step_mpks.sort_by(|(a, _), (b, _)| b.cmp(a)); // newest first
+    if step_mpks.len() > keep {
+        for (step, mpk_path) in step_mpks.iter().skip(keep) {
+            match fs::remove_file(mpk_path) {
+                Ok(()) => eprintln!(
+                    "checkpoint retention: pruned {} (older than the last {keep} periodic snapshots)",
+                    mpk_path.display()
+                ),
+                Err(err) => eprintln!(
+                    "checkpoint retention: failed to prune {}: {err}",
+                    mpk_path.display()
+                ),
+            }
+            if let Some(sidecar) = sidecars_by_step.remove(step) {
+                match fs::remove_file(&sidecar) {
+                    Ok(()) => eprintln!(
+                        "checkpoint retention: pruned {} (sidecar for step {step})",
+                        sidecar.display()
+                    ),
+                    Err(err) => eprintln!(
+                        "checkpoint retention: failed to prune sidecar {}: {err}",
+                        sidecar.display()
+                    ),
+                }
+            }
+        }
+    }
+
+    // Orphan sidecars: any remaining sidecar whose .mpk no longer exists.
+    let surviving_steps: std::collections::HashSet<usize> = step_mpks
+        .iter()
+        .take(keep)
+        .map(|(step, _)| *step)
+        .collect();
+    for (step, sidecar) in sidecars_by_step {
+        if !surviving_steps.contains(&step) {
+            match fs::remove_file(&sidecar) {
+                Ok(()) => eprintln!(
+                    "checkpoint retention: pruned orphan sidecar {}",
+                    sidecar.display()
+                ),
+                Err(err) => eprintln!(
+                    "checkpoint retention: failed to prune orphan sidecar {}: {err}",
+                    sidecar.display()
+                ),
+            }
+        }
+    }
+}
+
 fn checkpoint_metadata<B: burn::tensor::backend::AutodiffBackend>(
     run: &TrainingRun<'_, B>,
     metrics: rusty_gpt::model::TrainingMetrics,
@@ -361,6 +560,8 @@ fn checkpoint_metadata<B: burn::tensor::backend::AutodiffBackend>(
         },
         interrupted: false,
         interrupted_at_step: None,
+        step: None,
+        interval: None,
     })
 }
 
@@ -432,5 +633,94 @@ mod tests {
             Path::new("checkpoints/mini_gpt.interrupted-step-1.mpk"),
             result.with_extension("mpk")
         );
+    }
+
+    #[test]
+    fn step_checkpoint_path_keeps_parent_and_tags_step() {
+        let result = step_checkpoint_path(Path::new("checkpoints/mini_gpt"), 100);
+        assert_eq!(
+            PathBuf::from("checkpoints/mini_gpt.step-100.mpk"),
+            result
+        );
+    }
+
+    #[test]
+    fn step_checkpoint_path_is_idempotent_through_with_extension() {
+        let result = step_checkpoint_path(Path::new("checkpoints/mini_gpt"), 200);
+        assert_eq!(
+            Path::new("checkpoints/mini_gpt.step-200.mpk"),
+            result.with_extension("mpk")
+        );
+    }
+
+    #[test]
+    fn prune_old_step_checkpoints_keeps_newest_k_and_deletes_orphan_sidecars() {
+        let dir = std::env::temp_dir().join(format!(
+            "rusty-gpt-prune-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("mini_gpt");
+
+        // Seed the directory with periodic snapshots at steps 100/200/300,
+        // a stale orphan sidecar at step 50 (no .mpk), the final save, and
+        // an interrupted save (which must NOT be pruned).
+        for step in [100usize, 200, 300] {
+            fs::write(dir.join(format!("mini_gpt.step-{step}.mpk")), b"weights").unwrap();
+            fs::write(
+                dir.join(format!("mini_gpt.step-{step}.metadata.json")),
+                b"{}",
+            )
+            .unwrap();
+        }
+        fs::write(dir.join("mini_gpt.step-50.metadata.json"), b"{}").unwrap(); // orphan
+        fs::write(dir.join("mini_gpt.mpk"), b"final").unwrap();
+        fs::write(dir.join("mini_gpt.metadata.json"), b"{}").unwrap();
+        fs::write(dir.join("mini_gpt.interrupted-step-7.mpk"), b"int").unwrap();
+        fs::write(dir.join("mini_gpt.interrupted-step-7.metadata.json"), b"{}").unwrap();
+
+        prune_old_step_checkpoints(&base, 2);
+
+        let names: std::collections::HashSet<String> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect();
+
+        // Step-300 and step-200 survive; step-100 + its sidecar are pruned;
+        // orphan step-50 sidecar is removed; the final and the interrupted
+        // saves are untouched.
+        assert!(names.contains("mini_gpt.step-300.mpk"));
+        assert!(names.contains("mini_gpt.step-300.metadata.json"));
+        assert!(names.contains("mini_gpt.step-200.mpk"));
+        assert!(names.contains("mini_gpt.step-200.metadata.json"));
+        assert!(!names.contains("mini_gpt.step-100.mpk"));
+        assert!(!names.contains("mini_gpt.step-100.metadata.json"));
+        assert!(!names.contains("mini_gpt.step-50.metadata.json"));
+        assert!(names.contains("mini_gpt.mpk"));
+        assert!(names.contains("mini_gpt.metadata.json"));
+        assert!(names.contains("mini_gpt.interrupted-step-7.mpk"));
+        assert!(names.contains("mini_gpt.interrupted-step-7.metadata.json"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_old_step_checkpoints_with_keep_zero_is_noop() {
+        let dir = std::env::temp_dir().join(format!(
+            "rusty-gpt-prune-zero-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("mini_gpt");
+
+        fs::write(dir.join("mini_gpt.step-100.mpk"), b"weights").unwrap();
+
+        prune_old_step_checkpoints(&base, 0);
+
+        assert!(dir.join("mini_gpt.step-100.mpk").exists());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

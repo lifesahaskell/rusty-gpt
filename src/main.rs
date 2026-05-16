@@ -425,6 +425,8 @@ mod tests {
             generate_tokens: 4,
             minigpt_grad_clip_norm: 1.0,
             prefetch_batches: 2,
+            checkpoint_interval: 0,
+            checkpoint_keep: 3,
         };
         let text = "abcdefghijklmnopqrstuvwxyz ".repeat(8);
 
@@ -775,6 +777,8 @@ mod tests {
             generate_tokens: 4,
             minigpt_grad_clip_norm: 1.0,
             prefetch_batches: 0,
+            checkpoint_interval: 0,
+            checkpoint_keep: 3,
         };
 
         let err = run_training_demo::<TestBackend>(

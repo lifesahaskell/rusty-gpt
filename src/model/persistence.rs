@@ -47,6 +47,16 @@ pub struct CheckpointMetadata {
     /// observed the signal and broke out. `None` for normal end-of-run saves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interrupted_at_step: Option<usize>,
+    /// Step number at which this periodic-cadence snapshot was written.
+    /// `None` for the normal end-of-run save and interrupted saves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<usize>,
+    /// `--checkpoint-interval` value in effect when this periodic snapshot
+    /// was written. `None` for the normal end-of-run save and interrupted
+    /// saves; lets future tooling reason about cadence without inferring
+    /// it from filenames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<usize>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -431,6 +441,8 @@ mod tests {
             },
             interrupted: false,
             interrupted_at_step: None,
+            step: None,
+            interval: None,
         };
 
         save_checkpoint_metadata(&path, &metadata).unwrap();
@@ -490,6 +502,8 @@ mod tests {
                 },
                 interrupted: false,
                 interrupted_at_step: None,
+                step: None,
+                interval: None,
             },
         )
         .unwrap();
@@ -670,6 +684,8 @@ mod tests {
             },
             interrupted: false,
             interrupted_at_step: None,
+            step: None,
+            interval: None,
         };
         std::fs::write(&tokenizer_path, br#"{"tokenizer":"new"}"#).unwrap();
 
@@ -730,6 +746,8 @@ mod tests {
             },
             interrupted: false,
             interrupted_at_step: None,
+            step: None,
+            interval: None,
         };
 
         let report = checkpoint_compatibility_report(
@@ -787,6 +805,8 @@ mod tests {
             },
             interrupted: false,
             interrupted_at_step: None,
+            step: None,
+            interval: None,
         }
     }
 }

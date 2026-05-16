@@ -37,6 +37,11 @@ pub struct TrainingParams {
     pub prefetch_batches: usize,
     pub grad_clipping: Option<GradientClippingConfig>,
     pub log_context: TrainingLogContext,
+    /// Cadence (in steps) at which the optional periodic-save callback fires.
+    /// `0` disables periodic saves; the callback is then never invoked
+    /// regardless of what it does. Only MiniGPT wires a real callback —
+    /// the smaller teaching variants always pass `0` plus a no-op closure.
+    pub periodic_checkpoint_interval: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -72,6 +77,7 @@ impl TrainingParams {
             prefetch_batches: 0,
             grad_clipping: None,
             log_context,
+            periodic_checkpoint_interval: 0,
         }
     }
 
@@ -82,6 +88,11 @@ impl TrainingParams {
 
     pub fn with_prefetch_batches(mut self, batches: usize) -> Self {
         self.prefetch_batches = batches;
+        self
+    }
+
+    pub fn with_periodic_checkpoint_interval(mut self, interval: usize) -> Self {
+        self.periodic_checkpoint_interval = interval;
         self
     }
 }
@@ -227,18 +238,20 @@ impl<'a> TrainingBatchSource<'a> {
     }
 }
 
-fn train_language_model<B, M>(
+fn train_language_model<B, M, F>(
     mut model: M,
     loader: &DataLoader,
     value_loader: &DataLoader,
     device: &B::Device,
     params: TrainingParams,
     forward: impl Fn(&M, Tensor<B, 2, Int>) -> Tensor<B, 3>,
+    mut periodic_save: F,
 ) -> Result<TrainingOutcome<M>, String>
 where
     B: AutodiffBackend,
     M: AutodiffModule<B>,
     B::FloatElem: Into<f64>,
+    F: FnMut(&M, usize) -> Result<(), String>,
 {
     let training_batches = TrainingBatchSource::new(loader, params.prefetch_batches);
     let mut optimizer = AdamWConfig::new()
@@ -266,6 +279,16 @@ where
         let grads = GradientsParams::from_grads(grads, &model);
         model = optimizer.step(params.learning_rate, model, grads);
         steps_completed = step + 1;
+
+        // Periodic checkpoint cadence is orthogonal to `eval_interval` —
+        // they fire on independent step counts. Skip the final step so we
+        // don't double-save with the caller's end-of-run write.
+        if params.periodic_checkpoint_interval > 0
+            && steps_completed != params.steps
+            && steps_completed.is_multiple_of(params.periodic_checkpoint_interval)
+        {
+            periodic_save(&model, steps_completed)?;
+        }
 
         if should_log_training_step(step, params.steps, params.eval_interval) {
             let throughput = TrainingThroughput::from_progress(
@@ -329,6 +352,7 @@ where
             device,
             params,
             |model, inputs| model.forward(inputs),
+            no_periodic_save,
         )
     }
 }
@@ -354,6 +378,7 @@ where
             device,
             params,
             |model, inputs| model.forward_tokens(inputs),
+            no_periodic_save,
         )
     }
 }
@@ -379,6 +404,7 @@ where
             device,
             params,
             |model, inputs| model.forward_tokens(inputs),
+            no_periodic_save,
         )
     }
 }
@@ -395,6 +421,32 @@ where
         config: MiniGptConfig,
         params: TrainingParams,
     ) -> Result<TrainingOutcome<Self>, String> {
+        Self::train_with_periodic_save(
+            loader,
+            value_loader,
+            device,
+            config,
+            params,
+            no_periodic_save,
+        )
+    }
+
+    /// Same as [`MiniGpt::train`] but lets the caller hook into the periodic
+    /// save cadence controlled by [`TrainingParams::periodic_checkpoint_interval`].
+    /// The closure is invoked with the current model and the step number
+    /// (1-indexed) every `periodic_checkpoint_interval` steps, excluding the
+    /// final step. It is **not** invoked when the interval is `0`.
+    pub fn train_with_periodic_save<F>(
+        loader: &DataLoader,
+        value_loader: &DataLoader,
+        device: &B::Device,
+        config: MiniGptConfig,
+        params: TrainingParams,
+        periodic_save: F,
+    ) -> Result<TrainingOutcome<Self>, String>
+    where
+        F: FnMut(&Self, usize) -> Result<(), String>,
+    {
         train_language_model(
             MiniGpt::<B>::new(
                 config.vocab_size,
@@ -409,6 +461,14 @@ where
             device,
             params,
             |model, inputs| model.forward_tokens(inputs),
+            periodic_save,
         )
     }
+}
+
+/// Default no-op save callback used by every training variant that does
+/// not support persistence (the three teaching models) or when the caller
+/// has not opted in to periodic saves.
+fn no_periodic_save<M>(_model: &M, _step: usize) -> Result<(), String> {
+    Ok(())
 }
