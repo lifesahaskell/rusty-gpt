@@ -48,13 +48,14 @@ use runtime_training::{TrainingDemoOptions, run_training_demo};
 fn main() -> Result<()> {
     let config =
         parse_runtime_config_with_checkpoint(env::args().skip(1), RuntimeEnv::from_process_env())?;
-    let text = load_input_text(&config.input_path)?;
+    let text = load_input_text(&config.input_source)?;
     let hyperparameters = config.hyperparameters;
     let logger = EventLogger::stdout(config.log_format);
+    let input_display = config.input_source.display();
     logger.log(RuntimeEvent::AppConfigured {
         backend: config.backend.label().to_string(),
         model: config.model.label().to_string(),
-        input_path: config.input_path.display().to_string(),
+        input_path: input_display.clone(),
         tokenizer_path: minigpt_tokenizer_path(),
         checkpoint_path: config.checkpoint_path.display().to_string(),
         log_format: config.log_format,
@@ -105,7 +106,7 @@ fn main() -> Result<()> {
                 benchmark_config: &config.benchmark_config,
                 logger,
                 checkpoint_path: &config.checkpoint_path,
-                input_source: &config.input_path.display().to_string(),
+                input_source: &input_display,
             },
         ),
         #[cfg(feature = "cuda")]
@@ -126,7 +127,7 @@ fn main() -> Result<()> {
                     logger,
                     benchmark_generation: config.benchmark_generation,
                     benchmark_config: config.benchmark_config,
-                    input_source: config.input_path.display().to_string(),
+                    input_source: input_display.clone(),
                 },
             )
         }

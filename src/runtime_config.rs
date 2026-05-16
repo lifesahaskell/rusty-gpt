@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use rusty_gpt::loader::InputSource;
 use rusty_gpt::observability::LogFormat;
 use rusty_gpt::utils::{BenchmarkConfig, parse_usize_list};
 use std::env;
@@ -316,6 +317,7 @@ pub(crate) struct RuntimeConfig {
     pub(crate) backend: BackendChoice,
     pub(crate) model: ModelChoice,
     pub(crate) input_path: PathBuf,
+    pub(crate) input_source: InputSource,
     pub(crate) checkpoint_path: PathBuf,
     pub(crate) hyperparameters: Hyperparameters,
     pub(crate) interactive: bool,
@@ -628,14 +630,21 @@ where
     benchmark_config.validate()?;
     let hyperparameters = Hyperparameters::from_env_and_overrides(&env, &hyperparameter_overrides)?;
 
+    let raw_input = arg_input
+        .or(env.input.as_deref())
+        .unwrap_or(DEFAULT_INPUT_PATH);
+    let input_source = InputSource::parse(raw_input)
+        .with_context(|| format!("invalid --input value '{raw_input}'"))?;
+    let input_path = match &input_source {
+        InputSource::Local(path) => path.clone(),
+        InputSource::HuggingFace { .. } => PathBuf::from(input_source.display()),
+    };
+
     Ok(RuntimeConfig {
         backend,
         model: parse_model_name(arg_model.or(env.model.as_deref()).unwrap_or("minigpt"))?,
-        input_path: PathBuf::from(
-            arg_input
-                .or(env.input.as_deref())
-                .unwrap_or(DEFAULT_INPUT_PATH),
-        ),
+        input_path,
+        input_source,
         checkpoint_path: PathBuf::from(
             arg_checkpoint
                 .or(env.checkpoint.as_deref())
