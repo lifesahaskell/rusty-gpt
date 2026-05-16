@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use rusty_gpt::loader::huggingface;
+use rusty_gpt::loader::{DEFAULT_MAX_LOCAL_INPUT_BYTES, InputSource};
 use rusty_gpt::tokenizer::Tokenizer;
 use rusty_gpt::tokenizer::bpe::BpeTrainer;
 use serde::Serialize;
@@ -116,11 +117,29 @@ where
 }
 
 fn load_corpus_text(source: &str) -> Result<String> {
-    if let Some(text) = huggingface::load_text_from_uri(source)? {
-        return Ok(text);
-    }
+    load_corpus_text_with_max_bytes(source, DEFAULT_MAX_LOCAL_INPUT_BYTES)
+}
 
-    fs::read_to_string(source).with_context(|| format!("failed to read corpus from {source}"))
+fn load_corpus_text_with_max_bytes(source: &str, max_local_bytes: u64) -> Result<String> {
+    let parsed = InputSource::parse(source)
+        .with_context(|| format!("invalid --corpus value '{source}'"))?;
+
+    match &parsed {
+        InputSource::Local(path) => {
+            parsed
+                .validate_local_size(max_local_bytes)
+                .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+            fs::read_to_string(path)
+                .with_context(|| format!("failed to read corpus from {}", path.display()))
+        }
+        InputSource::HuggingFace { .. } => {
+            let canonical = parsed.display();
+            match huggingface::load_text_from_uri(&canonical)? {
+                Some(text) => Ok(text),
+                None => bail!("Hugging Face loader returned no text for {canonical}"),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -147,6 +166,37 @@ mod tests {
             },
             config
         );
+    }
+
+    #[test]
+    fn load_corpus_text_rejects_disallowed_scheme() {
+        let err = load_corpus_text_with_max_bytes("http://example.com/foo", 1024).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid --corpus value")
+                || err.to_string().contains("unsupported input URI scheme"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_corpus_text_rejects_oversized_local_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "rusty-gpt-corpus-too-large-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("corpus.txt");
+        fs::write(&path, b"hello hello hello").unwrap();
+
+        let err =
+            load_corpus_text_with_max_bytes(path.to_str().unwrap(), 4).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds the configured maximum"),
+            "got: {err}"
+        );
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir(dir);
     }
 
     #[test]

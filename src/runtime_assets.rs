@@ -2,6 +2,7 @@ use crate::runtime_config::ModelChoice;
 use anyhow::{Context, Result};
 use burn::tensor::backend::Backend;
 use rusty_gpt::loader::huggingface;
+use rusty_gpt::loader::{InputSource, DEFAULT_MAX_LOCAL_INPUT_BYTES};
 use rusty_gpt::model::MiniGpt;
 use rusty_gpt::model::persistence::{CheckpointModelShape, load_model_with_metadata_validation};
 use rusty_gpt::observability::{EventLogger, RuntimeEvent};
@@ -110,11 +111,33 @@ pub(crate) fn latest_checkpoint_path(checkpoint_dir: &Path) -> Result<PathBuf> {
         .with_context(|| format!("no .mpk checkpoints found in {:?}", checkpoint_dir))
 }
 
-pub(crate) fn load_input_text(path: &Path) -> Result<String> {
-    let input = path.as_os_str().to_string_lossy();
-    if let Some(text) = huggingface::load_text_from_uri(&input)? {
-        return Ok(text);
-    }
+pub(crate) fn load_input_text(source: &InputSource) -> Result<String> {
+    load_input_text_with_max_bytes(source, DEFAULT_MAX_LOCAL_INPUT_BYTES)
+}
 
-    fs::read_to_string(path).with_context(|| format!("failed to read input text from {:?}", path))
+pub(crate) fn load_input_text_with_max_bytes(
+    source: &InputSource,
+    max_local_bytes: u64,
+) -> Result<String> {
+    match source {
+        InputSource::Local(path) => {
+            // Enforce the size cap via metadata before we read the file body.
+            source
+                .validate_local_size(max_local_bytes)
+                .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+            fs::read_to_string(path)
+                .with_context(|| format!("failed to read input text from {:?}", path))
+        }
+        InputSource::HuggingFace { .. } => {
+            // The Hugging Face loader is the existing implementation; we feed
+            // it the canonical, validated form rendered by `InputSource::display`.
+            let canonical = source.display();
+            match huggingface::load_text_from_uri(&canonical)? {
+                Some(text) => Ok(text),
+                None => Err(anyhow::anyhow!(
+                    "Hugging Face loader returned no text for {canonical}"
+                )),
+            }
+        }
+    }
 }
