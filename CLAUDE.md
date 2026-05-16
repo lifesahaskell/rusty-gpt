@@ -217,4 +217,3 @@ Other invariants:
 - **Env-mutating tests use `unsafe`**: Rust 2024 makes `env::set_var` / `env::remove_var` unsafe. Existing tests in `main.rs` wrap them in `unsafe { ... }` blocks with a SAFETY comment — follow the same pattern when adding more.
 - **Burn features**: `burn` is pulled in with `["train", "ndarray", "wgpu"]` in `Cargo.toml`. The `wgpu` feature isn't exercised at runtime but kept so the CPU build stays portable; `cuda` is the only opt-in feature.
 - **`data-secret/` is gitignored**: anything you drop there (e.g. `fafolang.txt`, `claude_src.txt`) won't be committed. Use it for corpora you don't want in the repo.
-- **Clippy has known pre-existing warnings**: `cargo clippy --all-targets` currently reports a handful of style lints in `src/model/mod.rs` (too-many-args, complex-type, etc.). The CI workflow runs clippy without `-D warnings` for that reason. If you tighten CI, fix those lints first.

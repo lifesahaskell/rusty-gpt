@@ -766,9 +766,15 @@ mod tests {
         }
     }
 
+    /// A single env-driven invariant-violation case used by
+    /// [`rejects_invalid_hyperparameter_invariants_from_env`]: a human-readable
+    /// label, a mutator that injects the bad value into a [`RuntimeEnv`], and
+    /// the expected substring of the resulting validation error.
+    type EnvInvariantCase = (&'static str, fn(&mut RuntimeEnv), &'static str);
+
     #[test]
     fn rejects_invalid_hyperparameter_invariants_from_env() {
-        let cases: [(&str, fn(&mut RuntimeEnv), &str); 9] = [
+        let cases: [EnvInvariantCase; 9] = [
             (
                 "block_size",
                 |env| env.block_size = Some("0".to_string()),
