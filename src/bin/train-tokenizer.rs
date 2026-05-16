@@ -121,8 +121,8 @@ fn load_corpus_text(source: &str) -> Result<String> {
 }
 
 fn load_corpus_text_with_max_bytes(source: &str, max_local_bytes: u64) -> Result<String> {
-    let parsed = InputSource::parse(source)
-        .with_context(|| format!("invalid --corpus value '{source}'"))?;
+    let parsed =
+        InputSource::parse(source).with_context(|| format!("invalid --corpus value '{source}'"))?;
 
     match &parsed {
         InputSource::Local(path) => {
@@ -180,16 +180,13 @@ mod tests {
 
     #[test]
     fn load_corpus_text_rejects_oversized_local_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "rusty-gpt-corpus-too-large-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rusty-gpt-corpus-too-large-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("corpus.txt");
         fs::write(&path, b"hello hello hello").unwrap();
 
-        let err =
-            load_corpus_text_with_max_bytes(path.to_str().unwrap(), 4).unwrap_err();
+        let err = load_corpus_text_with_max_bytes(path.to_str().unwrap(), 4).unwrap_err();
         assert!(
             err.to_string().contains("exceeds the configured maximum"),
             "got: {err}"

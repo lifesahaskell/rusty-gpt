@@ -326,12 +326,12 @@ fn parse_hf_query(query: &str, raw: &str) -> Result<String, InputSourceError> {
                 raw: raw.to_string(),
             });
         }
-        let (key, value) = pair.split_once('=').ok_or_else(|| {
-            InputSourceError::MalformedHuggingFaceQuery {
-                reason: format!("parameter '{pair}' missing '='"),
-                raw: raw.to_string(),
-            }
-        })?;
+        let (key, value) =
+            pair.split_once('=')
+                .ok_or_else(|| InputSourceError::MalformedHuggingFaceQuery {
+                    reason: format!("parameter '{pair}' missing '='"),
+                    raw: raw.to_string(),
+                })?;
         if !ALLOWED_QUERY_KEYS.contains(&key) {
             return Err(InputSourceError::DisallowedHuggingFaceQueryKey {
                 key: key.to_string(),
@@ -569,7 +569,10 @@ mod tests {
         assert!(
             matches!(
                 err,
-                InputSourceError::DisallowedHuggingFaceCharacters { component: "org", .. }
+                InputSourceError::DisallowedHuggingFaceCharacters {
+                    component: "org",
+                    ..
+                }
             ),
             "expected DisallowedHuggingFaceCharacters(org), got {err:?}"
         );
@@ -657,8 +660,8 @@ mod tests {
 
     #[test]
     fn rejects_hf_uri_with_unknown_query_key() {
-        let err =
-            InputSource::parse("hf://org/dataset?config=en&shell_exec=cat%20/etc/passwd").unwrap_err();
+        let err = InputSource::parse("hf://org/dataset?config=en&shell_exec=cat%20/etc/passwd")
+            .unwrap_err();
         assert_eq!(
             InputSourceError::DisallowedHuggingFaceQueryKey {
                 key: "shell_exec".to_string()
@@ -754,8 +757,7 @@ mod tests {
 
     #[test]
     fn validate_local_size_reports_missing_file() {
-        let parsed =
-            InputSource::parse("/nonexistent/rusty-gpt-input-source-missing.txt").unwrap();
+        let parsed = InputSource::parse("/nonexistent/rusty-gpt-input-source-missing.txt").unwrap();
         let err = parsed
             .validate_local_size(DEFAULT_MAX_LOCAL_INPUT_BYTES)
             .unwrap_err();
@@ -777,9 +779,7 @@ mod tests {
         );
         assert_eq!(
             "hf://org/dataset@v1",
-            InputSource::parse("hf://org/dataset@v1")
-                .unwrap()
-                .display()
+            InputSource::parse("hf://org/dataset@v1").unwrap().display()
         );
         assert_eq!(
             "hf://org/dataset?config=en&split=train&rows=100",

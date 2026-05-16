@@ -2,7 +2,7 @@ use crate::runtime_config::ModelChoice;
 use anyhow::{Context, Result};
 use burn::tensor::backend::Backend;
 use rusty_gpt::loader::huggingface;
-use rusty_gpt::loader::{InputSource, DEFAULT_MAX_LOCAL_INPUT_BYTES};
+use rusty_gpt::loader::{DEFAULT_MAX_LOCAL_INPUT_BYTES, InputSource};
 use rusty_gpt::model::MiniGpt;
 use rusty_gpt::model::persistence::{CheckpointModelShape, load_model_with_metadata_validation};
 use rusty_gpt::observability::{EventLogger, RuntimeEvent};
