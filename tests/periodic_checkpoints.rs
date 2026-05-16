@@ -46,7 +46,11 @@ fn checkpoint_interval_and_keep_produce_expected_files() {
 
     let names: Vec<String> = fs::read_dir(&tmp)
         .expect("read tmp dir")
-        .filter_map(|entry| entry.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+        })
         .collect();
 
     // Final end-of-run save is always present.
