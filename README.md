@@ -16,6 +16,14 @@ docker compose up
 # Or natively (Rust 1.93+):
 cargo run --bin rusty-gpt -- --serve --load-latest-checkpoint
 cargo test
+
+# Train a MiniGPT from scratch on the bundled Shakespeare corpus.
+# One-time: build the BPE tokenizer (writes checkpoints/tokenizer.json).
+cargo run --bin train-tokenizer -- --corpus data/input.txt \
+    --vocab-size 2048 --output checkpoints/tokenizer.json
+
+# Then train MiniGPT (defaults to 1000 steps on CPU; add --release for speed).
+cargo run --release
 ```
 
 Open VS Code with the *Dev Containers* extension to pick between a CPU dev
