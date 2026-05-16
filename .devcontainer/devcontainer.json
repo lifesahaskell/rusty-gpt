@@ -1,0 +1,107 @@
+{
+  "$schema": "https://raw.githubusercontent.com/devcontainers/spec/main/schemas/devContainer.schema.json",
+  "name": "rusty-gpt",
+
+  // The dev container is the same compose stack used for `docker compose up`,
+  // so what you build/test inside VS Code matches what the prod images run.
+  "dockerComposeFile": [
+    "../compose.yaml",
+    "../compose.override.yaml"
+  ],
+  "service": "server",
+  "workspaceFolder": "/workspace",
+
+  // Replace the cargo-watch command from compose.override.yaml with a sleep
+  // so the container stays alive even if cargo watch crashes. Run cargo watch
+  // yourself from the integrated terminal — see postAttachCommand below.
+  "overrideCommand": true,
+
+  // Only the default-profile services come up automatically. Run the trainer
+  // explicitly with: `docker compose --profile train run --rm trainer`.
+  "runServices": ["server", "ui"],
+
+  "shutdownAction": "stopCompose",
+
+  "forwardPorts": [8787, 5173],
+  "portsAttributes": {
+    "8787": {
+      "label": "rusty-gpt API",
+      "onAutoForward": "silent"
+    },
+    "5173": {
+      "label": "mini-gpt-ui (Vite)",
+      "onAutoForward": "openBrowserOnce"
+    }
+  },
+
+  // Warm the cargo dep cache once on first create so the first `cargo run`
+  // doesn't sit fetching crates. Skipped on subsequent rebuilds.
+  "postCreateCommand": "cargo fetch --locked || true",
+
+  "postAttachCommand": {
+    "hint": "echo 'Start the dev API server with:  cargo watch -w src -w Cargo.toml -x \"run -- --serve --load-latest-checkpoint --server-addr 0.0.0.0:8787\"'"
+  },
+
+  "remoteUser": "root",
+  "containerEnv": {
+    "RUST_BACKTRACE": "1"
+  },
+
+  "mounts": [
+    // Optional: forward your host gitconfig so commits authored inside the
+    // container carry your name + email. Safe if the file is absent.
+    "source=${localEnv:HOME}/.gitconfig,target=/root/.gitconfig,type=bind,consistency=cached,readonly"
+  ],
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "vadimcn.vscode-lldb",
+        "serayuzgur.crates",
+        "fill-labs.dependi",
+        "esbenp.prettier-vscode",
+        "dbaeumer.vscode-eslint",
+        "redhat.vscode-yaml",
+        "ms-azuretools.vscode-docker",
+        "GitHub.vscode-pull-request-github"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy",
+        "rust-analyzer.cargo.allTargets": true,
+        "rust-analyzer.cargo.features": [],
+        "rust-analyzer.imports.granularity.group": "module",
+        "rust-analyzer.imports.prefix": "crate",
+        "editor.formatOnSave": true,
+        "files.watcherExclude": {
+          "**/target/**": true,
+          "**/node_modules/**": true,
+          "**/checkpoints/**": true,
+          "**/data-secret/**": true
+        },
+        "search.exclude": {
+          "**/target": true,
+          "**/node_modules": true,
+          "**/dist": true
+        },
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer"
+        },
+        "[typescript]": {
+          "editor.defaultFormatter": "esbenp.prettier-vscode"
+        },
+        "[typescriptreact]": {
+          "editor.defaultFormatter": "esbenp.prettier-vscode"
+        },
+        "[json]": {
+          "editor.defaultFormatter": "esbenp.prettier-vscode"
+        },
+        "[yaml]": {
+          "editor.defaultFormatter": "redhat.vscode-yaml"
+        },
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  }
+}

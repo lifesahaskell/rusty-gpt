@@ -1,0 +1,98 @@
+{
+  "$schema": "https://raw.githubusercontent.com/devcontainers/spec/main/schemas/devContainer.schema.json",
+  "name": "rusty-gpt (cuda)",
+
+  // Sibling of ../devcontainer.json. The CPU one attaches to `server`; this
+  // one attaches to `trainer` so you get an interactive shell with GPU
+  // access and the CUDA build feature available. Use this when iterating on
+  // training code or the cubecl-touching parts of model/mod.rs.
+  //
+  // PREREQUISITE: host must have nvidia-container-toolkit installed.
+  //   bash scripts/test_cuda_passthrough.sh   # verify; auto-prompts install path
+  //   sudo bash scripts/install_nvidia_container_toolkit.sh   # if missing
+  "dockerComposeFile": [
+    "../../compose.yaml",
+    "../../compose.override.yaml"
+  ],
+  "service": "trainer",
+  "workspaceFolder": "/workspace",
+
+  // The trainer service's compose command kicks off a full training run.
+  // Override with sleep infinity so the container stays alive for attach —
+  // run training yourself via the "Train MiniGPT (CUDA)" task or:
+  //   cargo run --release --features cuda -- --backend cuda --model minigpt
+  "overrideCommand": true,
+
+  // Only spin up what we need. Skipping `server` keeps the CPU build cache
+  // untouched. Add "ui" here if you want the UI available too — it costs
+  // ~200MB RAM and a vite process but doesn't compete for the GPU.
+  "runServices": ["trainer"],
+
+  "shutdownAction": "stopCompose",
+
+  "forwardPorts": [8787],
+  "portsAttributes": {
+    "8787": {
+      "label": "rusty-gpt API (cuda)",
+      "onAutoForward": "silent"
+    }
+  },
+
+  "postCreateCommand": "cargo fetch --locked || true",
+
+  "postAttachCommand": {
+    "gpu-check": "nvidia-smi -L || echo 'WARNING: nvidia-smi failed inside the container — GPU passthrough may be misconfigured. Run scripts/test_cuda_passthrough.sh on the host to diagnose.'",
+    "hint": "echo 'Train MiniGPT with:  cargo run --release --features cuda -- --backend cuda --model minigpt --checkpoint /workspace/checkpoints/mini_gpt --input /workspace/data/input.txt'"
+  },
+
+  "remoteUser": "root",
+  "containerEnv": {
+    "RUST_BACKTRACE": "1"
+  },
+
+  "mounts": [
+    "source=${localEnv:HOME}/.gitconfig,target=/root/.gitconfig,type=bind,consistency=cached,readonly"
+  ],
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "vadimcn.vscode-lldb",
+        "serayuzgur.crates",
+        "fill-labs.dependi",
+        "redhat.vscode-yaml",
+        "ms-azuretools.vscode-docker",
+        "GitHub.vscode-pull-request-github",
+        "nvidia.nsight-vscode-edition"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy",
+        "rust-analyzer.cargo.allTargets": true,
+        "rust-analyzer.cargo.features": ["cuda"],
+        "rust-analyzer.imports.granularity.group": "module",
+        "rust-analyzer.imports.prefix": "crate",
+        "editor.formatOnSave": true,
+        "files.watcherExclude": {
+          "**/target/**": true,
+          "**/node_modules/**": true,
+          "**/checkpoints/**": true,
+          "**/data-secret/**": true
+        },
+        "search.exclude": {
+          "**/target": true,
+          "**/node_modules": true,
+          "**/dist": true
+        },
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer"
+        },
+        "[yaml]": {
+          "editor.defaultFormatter": "redhat.vscode-yaml"
+        },
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  }
+}
