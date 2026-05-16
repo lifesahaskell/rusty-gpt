@@ -90,6 +90,8 @@ Defaults live in `src/runtime_config.rs`; validation rules in `Hyperparameters::
 | `--generate-tokens` | `RUSTY_GPT_GENERATE_TOKENS` | int, must be > 0 |
 | `--grad-clip-norm` | `RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM` | f32, must be > 0 |
 | `--prefetch-batches` | `RUSTY_GPT_PREFETCH_BATCHES` | int, default `2` (CPU prefetch queue depth) |
+| `--checkpoint-interval` | `RUSTY_GPT_CHECKPOINT_INTERVAL` | int, default `0` (disabled); save `<checkpoint>.step-<N>.mpk` every N steps during MiniGPT training |
+| `--checkpoint-keep` | `RUSTY_GPT_CHECKPOINT_KEEP` | int, default `3`; retention window for periodic snapshots — older `.step-N.` files are pruned, the final save and any `.interrupted-step-*` save are never pruned |
 
 `Hyperparameters::from_env_and_overrides` (in `src/runtime_config.rs`) resolves env → CLI overrides → `validate()`, which enforces the positivity/divisibility rules and recomputes `head_dim = embed_dim / num_heads`. Invalid combinations (e.g. `embed_dim` not divisible by `num_heads`) fail at config-parse time.
 
