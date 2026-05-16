@@ -48,6 +48,14 @@ pub struct TrainingMetrics {
 pub struct TrainingOutcome<M> {
     pub model: M,
     pub metrics: TrainingMetrics,
+    /// Number of training steps actually completed before the loop returned.
+    /// Equal to `params.steps` on a clean finish; less when a signal interrupt
+    /// broke the loop early.
+    pub steps_completed: usize,
+    /// `true` when the loop stopped early because [`crate::runtime_signals`]
+    /// observed a SIGINT/SIGTERM. The caller is expected to save a partial
+    /// checkpoint and exit with [`crate::runtime_signals::INTERRUPTED_EXIT_CODE`].
+    pub interrupted: bool,
 }
 
 impl TrainingParams {
@@ -239,14 +247,25 @@ where
     let loss_fn = CrossEntropyLossConfig::new().init(device);
     let started_at = std::time::Instant::now();
     let mut final_value_loss = None;
+    let mut interrupted = false;
+    let mut steps_completed = 0usize;
 
     for step in 0..params.steps {
+        // Honour any SIGINT/SIGTERM received before this step starts so the
+        // operator gets a clean partial-checkpoint save instead of a hard
+        // abort mid-step. See `runtime_signals` for the installer.
+        if crate::runtime_signals::interrupt_requested() {
+            interrupted = true;
+            break;
+        }
+
         let (inputs, targets) = training_batches.next_batch::<B>(device)?;
         let loss = language_model_loss(&loss_fn, forward(&model, inputs), targets);
 
         let grads = loss.backward();
         let grads = GradientsParams::from_grads(grads, &model);
         model = optimizer.step(params.learning_rate, model, grads);
+        steps_completed = step + 1;
 
         if should_log_training_step(step, params.steps, params.eval_interval) {
             let throughput = TrainingThroughput::from_progress(
@@ -285,6 +304,8 @@ where
             final_value_loss,
             final_perplexity: perplexity(final_value_loss),
         },
+        steps_completed,
+        interrupted,
     })
 }
 
