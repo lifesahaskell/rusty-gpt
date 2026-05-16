@@ -38,6 +38,29 @@ pub struct CheckpointMetadata {
     pub tokenizer: CheckpointTokenizer,
     pub training: CheckpointTrainingRun,
     pub final_metrics: CheckpointTrainingMetrics,
+    /// `true` when this checkpoint was written by the SIGINT/SIGTERM graceful
+    /// shutdown path instead of a normal end-of-run save. Older sidecars
+    /// without this field deserialize to `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub interrupted: bool,
+    /// When `interrupted` is true, the step number at which the training loop
+    /// observed the signal and broke out. `None` for normal end-of-run saves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted_at_step: Option<usize>,
+    /// Step number at which this periodic-cadence snapshot was written.
+    /// `None` for the normal end-of-run save and interrupted saves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<usize>,
+    /// `--checkpoint-interval` value in effect when this periodic snapshot
+    /// was written. `None` for the normal end-of-run save and interrupted
+    /// saves; lets future tooling reason about cadence without inferring
+    /// it from filenames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<usize>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -416,6 +439,10 @@ mod tests {
                 final_value_loss: 1.25,
                 final_perplexity: 3.49,
             },
+            interrupted: false,
+            interrupted_at_step: None,
+            step: None,
+            interval: None,
         };
 
         save_checkpoint_metadata(&path, &metadata).unwrap();
@@ -473,6 +500,10 @@ mod tests {
                     final_value_loss: 1.0,
                     final_perplexity: 2.71,
                 },
+                interrupted: false,
+                interrupted_at_step: None,
+                step: None,
+                interval: None,
             },
         )
         .unwrap();
@@ -651,6 +682,10 @@ mod tests {
                 final_value_loss: 1.0,
                 final_perplexity: 2.71,
             },
+            interrupted: false,
+            interrupted_at_step: None,
+            step: None,
+            interval: None,
         };
         std::fs::write(&tokenizer_path, br#"{"tokenizer":"new"}"#).unwrap();
 
@@ -709,6 +744,10 @@ mod tests {
                 final_value_loss: 1.0,
                 final_perplexity: 2.71,
             },
+            interrupted: false,
+            interrupted_at_step: None,
+            step: None,
+            interval: None,
         };
 
         let report = checkpoint_compatibility_report(
@@ -764,6 +803,10 @@ mod tests {
                 final_value_loss: 1.0,
                 final_perplexity: 2.71,
             },
+            interrupted: false,
+            interrupted_at_step: None,
+            step: None,
+            interval: None,
         }
     }
 }

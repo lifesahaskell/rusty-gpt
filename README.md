@@ -39,6 +39,16 @@ environment and a CUDA one ([details](docs/development-runbook.md#container-base
 - **Self-describing checkpoints** — every `.mpk` ships with a
   `.metadata.json` sidecar (shape, tokenizer hash, training config, git
   commit), validated on load.
+- **Graceful interrupt** — Ctrl-C (or `SIGTERM`) during a MiniGPT
+  training run completes the current step, writes a partial checkpoint to
+  `<checkpoint>.interrupted-step-<N>.mpk` (with `interrupted: true` in the
+  sidecar), and exits with code 130. A second interrupt within 2s aborts
+  immediately without saving.
+- **Periodic mid-run checkpoints** — `--checkpoint-interval <N>` saves
+  `<checkpoint>.step-<N>.mpk` every N steps; `--checkpoint-keep <K>`
+  (default 3) prunes older periodic snapshots. The final end-of-run save
+  and any interrupted save are never pruned. Example:
+  `cargo run --release --features cuda -- --backend cuda --model minigpt --train-steps 100000 --checkpoint-interval 1000`.
 - **Attention visualization** — `POST /api/generate` returns per-layer /
   per-head attention weights alongside the generated tokens for the React
   UI to render.

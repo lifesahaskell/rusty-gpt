@@ -28,6 +28,14 @@ pub(crate) const EVAL_INTERVAL: usize = 100;
 pub(crate) const GENERATE_TOKENS: usize = 80;
 pub(crate) const MINIGPT_GRAD_CLIP_NORM: f32 = 1.0;
 pub(crate) const PREFETCH_BATCHES: usize = 2;
+/// Default cadence (in training steps) for mid-run MiniGPT checkpoints.
+/// `0` disables periodic saves, preserving the historical behaviour of
+/// saving only at the end of `train_steps`.
+pub(crate) const CHECKPOINT_INTERVAL: usize = 0;
+/// Default retention window for periodic checkpoints: keep the most recent
+/// K snapshots, prune the rest. The final end-of-run save and any SIGINT
+/// `interrupted-step-*` save are never pruned.
+pub(crate) const CHECKPOINT_KEEP: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Hyperparameters {
@@ -44,6 +52,8 @@ pub(crate) struct Hyperparameters {
     pub(crate) generate_tokens: usize,
     pub(crate) minigpt_grad_clip_norm: f32,
     pub(crate) prefetch_batches: usize,
+    pub(crate) checkpoint_interval: usize,
+    pub(crate) checkpoint_keep: usize,
 }
 
 impl Default for Hyperparameters {
@@ -62,6 +72,8 @@ impl Default for Hyperparameters {
             generate_tokens: GENERATE_TOKENS,
             minigpt_grad_clip_norm: MINIGPT_GRAD_CLIP_NORM,
             prefetch_batches: PREFETCH_BATCHES,
+            checkpoint_interval: CHECKPOINT_INTERVAL,
+            checkpoint_keep: CHECKPOINT_KEEP,
         }
     }
 }
@@ -141,6 +153,16 @@ impl Hyperparameters {
             env.prefetch_batches.as_deref(),
             &mut hyperparameters.prefetch_batches,
         )?;
+        apply_optional_override(
+            "RUSTY_GPT_CHECKPOINT_INTERVAL",
+            env.checkpoint_interval.as_deref(),
+            &mut hyperparameters.checkpoint_interval,
+        )?;
+        apply_optional_override(
+            "RUSTY_GPT_CHECKPOINT_KEEP",
+            env.checkpoint_keep.as_deref(),
+            &mut hyperparameters.checkpoint_keep,
+        )?;
 
         overrides.apply_to(&mut hyperparameters);
         hyperparameters.validate()?;
@@ -181,6 +203,11 @@ impl Hyperparameters {
         if self.minigpt_grad_clip_norm <= 0.0 {
             bail!("RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM must be greater than zero");
         }
+        if self.checkpoint_interval != 0 && self.checkpoint_keep == 0 {
+            bail!(
+                "checkpoint_keep must be greater than zero when checkpoint_interval is non-zero (use --checkpoint-interval 0 to disable periodic checkpoints entirely)"
+            );
+        }
 
         self.head_dim = self.embed_dim / self.num_heads;
         Ok(())
@@ -201,6 +228,8 @@ struct HyperparameterOverrides {
     generate_tokens: Option<usize>,
     minigpt_grad_clip_norm: Option<f32>,
     prefetch_batches: Option<usize>,
+    checkpoint_interval: Option<usize>,
+    checkpoint_keep: Option<usize>,
 }
 
 impl HyperparameterOverrides {
@@ -240,6 +269,12 @@ impl HyperparameterOverrides {
         }
         if let Some(value) = self.prefetch_batches {
             hyperparameters.prefetch_batches = value;
+        }
+        if let Some(value) = self.checkpoint_interval {
+            hyperparameters.checkpoint_interval = value;
+        }
+        if let Some(value) = self.checkpoint_keep {
+            hyperparameters.checkpoint_keep = value;
         }
     }
 }
@@ -354,6 +389,8 @@ pub(crate) struct RuntimeEnv {
     pub(crate) generate_tokens: Option<String>,
     pub(crate) minigpt_grad_clip_norm: Option<String>,
     pub(crate) prefetch_batches: Option<String>,
+    pub(crate) checkpoint_interval: Option<String>,
+    pub(crate) checkpoint_keep: Option<String>,
 }
 
 impl RuntimeEnv {
@@ -381,6 +418,8 @@ impl RuntimeEnv {
             generate_tokens: env::var("RUSTY_GPT_GENERATE_TOKENS").ok(),
             minigpt_grad_clip_norm: env::var("RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM").ok(),
             prefetch_batches: env::var("RUSTY_GPT_PREFETCH_BATCHES").ok(),
+            checkpoint_interval: env::var("RUSTY_GPT_CHECKPOINT_INTERVAL").ok(),
+            checkpoint_keep: env::var("RUSTY_GPT_CHECKPOINT_KEEP").ok(),
         }
     }
 }
@@ -567,6 +606,16 @@ where
             "--prefetch-batches" => {
                 hyperparameter_overrides.prefetch_batches =
                     Some(parse_arg_value(&args, index, "--prefetch-batches")?);
+                index += 2;
+            }
+            "--checkpoint-interval" => {
+                hyperparameter_overrides.checkpoint_interval =
+                    Some(parse_arg_value(&args, index, "--checkpoint-interval")?);
+                index += 2;
+            }
+            "--checkpoint-keep" => {
+                hyperparameter_overrides.checkpoint_keep =
+                    Some(parse_arg_value(&args, index, "--checkpoint-keep")?);
                 index += 2;
             }
             "--interactive-generate" => {
