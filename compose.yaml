@@ -1,0 +1,121 @@
+# rusty-gpt local infrastructure.
+#
+# Profiles (start any combination with `docker compose --profile <name> up`):
+#   bootstrap  one-shot: train a BPE tokenizer into ./checkpoints/tokenizer.json
+#   train      one-shot: train MiniGPT on a CUDA GPU, writes ./checkpoints/mini_gpt.mpk
+#   serve      (default) HTTP API + React UI; serves the newest checkpoint
+#
+# Typical first-time flow on a CUDA host:
+#   docker compose --profile bootstrap run --rm train-tokenizer
+#   docker compose --profile train     run --rm trainer
+#   docker compose --profile serve     up  -d
+#
+# Subsequent runs (already have a tokenizer + checkpoint):
+#   docker compose up -d           # `serve` is the default profile
+
+name: rusty-gpt
+
+x-checkpoints-volume: &checkpoints-volume
+  type: bind
+  source: ./checkpoints
+  target: /app/checkpoints
+
+x-data-volume: &data-volume
+  type: bind
+  source: ./data
+  target: /app/data
+  read_only: true
+
+services:
+  # ---- bootstrap: train the BPE tokenizer (CPU-only, fast) ------------------
+  train-tokenizer:
+    profiles: ["bootstrap"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.cpu
+    image: rusty-gpt-cpu:latest
+    entrypoint: ["/usr/local/bin/train-tokenizer"]
+    command:
+      - "--corpus"
+      - "/app/data/input.txt"
+      - "--vocab-size"
+      - "2048"
+      - "--output"
+      - "/app/checkpoints/tokenizer.json"
+    volumes:
+      - *checkpoints-volume
+      - *data-volume
+
+  # ---- train: run MiniGPT training on a CUDA GPU ----------------------------
+  trainer:
+    profiles: ["train"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.cuda
+    image: rusty-gpt-cuda:latest
+    command:
+      - "--backend"
+      - "cuda"
+      - "--model"
+      - "minigpt"
+      - "--checkpoint"
+      - "/app/checkpoints/mini_gpt"
+      - "--input"
+      - "/app/data/input.txt"
+    environment:
+      RUSTY_GPT_BPE_TOKENIZER: /app/checkpoints/tokenizer.json
+      # Override any of these to tune the run without rebuilding the image.
+      RUSTY_GPT_TRAIN_STEPS: ${RUSTY_GPT_TRAIN_STEPS:-2000}
+      RUSTY_GPT_EVAL_INTERVAL: ${RUSTY_GPT_EVAL_INTERVAL:-100}
+      RUSTY_GPT_BATCH_SIZE: ${RUSTY_GPT_BATCH_SIZE:-32}
+      RUSTY_GPT_BLOCK_SIZE: ${RUSTY_GPT_BLOCK_SIZE:-128}
+    volumes:
+      - *checkpoints-volume
+      - *data-volume
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: ["gpu"]
+
+  # ---- serve: HTTP API serving the newest checkpoint (CPU inference) --------
+  server:
+    profiles: ["serve", ""]   # "" = default profile; runs on bare `compose up`
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.cpu
+    image: rusty-gpt-cpu:latest
+    command:
+      - "--serve"
+      - "--load-latest-checkpoint"
+      - "--server-addr"
+      - "0.0.0.0:8787"
+    environment:
+      RUSTY_GPT_BPE_TOKENIZER: /app/checkpoints/tokenizer.json
+    volumes:
+      - <<: *checkpoints-volume
+        read_only: true
+    ports:
+      - "${RUSTY_GPT_PORT:-8787}:8787"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8787/api/info >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  # ---- serve: React UI behind nginx, proxies /api -> server -----------------
+  ui:
+    profiles: ["serve", ""]
+    build:
+      context: ./mini-gpt-ui
+    image: rusty-gpt-ui:latest
+    ports:
+      - "${RUSTY_GPT_UI_PORT:-8080}:80"
+    depends_on:
+      server:
+        condition: service_healthy
+    restart: unless-stopped

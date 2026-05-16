@@ -1,0 +1,111 @@
+# Dev iteration override — auto-merged with compose.yaml when you run
+# `docker compose up`. Swaps the prod images for builder-stage images with
+# bind-mounted source so changes to src/ trigger an in-container rebuild,
+# not a docker image rebuild.
+#
+# This file is also the compose backing for .devcontainer/devcontainer.json,
+# so the whole repo is bind-mounted at /workspace (instead of piecewise
+# src/tests/Cargo.toml mounts) — that way VS Code's file tree sees the full
+# project when attached to the `server` container.
+#
+# To opt OUT (run prod images locally), pass the base file explicitly:
+#   docker compose -f compose.yaml up
+#
+# Notes:
+#   - CARGO_TARGET_DIR points at a named volume so target/ persists across
+#     container restarts and the host's target/ stays untouched.
+#   - Separate target volumes per backend (cpu vs cuda) — different feature
+#     flags produce incompatible artifacts; sharing the dir thrashes cache.
+#   - The cargo registry + git caches are also on named volumes — the first
+#     `cargo build` after a wipe will re-fetch, subsequent ones are fast.
+#   - `!override` / `!reset` need Docker Compose v2.24+.
+
+services:
+  # Hot-reload dev server: cargo watch rebuilds + reruns on source change.
+  server:
+    build:
+      target: dev
+    image: rusty-gpt-cpu-dev:latest
+    entrypoint: []
+    # scripts/start_dev_server.sh reads the newest .metadata.json sidecar in
+    # /workspace/checkpoints/ and injects matching --block-size etc. so the
+    # server config follows whatever checkpoint --load-latest-checkpoint
+    # picks. Avoids a metadata-mismatch panic on startup (the panic shows up
+    # downstream as a 502 from the UI's /api proxy).
+    command: ["bash", "scripts/start_dev_server.sh"]
+    working_dir: /workspace
+    environment:
+      CARGO_TARGET_DIR: /cargo-target
+      RUSTY_GPT_BPE_TOKENIZER: /workspace/checkpoints/tokenizer.json
+      RUST_BACKTRACE: "1"
+    volumes:
+      - .:/workspace:cached
+      - cargo-target-cpu:/cargo-target
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+    healthcheck:
+      disable: true
+
+  # Trainer in dev mode: `dev` stage gives us cargo-watch + comfort tooling
+  # so the same service backs both:
+  #   - One-shot training:   `docker compose --profile train run --rm trainer`
+  #   - CUDA dev container:  .devcontainer/cuda/devcontainer.json attaches
+  #     here and replaces the command with `sleep infinity` (overrideCommand).
+  trainer:
+    build:
+      target: dev
+    image: rusty-gpt-cuda-dev:latest
+    entrypoint: []
+    command:
+      - bash
+      - -c
+      - >
+        cargo run --release --features cuda --bin rusty-gpt --
+        --backend cuda
+        --model minigpt
+        --checkpoint /workspace/checkpoints/mini_gpt
+        --input /workspace/data/input.txt
+    working_dir: /workspace
+    environment:
+      CARGO_TARGET_DIR: /cargo-target
+      RUSTY_GPT_BPE_TOKENIZER: /workspace/checkpoints/tokenizer.json
+      RUST_BACKTRACE: "1"
+    volumes:
+      - .:/workspace:cached
+      - cargo-target-cuda:/cargo-target
+      - cargo-registry-cuda:/usr/local/cargo/registry
+      - cargo-git-cuda:/usr/local/cargo/git
+
+  # Vite dev server with HMR. Proxies /api -> server:8787 via the existing
+  # VITE_API_PROXY_TARGET hook in mini-gpt-ui/vite.config.ts.
+  ui:
+    image: node:22-alpine
+    build: !reset null
+    working_dir: /app
+    entrypoint: []
+    # The named-volume mount makes /app/node_modules always exist (just empty
+    # on first run), so we test for the actual binary, not the directory.
+    command:
+      - sh
+      - -lc
+      - "[ -x node_modules/.bin/vite ] || npm ci; exec npm run dev -- --host 0.0.0.0 --port 5173"
+    environment:
+      VITE_API_PROXY_TARGET: http://server:8787
+    volumes:
+      - ./mini-gpt-ui:/app
+      - ui-node-modules:/app/node_modules
+    ports: !override
+      - "${RUSTY_GPT_UI_PORT:-5173}:5173"
+    healthcheck:
+      disable: true
+    depends_on: !override
+      - server
+
+volumes:
+  cargo-target-cpu:
+  cargo-target-cuda:
+  cargo-registry:
+  cargo-registry-cuda:
+  cargo-git:
+  cargo-git-cuda:
+  ui-node-modules:
