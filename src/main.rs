@@ -111,7 +111,7 @@ fn main() -> Result<()> {
         #[cfg(feature = "cuda")]
         BackendChoice::Cuda => {
             if config.interactive {
-                bail!("interactive generation currently requires --backend cpu");
+                anyhow::bail!("interactive generation currently requires --backend cpu");
             }
             let device = CudaDevice::default();
             run_demo::<Cuda>(&text, hyperparameters, config.model, &device, &logger)?;

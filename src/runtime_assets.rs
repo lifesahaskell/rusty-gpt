@@ -3,7 +3,9 @@ use anyhow::{Context, Result};
 use burn::tensor::backend::Backend;
 use rusty_gpt::loader::huggingface;
 use rusty_gpt::model::MiniGpt;
-use rusty_gpt::model::persistence::{CheckpointModelShape, load_model_with_metadata_validation};
+use rusty_gpt::model::persistence::{
+    CheckpointModelShape, load_model_with_strict_metadata_validation,
+};
 use rusty_gpt::observability::{EventLogger, RuntimeEvent};
 use rusty_gpt::tokenizer::RuntimeTokenizer;
 use std::env;
@@ -30,11 +32,11 @@ pub(crate) fn load_minigpt_checkpoint<B: Backend>(
         num_layers: template.num_layers(),
     };
     let tokenizer_path = minigpt_tokenizer_path();
-    let model = load_model_with_metadata_validation(
+    let model = load_model_with_strict_metadata_validation(
         template,
         checkpoint_path,
         &expected_shape,
-        Some(Path::new(&tokenizer_path)),
+        Path::new(&tokenizer_path),
         device,
     )
     .with_context(|| {

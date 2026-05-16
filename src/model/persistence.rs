@@ -217,6 +217,39 @@ pub fn validate_checkpoint_compatibility(
     Ok(())
 }
 
+pub fn validate_checkpoint_compatibility_strict(
+    checkpoint_path: &Path,
+    metadata: &CheckpointMetadata,
+    expected_shape: &CheckpointModelShape,
+    tokenizer_path: &Path,
+) -> anyhow::Result<()> {
+    let mut report =
+        checkpoint_compatibility_report(metadata, expected_shape, Some(tokenizer_path))?;
+
+    if metadata.tokenizer.sha256.is_none() {
+        report.issues.push(CheckpointCompatibilityIssue {
+            field: "tokenizer.sha256".to_string(),
+            expected: format!(
+                "sha256 recorded in checkpoint metadata for tokenizer {}",
+                tokenizer_path.display()
+            ),
+            found: "missing".to_string(),
+        });
+        report.compatible = false;
+    }
+
+    if !report.compatible {
+        anyhow::bail!(
+            "strict checkpoint metadata validation failed for checkpoint {} with tokenizer {}: {}",
+            checkpoint_path.with_extension("mpk").display(),
+            tokenizer_path.display(),
+            report
+        );
+    }
+
+    Ok(())
+}
+
 fn push_usize_issue(
     issues: &mut Vec<CheckpointCompatibilityIssue>,
     field: &str,
@@ -248,6 +281,33 @@ where
     if let Some(metadata) = load_checkpoint_metadata(&path_buf)? {
         validate_checkpoint_compatibility(&metadata, expected_shape, tokenizer_path)?;
     }
+
+    load_model(model, path, device).map_err(anyhow::Error::msg)
+}
+
+pub fn load_model_with_strict_metadata_validation<M, B, P>(
+    model: M,
+    path: P,
+    expected_shape: &CheckpointModelShape,
+    tokenizer_path: &Path,
+    device: &B::Device,
+) -> anyhow::Result<M>
+where
+    M: Module<B>,
+    B: Backend,
+    P: Into<PathBuf> + Clone,
+{
+    let path_buf: PathBuf = path.clone().into();
+    let metadata_path = metadata_path(&path_buf);
+    let metadata = load_checkpoint_metadata(&path_buf)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "strict checkpoint metadata validation failed for checkpoint {}: missing metadata sidecar {}; runtime MiniGPT checkpoint loads require metadata before Burn model deserialization",
+            path_buf.with_extension("mpk").display(),
+            metadata_path.display()
+        )
+    })?;
+
+    validate_checkpoint_compatibility_strict(&path_buf, &metadata, expected_shape, tokenizer_path)?;
 
     load_model(model, path, device).map_err(anyhow::Error::msg)
 }
@@ -443,6 +503,115 @@ mod tests {
     }
 
     #[test]
+    fn strict_metadata_validation_rejects_missing_sidecar_before_raw_load() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let path = std::env::temp_dir().join(format!(
+            "rusty-gpt-strict-missing-metadata-{}",
+            std::process::id()
+        ));
+        let saved_path = path.with_extension("mpk");
+        let metadata_path = metadata_path(&path);
+        let tokenizer_path = path.with_extension("tokenizer.json");
+        let _ = std::fs::remove_file(&saved_path);
+        let _ = std::fs::remove_file(&metadata_path);
+        let _ = std::fs::remove_file(&tokenizer_path);
+
+        let template = MiniGpt::<TestBackend>::new(7, 8, 1, 4, 2, &device);
+        let err = load_model_with_strict_metadata_validation(
+            template,
+            &path,
+            &CheckpointModelShape {
+                vocab_size: 7,
+                block_size: 4,
+                embed_dim: 8,
+                num_heads: 2,
+                num_layers: 1,
+            },
+            &tokenizer_path,
+            &device,
+        )
+        .expect_err("strict runtime loads should reject checkpoints without metadata");
+
+        let message = err.to_string();
+        assert!(message.contains("missing metadata sidecar"));
+        assert!(message.contains(&metadata_path.display().to_string()));
+        assert!(message.contains("before Burn model deserialization"));
+
+        let _ = std::fs::remove_file(saved_path);
+        let _ = std::fs::remove_file(metadata_path);
+        let _ = std::fs::remove_file(tokenizer_path);
+    }
+
+    #[test]
+    fn strict_metadata_validation_rejects_missing_tokenizer_hash() {
+        let checkpoint_path = std::env::temp_dir().join(format!(
+            "rusty-gpt-strict-missing-tokenizer-sha-{}",
+            std::process::id()
+        ));
+        let tokenizer_path = checkpoint_path.with_extension("tokenizer.json");
+        std::fs::write(&tokenizer_path, br#"{"tokenizer":"current"}"#).unwrap();
+        let metadata = compatible_test_metadata(7, None);
+
+        let err = validate_checkpoint_compatibility_strict(
+            &checkpoint_path,
+            &metadata,
+            &CheckpointModelShape {
+                vocab_size: 7,
+                block_size: 4,
+                embed_dim: 8,
+                num_heads: 2,
+                num_layers: 1,
+            },
+            &tokenizer_path,
+        )
+        .expect_err("strict runtime loads should require tokenizer sha256 metadata");
+
+        let message = err.to_string();
+        assert!(message.contains("strict checkpoint metadata validation failed"));
+        assert!(message.contains(&checkpoint_path.with_extension("mpk").display().to_string()));
+        assert!(message.contains(&tokenizer_path.display().to_string()));
+        assert!(message.contains("tokenizer.sha256 expected sha256 recorded"));
+        assert!(message.contains("found missing"));
+
+        let _ = std::fs::remove_file(tokenizer_path);
+    }
+
+    #[test]
+    fn strict_metadata_validation_reports_tokenizer_hash_mismatch_with_context() {
+        let checkpoint_path = std::env::temp_dir().join(format!(
+            "rusty-gpt-strict-tokenizer-sha-mismatch-{}",
+            std::process::id()
+        ));
+        let tokenizer_path = checkpoint_path.with_extension("tokenizer.json");
+        std::fs::write(&tokenizer_path, br#"{"tokenizer":"saved"}"#).unwrap();
+        let metadata = compatible_test_metadata(7, sha256_file_hex(&tokenizer_path).unwrap());
+        std::fs::write(&tokenizer_path, br#"{"tokenizer":"runtime"}"#).unwrap();
+
+        let err = validate_checkpoint_compatibility_strict(
+            &checkpoint_path,
+            &metadata,
+            &CheckpointModelShape {
+                vocab_size: 7,
+                block_size: 4,
+                embed_dim: 8,
+                num_heads: 2,
+                num_layers: 1,
+            },
+            &tokenizer_path,
+        )
+        .expect_err("strict runtime loads should reject tokenizer sha256 mismatches");
+
+        let message = err.to_string();
+        assert!(message.contains("strict checkpoint metadata validation failed"));
+        assert!(message.contains(&checkpoint_path.with_extension("mpk").display().to_string()));
+        assert!(message.contains(&tokenizer_path.display().to_string()));
+        assert!(message.contains("tokenizer.sha256"));
+
+        let _ = std::fs::remove_file(tokenizer_path);
+    }
+
+    #[test]
     fn compatibility_report_validates_tokenizer_hash_when_path_is_provided() {
         let tokenizer_path = std::env::temp_dir().join(format!(
             "rusty-gpt-tokenizer-compatibility-{}.json",
@@ -557,5 +726,44 @@ mod tests {
 
         assert!(report.compatible);
         assert!(report.issues.is_empty());
+    }
+
+    fn compatible_test_metadata(
+        vocab_size: usize,
+        tokenizer_sha256: Option<String>,
+    ) -> CheckpointMetadata {
+        CheckpointMetadata {
+            version: 1,
+            created_at_utc: "2026-05-14T00:00:00Z".to_string(),
+            git_commit: None,
+            input_source: "test".to_string(),
+            model_shape: CheckpointModelShape {
+                vocab_size,
+                block_size: 4,
+                embed_dim: 8,
+                num_heads: 2,
+                num_layers: 1,
+            },
+            tokenizer: CheckpointTokenizer {
+                path: "tokenizer.json".to_string(),
+                sha256: tokenizer_sha256,
+                vocab_size,
+            },
+            training: CheckpointTrainingRun {
+                backend: "cpu".to_string(),
+                train_tokens: 10,
+                value_tokens: 2,
+                batch_size: 1,
+                learning_rate: 1e-4,
+                train_steps: 1,
+                eval_interval: 0,
+                grad_clip_norm: 1.0,
+                prefetch_batches: 0,
+            },
+            final_metrics: CheckpointTrainingMetrics {
+                final_value_loss: 1.0,
+                final_perplexity: 2.71,
+            },
+        }
     }
 }
