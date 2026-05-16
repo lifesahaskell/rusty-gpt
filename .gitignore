@@ -8,3 +8,4 @@ data/huggingface-cache/
 .agents/
 .claude/
 data-secret/
+/docs/sprints/
