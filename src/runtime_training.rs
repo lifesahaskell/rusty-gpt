@@ -9,6 +9,7 @@ use rusty_gpt::model::{
     TrainingOutcome, TrainingParams, TrivialModel,
 };
 use rusty_gpt::observability::{EventLogger, RuntimeEvent};
+use rusty_gpt::runtime_signals::{INTERRUPTED_EXIT_CODE, install_training_signal_handler};
 use rusty_gpt::utils::{BenchmarkConfig, benchmark_generation};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,11 @@ where
     if options.benchmark_generation && !model_choice.includes_minigpt() {
         bail!("generation benchmarks require --model minigpt or compare");
     }
+
+    // Install the SIGINT/SIGTERM handler *only* on the training path so that
+    // --serve and --interactive-generate keep the default Ctrl-C behaviour.
+    install_training_signal_handler()
+        .context("failed to install SIGINT/SIGTERM handler for training")?;
 
     let tokenizer = tokenizer_for_model(text, model_choice)?;
     let encoded = tokenizer.encode(text);
@@ -206,7 +212,9 @@ where
             .map_err(anyhow::Error::msg)
             .context("failed to train minigpt model")?;
             log_training_completed(&run, started_at, outcome.metrics);
-            if run.benchmark_generation {
+            let interrupted = outcome.interrupted;
+            let steps_completed = outcome.steps_completed;
+            if !interrupted && run.benchmark_generation {
                 benchmark_generation(
                     &outcome.model,
                     run.device,
@@ -217,6 +225,12 @@ where
                 .context("failed to benchmark minigpt generation")?;
             }
             save_minigpt_checkpoint(outcome, run.checkpoint_path, &run)?;
+            if interrupted {
+                eprintln!(
+                    "training interrupted at step {steps_completed}; partial checkpoint saved. Exiting with code {INTERRUPTED_EXIT_CODE}."
+                );
+                std::process::exit(INTERRUPTED_EXIT_CODE);
+            }
         }
         ModelChoice::Compare => unreachable!("compare should be expanded before training dispatch"),
     }
@@ -253,22 +267,59 @@ fn save_minigpt_checkpoint<B: burn::tensor::backend::AutodiffBackend>(
             .with_context(|| format!("failed to create checkpoint directory {:?}", parent))?;
     }
 
+    // When the training loop was interrupted, redirect the save to a
+    // sibling path tagged with the step number so the normal end-of-run
+    // checkpoint (and any periodic snapshot retention from T3) is not
+    // overwritten by the partial run.
+    let save_path = if outcome.interrupted {
+        interrupted_checkpoint_path(checkpoint_path, outcome.steps_completed)
+    } else {
+        checkpoint_path.to_path_buf()
+    };
+
     let started_at = Instant::now();
-    save_model(outcome.model, checkpoint_path)
-        .with_context(|| format!("failed to save minigpt checkpoint to {:?}", checkpoint_path))?;
-    save_checkpoint_metadata(checkpoint_path, &checkpoint_metadata(run, outcome.metrics)?)
-        .with_context(|| {
-            format!(
-                "failed to save checkpoint metadata for {:?}",
-                checkpoint_path
-            )
-        })?;
+    save_model(outcome.model, &save_path)
+        .with_context(|| format!("failed to save minigpt checkpoint to {:?}", save_path))?;
+    let mut metadata = checkpoint_metadata(run, outcome.metrics)?;
+    if outcome.interrupted {
+        metadata.interrupted = true;
+        metadata.interrupted_at_step = Some(outcome.steps_completed);
+    }
+    save_checkpoint_metadata(&save_path, &metadata).with_context(|| {
+        format!("failed to save checkpoint metadata for {:?}", save_path)
+    })?;
+    let saved_mpk = save_path.with_extension("mpk").display().to_string();
     run.logger.log(RuntimeEvent::CheckpointSaved {
-        path: checkpoint_path.with_extension("mpk").display().to_string(),
+        path: saved_mpk.clone(),
         elapsed_ms: started_at.elapsed().as_millis(),
     });
+    if outcome.interrupted {
+        eprintln!("interrupted checkpoint saved at {saved_mpk}");
+    }
 
     Ok(())
+}
+
+/// Suffix the checkpoint path with `.interrupted-step-<N>.mpk`. The trailing
+/// `.mpk` is included here on purpose: `std::path::Path::with_extension`
+/// treats anything after the last `.` as an extension, so Burn's recorder
+/// (which calls `with_extension("mpk")` internally) would silently strip
+/// `interrupted-step-N` from a bare path. By baking `.mpk` into the path we
+/// pass downstream, `with_extension("mpk")` becomes a no-op and the on-disk
+/// file is `<base>.interrupted-step-<N>.mpk` as the spec requires.
+///
+/// Example: `checkpoints/mini_gpt` + step `42` ⇒
+/// `checkpoints/mini_gpt.interrupted-step-42.mpk`.
+pub(crate) fn interrupted_checkpoint_path(base: &Path, step: usize) -> PathBuf {
+    let file_name = base
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("checkpoint");
+    let tagged = format!("{file_name}.interrupted-step-{step}.mpk");
+    match base.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(tagged),
+        _ => PathBuf::from(tagged),
+    }
 }
 
 fn checkpoint_metadata<B: burn::tensor::backend::AutodiffBackend>(
@@ -308,6 +359,8 @@ fn checkpoint_metadata<B: burn::tensor::backend::AutodiffBackend>(
             final_value_loss: metrics.final_value_loss,
             final_perplexity: metrics.final_perplexity,
         },
+        interrupted: false,
+        interrupted_at_step: None,
     })
 }
 
@@ -347,4 +400,37 @@ pub(crate) fn split_training_and_value_tokens(
         tokens[split_at..].to_vec(),
         value_block_size,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interrupted_checkpoint_path_keeps_parent_and_tags_step() {
+        let result = interrupted_checkpoint_path(Path::new("checkpoints/mini_gpt"), 42);
+        assert_eq!(
+            PathBuf::from("checkpoints/mini_gpt.interrupted-step-42.mpk"),
+            result
+        );
+    }
+
+    #[test]
+    fn interrupted_checkpoint_path_handles_bare_filename() {
+        let result = interrupted_checkpoint_path(Path::new("mini_gpt"), 7);
+        assert_eq!(PathBuf::from("mini_gpt.interrupted-step-7.mpk"), result);
+    }
+
+    #[test]
+    fn interrupted_checkpoint_path_is_idempotent_through_with_extension() {
+        // Critical regression guard: std::path::Path::with_extension("mpk")
+        // must NOT strip the interrupted-step suffix. The bug it prevents:
+        // `mini_gpt.interrupted-step-1` (without .mpk) round-trips through
+        // Burn's recorder as `mini_gpt.mpk`.
+        let result = interrupted_checkpoint_path(Path::new("checkpoints/mini_gpt"), 1);
+        assert_eq!(
+            Path::new("checkpoints/mini_gpt.interrupted-step-1.mpk"),
+            result.with_extension("mpk")
+        );
+    }
 }
