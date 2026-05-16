@@ -651,6 +651,16 @@ impl<B: Backend> MiniGpt<B> {
         max_new_tokens: usize,
         device: &B::Device,
     ) -> Result<Vec<usize>, String> {
+        self.generate_with_options(prompt, max_new_tokens, device, GenerationOptions::greedy())
+    }
+
+    pub fn generate_with_options(
+        &self,
+        prompt: &[usize],
+        max_new_tokens: usize,
+        device: &B::Device,
+        options: GenerationOptions,
+    ) -> Result<Vec<usize>, String> {
         self.validate_generation_prompt(prompt)?;
 
         let mut output = prompt.to_vec();
@@ -660,15 +670,7 @@ impl<B: Backend> MiniGpt<B> {
             let input: Vec<i64> = context.iter().map(|&token| token as i64).collect();
             let tokens = Tensor::from_data(TensorData::new(input, [1, context.len()]), device);
             let logits = self.forward_tokens(tokens);
-            let [_batch_size, seq_len, vocab_size] = logits.shape().dims();
-            let logits = logits.into_data().to_vec::<f32>().unwrap();
-            let last_position_start = (seq_len - 1) * vocab_size;
-            let next_token = logits[last_position_start..last_position_start + vocab_size]
-                .iter()
-                .enumerate()
-                .max_by(|(_, left), (_, right)| left.total_cmp(right))
-                .map(|(token, _)| token)
-                .expect("vocab size should be greater than zero");
+            let next_token = Self::select_last_token(logits, options);
 
             output.push(next_token);
         }
@@ -769,25 +771,16 @@ impl<B: Backend> MiniGpt<B> {
         let logits = logits.into_data().to_vec::<f32>().unwrap();
         let last_position_start = (seq_len - 1) * vocab_size;
         let last_logits = &logits[last_position_start..last_position_start + vocab_size];
-        if options.temperature == 0.0 {
-            return Self::greedy_from_logits(last_logits);
-        }
 
-        generation::sample_from_logits(
+        generation::select_token_from_logits(
             last_logits,
-            options.temperature,
-            options.top_k,
-            rand::random(),
+            options,
+            if options.temperature <= 0.0 {
+                0.0
+            } else {
+                rand::random()
+            },
         )
-    }
-
-    fn greedy_from_logits(logits: &[f32]) -> usize {
-        logits
-            .iter()
-            .enumerate()
-            .max_by(|(_, left), (_, right)| left.total_cmp(right))
-            .map(|(token, _)| token)
-            .expect("vocab size should be greater than zero")
     }
 }
 
@@ -1278,6 +1271,21 @@ mod tests {
     }
 
     #[test]
+    fn minigpt_generate_delegates_to_greedy_options() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let model = MiniGpt::<TestBackend>::new(7, 8, 1, 4, 2, &device);
+        let prompt = [0, 1, 2];
+
+        let generated = model.generate(&prompt, 3, &device).unwrap();
+        let generated_with_options = model
+            .generate_with_options(&prompt, 3, &device, GenerationOptions::greedy())
+            .unwrap();
+
+        assert_eq!(generated_with_options, generated);
+    }
+
+    #[test]
     fn minigpt_generate_crops_context_to_position_window() {
         type TestBackend = NdArray<f32, i64>;
         let device = NdArrayDevice::Cpu;
@@ -1300,6 +1308,23 @@ mod tests {
             .expect_err("empty prompt should fail");
 
         assert!(err.contains("prompt must contain at least one token"));
+    }
+
+    #[test]
+    fn minigpt_option_bearing_generation_preserves_prompt_validation() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let model = MiniGpt::<TestBackend>::new(7, 8, 1, 4, 2, &device);
+
+        let uncached_err = model
+            .generate_with_options(&[0, 7], 1, &device, GenerationOptions::greedy())
+            .expect_err("out-of-vocab prompt should fail");
+        let cached_err = model
+            .generate_with_cache_options(&[0, 7], 1, &device, GenerationOptions::greedy())
+            .expect_err("out-of-vocab prompt should fail");
+
+        assert_eq!(uncached_err, cached_err);
+        assert!(uncached_err.contains("outside the model vocab size 7"));
     }
 
     #[test]
@@ -1334,9 +1359,12 @@ mod tests {
         let model = MiniGpt::<TestBackend>::new(7, 8, 1, 6, 2, &device);
         let prompt = [0, 1, 2];
         let prompt_tensor = Tensor::<TestBackend, 2, Int>::from_data([[0, 1, 2]], &device);
+        let options = GenerationOptions::greedy();
 
-        let generated = model.generate_cached(prompt_tensor, 3);
-        let uncached = model.generate(&prompt, 3, &device).unwrap();
+        let generated = model.generate_cached_with_options(prompt_tensor, 3, options);
+        let uncached = model
+            .generate_with_options(&prompt, 3, &device, options)
+            .unwrap();
 
         assert_eq!(uncached[prompt.len()..], generated);
     }

@@ -697,3 +697,285 @@ fn parse_model_name(name: &str) -> Result<ModelChoice> {
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_args(args: &[&str]) -> Result<RuntimeConfig> {
+        parse_args_with_env(args, RuntimeEnv::default())
+    }
+
+    fn parse_args_with_env(args: &[&str], env: RuntimeEnv) -> Result<RuntimeConfig> {
+        parse_runtime_config_with_checkpoint(args.iter().copied(), env)
+    }
+
+    fn expect_parse_error(args: &[&str], expected: &str) {
+        let err = parse_args(args).expect_err("runtime config parsing should fail");
+        assert!(
+            err.to_string().contains(expected),
+            "expected error to contain '{expected}', got '{err}'"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_hyperparameter_invariants_from_cli_overrides() {
+        let cases = [
+            (
+                &["--block-size", "0"][..],
+                "block_size must be greater than zero",
+            ),
+            (
+                &["--batch-size", "0"][..],
+                "batch_size must be greater than zero",
+            ),
+            (
+                &["--embed-dim", "0"][..],
+                "embed_dim must be greater than zero",
+            ),
+            (
+                &["--num-heads", "0"][..],
+                "num_heads must be greater than zero",
+            ),
+            (
+                &["--num-layers", "0"][..],
+                "num_layers must be greater than zero",
+            ),
+            (
+                &["--train-steps", "0"][..],
+                "train_steps must be greater than zero",
+            ),
+            (
+                &["--generate-tokens", "0"][..],
+                "generate_tokens must be greater than zero",
+            ),
+            (&["--dropout", "1.0"][..], "dropout must be >= 0 and < 1"),
+            (&["--dropout", "-0.1"][..], "dropout must be >= 0 and < 1"),
+            (
+                &["--learning-rate", "0"][..],
+                "learning_rate must be greater than zero",
+            ),
+            (
+                &["--learning-rate", "-0.01"][..],
+                "learning_rate must be greater than zero",
+            ),
+        ];
+
+        for (args, expected) in cases {
+            expect_parse_error(args, expected);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_hyperparameter_invariants_from_env() {
+        let cases: [(&str, fn(&mut RuntimeEnv), &str); 9] = [
+            (
+                "block_size",
+                |env| env.block_size = Some("0".to_string()),
+                "block_size must be greater than zero",
+            ),
+            (
+                "batch_size",
+                |env| env.batch_size = Some("0".to_string()),
+                "batch_size must be greater than zero",
+            ),
+            (
+                "embed_dim",
+                |env| env.embed_dim = Some("0".to_string()),
+                "embed_dim must be greater than zero",
+            ),
+            (
+                "num_heads",
+                |env| env.num_heads = Some("0".to_string()),
+                "num_heads must be greater than zero",
+            ),
+            (
+                "num_layers",
+                |env| env.num_layers = Some("0".to_string()),
+                "num_layers must be greater than zero",
+            ),
+            (
+                "train_steps",
+                |env| env.train_steps = Some("0".to_string()),
+                "train_steps must be greater than zero",
+            ),
+            (
+                "generate_tokens",
+                |env| env.generate_tokens = Some("0".to_string()),
+                "generate_tokens must be greater than zero",
+            ),
+            (
+                "dropout",
+                |env| env.dropout = Some("1.0".to_string()),
+                "dropout must be >= 0 and < 1",
+            ),
+            (
+                "learning_rate",
+                |env| env.learning_rate = Some("0".to_string()),
+                "learning_rate must be greater than zero",
+            ),
+        ];
+
+        for (name, set_env, expected) in cases {
+            let mut env = RuntimeEnv::default();
+            set_env(&mut env);
+
+            let err = match parse_args_with_env(&[], env) {
+                Ok(_) => panic!("{name} env override should fail"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains(expected),
+                "expected {name} error to contain '{expected}', got '{err}'"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_numeric_parse_from_env_and_cli_overrides() {
+        let mut env = RuntimeEnv {
+            block_size: Some("many".to_string()),
+            ..RuntimeEnv::default()
+        };
+        let err = parse_args_with_env(&[], env.clone())
+            .expect_err("invalid env hyperparameter value should fail");
+        assert!(
+            err.to_string()
+                .contains("invalid RUSTY_GPT_BLOCK_SIZE value: many")
+        );
+
+        env.block_size = None;
+        env.dropout = Some("often".to_string());
+        let err = parse_args_with_env(&[], env)
+            .expect_err("invalid env float hyperparameter value should fail");
+        assert!(
+            err.to_string()
+                .contains("invalid RUSTY_GPT_DROPOUT value: often")
+        );
+
+        expect_parse_error(
+            &["--block-size", "many"],
+            "invalid --block-size value: many",
+        );
+        expect_parse_error(&["--dropout", "often"], "invalid --dropout value: often");
+    }
+
+    #[test]
+    fn rejects_missing_parser_owned_flag_values() {
+        let cases = [
+            (&["--server-addr"][..], "--server-addr requires a value"),
+            (&["--log-format"][..], "--log-format requires a value"),
+            (
+                &["--benchmark-prompt-lens"][..],
+                "--benchmark-prompt-lens requires a comma-separated list",
+            ),
+            (
+                &["--benchmark-gen-lens"][..],
+                "--benchmark-gen-lens requires a comma-separated list",
+            ),
+            (
+                &["--benchmark-warmups"][..],
+                "--benchmark-warmups requires an integer",
+            ),
+            (
+                &["--benchmark-iterations"][..],
+                "--benchmark-iterations requires an integer",
+            ),
+            (&["--block-size"][..], "--block-size requires a value"),
+            (&["--dropout"][..], "--dropout requires a value"),
+            (&["--learning-rate"][..], "--learning-rate requires a value"),
+        ];
+
+        for (args, expected) in cases {
+            expect_parse_error(args, expected);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_parser_owned_flag_values() {
+        let cases = [
+            (
+                &["--server-addr", "localhost"][..],
+                "invalid server address 'localhost'",
+            ),
+            (&["--log-format", "yaml"][..], "unsupported log format"),
+            (
+                &["--benchmark-prompt-lens", "1,two"][..],
+                "invalid benchmark prompt lengths '1,two'",
+            ),
+            (
+                &["--benchmark-gen-lens", "0"][..],
+                "invalid benchmark generation lengths '0'",
+            ),
+            (
+                &["--benchmark-warmups", "many"][..],
+                "invalid benchmark warmups 'many'",
+            ),
+            (
+                &["--benchmark-iterations", "many"][..],
+                "invalid benchmark iterations 'many'",
+            ),
+            (
+                &["--benchmark-iterations", "0"][..],
+                "benchmark iterations must be greater than zero",
+            ),
+            (
+                &["--block-size", "many"][..],
+                "invalid --block-size value: many",
+            ),
+            (
+                &["--num-heads", "many"][..],
+                "invalid --num-heads value: many",
+            ),
+            (
+                &["--dropout", "often"][..],
+                "invalid --dropout value: often",
+            ),
+        ];
+
+        for (args, expected) in cases {
+            expect_parse_error(args, expected);
+        }
+    }
+
+    #[test]
+    fn serve_can_be_selected_from_args() {
+        let config = parse_args(&["--serve"]).unwrap();
+
+        assert!(config.serve);
+    }
+
+    #[test]
+    fn server_addr_can_be_selected_from_env() {
+        let config = parse_args_with_env(
+            &[],
+            RuntimeEnv {
+                server_addr: Some("127.0.0.1:9000".to_string()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            "127.0.0.1:9000".parse::<SocketAddr>().unwrap(),
+            config.server_addr
+        );
+    }
+
+    #[test]
+    fn server_addr_cli_override_takes_precedence_over_env() {
+        let config = parse_args_with_env(
+            &["--server-addr", "127.0.0.1:9001"],
+            RuntimeEnv {
+                server_addr: Some("127.0.0.1:9000".to_string()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            "127.0.0.1:9001".parse::<SocketAddr>().unwrap(),
+            config.server_addr
+        );
+    }
+}

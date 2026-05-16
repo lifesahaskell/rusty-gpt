@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor, TensorData};
 
-use crate::model::MiniGpt;
+use crate::model::{GenerationOptions, MiniGpt};
 use crate::observability::{BenchmarkStats, EventLogger, RuntimeEvent};
 
 pub const DEFAULT_PROMPT_LENS: [usize; 3] = [10, 50, 100];
@@ -152,21 +152,22 @@ pub fn benchmark_generation_cases<B: Backend>(
 
             let prompt = random_tokens(prompt_len, model.vocab_size());
             let prompt_tensor = prompt_tensor(&prompt, device);
+            let options = GenerationOptions::greedy();
 
             for _ in 0..config.warmups {
-                model.generate(&prompt, gen_len, device)?;
-                let _ = model.generate_cached(prompt_tensor.clone(), gen_len);
+                model.generate_with_options(&prompt, gen_len, device, options)?;
+                let _ = model.generate_cached_with_options(prompt_tensor.clone(), gen_len, options);
             }
 
             let mut naive_times = Vec::with_capacity(config.iterations);
             let mut cached_times = Vec::with_capacity(config.iterations);
             for _ in 0..config.iterations {
                 let t0 = Instant::now();
-                model.generate(&prompt, gen_len, device)?;
+                model.generate_with_options(&prompt, gen_len, device, options)?;
                 naive_times.push(t0.elapsed());
 
                 let t0 = Instant::now();
-                let _ = model.generate_cached(prompt_tensor.clone(), gen_len);
+                let _ = model.generate_cached_with_options(prompt_tensor.clone(), gen_len, options);
                 cached_times.push(t0.elapsed());
             }
 
@@ -299,6 +300,23 @@ mod tests {
         assert!(result.speedup.is_finite());
         assert!(result.naive.p95_ms >= result.naive.min_ms);
         assert!(result.cached.tokens_per_second.is_finite());
+    }
+
+    #[test]
+    fn benchmark_generation_compares_option_bearing_greedy_paths() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let model = MiniGpt::<TestBackend>::new(7, 8, 1, 8, 2, &device);
+        let prompt = vec![0, 1, 2];
+        let prompt_tensor = prompt_tensor(&prompt, &device);
+        let options = GenerationOptions::greedy();
+
+        let uncached = model
+            .generate_with_options(&prompt, 3, &device, options)
+            .unwrap();
+        let cached = model.generate_cached_with_options(prompt_tensor, 3, options);
+
+        assert_eq!(uncached[prompt.len()..], cached);
     }
 
     #[test]

@@ -66,3 +66,11 @@ pub(super) fn sample_from_logits(
 
     candidates.last().map(|(token, _)| *token).unwrap_or(0)
 }
+
+pub(super) fn select_token_from_logits(
+    logits: &[f32],
+    options: GenerationOptions,
+    random_unit: f32,
+) -> usize {
+    sample_from_logits(logits, options.temperature, options.top_k, random_unit)
+}
