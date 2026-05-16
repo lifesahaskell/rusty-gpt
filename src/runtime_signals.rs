@@ -65,8 +65,7 @@ pub fn install_training_signal_handler() -> anyhow::Result<()> {
                 let now_ms = start.elapsed().as_millis() as u64;
                 // Reserve 0 as the "no interrupt yet" sentinel.
                 let now_marker = now_ms.saturating_add(1);
-                let previous =
-                    FIRST_INTERRUPT_AT_MS_PLUS_ONE.swap(now_marker, Ordering::SeqCst);
+                let previous = FIRST_INTERRUPT_AT_MS_PLUS_ONE.swap(now_marker, Ordering::SeqCst);
                 if previous == 0 {
                     // First interrupt — request a clean stop at the next
                     // step boundary.

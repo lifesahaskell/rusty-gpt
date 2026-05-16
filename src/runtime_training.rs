@@ -309,9 +309,8 @@ fn save_minigpt_checkpoint<B: burn::tensor::backend::AutodiffBackend>(
         metadata.interrupted = true;
         metadata.interrupted_at_step = Some(outcome.steps_completed);
     }
-    save_checkpoint_metadata(&save_path, &metadata).with_context(|| {
-        format!("failed to save checkpoint metadata for {:?}", save_path)
-    })?;
+    save_checkpoint_metadata(&save_path, &metadata)
+        .with_context(|| format!("failed to save checkpoint metadata for {:?}", save_path))?;
     let saved_mpk = save_path.with_extension("mpk").display().to_string();
     run.logger.log(RuntimeEvent::CheckpointSaved {
         path: saved_mpk.clone(),
@@ -391,7 +390,10 @@ where
     // next iteration. For S1 this is fine; async double-buffering is a
     // Sprint 3 enhancement if profiling shows it matters.
     save_model(model.clone(), &save_path).with_context(|| {
-        format!("failed to save periodic minigpt checkpoint to {:?}", save_path)
+        format!(
+            "failed to save periodic minigpt checkpoint to {:?}",
+            save_path
+        )
     })?;
 
     let mut metadata = metadata_template.clone();
@@ -435,10 +437,7 @@ fn prune_old_step_checkpoints(checkpoint_base: &Path, keep: usize) {
     } else {
         dir
     };
-    let Some(base_name) = checkpoint_base
-        .file_name()
-        .and_then(|name| name.to_str())
-    else {
+    let Some(base_name) = checkpoint_base.file_name().and_then(|name| name.to_str()) else {
         return;
     };
     let mpk_prefix = format!("{base_name}.step-");
@@ -500,11 +499,8 @@ fn prune_old_step_checkpoints(checkpoint_base: &Path, keep: usize) {
     }
 
     // Orphan sidecars: any remaining sidecar whose .mpk no longer exists.
-    let surviving_steps: std::collections::HashSet<usize> = step_mpks
-        .iter()
-        .take(keep)
-        .map(|(step, _)| *step)
-        .collect();
+    let surviving_steps: std::collections::HashSet<usize> =
+        step_mpks.iter().take(keep).map(|(step, _)| *step).collect();
     for (step, sidecar) in sidecars_by_step {
         if !surviving_steps.contains(&step) {
             match fs::remove_file(&sidecar) {
@@ -638,10 +634,7 @@ mod tests {
     #[test]
     fn step_checkpoint_path_keeps_parent_and_tags_step() {
         let result = step_checkpoint_path(Path::new("checkpoints/mini_gpt"), 100);
-        assert_eq!(
-            PathBuf::from("checkpoints/mini_gpt.step-100.mpk"),
-            result
-        );
+        assert_eq!(PathBuf::from("checkpoints/mini_gpt.step-100.mpk"), result);
     }
 
     #[test]
@@ -655,10 +648,7 @@ mod tests {
 
     #[test]
     fn prune_old_step_checkpoints_keeps_newest_k_and_deletes_orphan_sidecars() {
-        let dir = std::env::temp_dir().join(format!(
-            "rusty-gpt-prune-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("rusty-gpt-prune-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let base = dir.join("mini_gpt");
@@ -707,10 +697,7 @@ mod tests {
 
     #[test]
     fn prune_old_step_checkpoints_with_keep_zero_is_noop() {
-        let dir = std::env::temp_dir().join(format!(
-            "rusty-gpt-prune-zero-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("rusty-gpt-prune-zero-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let base = dir.join("mini_gpt");
