@@ -1,0 +1,16 @@
+target/
+checkpoints/
+data-secret/
+.git/
+.github/
+mini-gpt-ui/node_modules/
+mini-gpt-ui/dist/
+**/*.mpk
+**/*.metadata.json
+**/.DS_Store
+docker/
+compose.yaml
+docker-compose.yml
+.dockerignore
+.vscode/
+.idea/

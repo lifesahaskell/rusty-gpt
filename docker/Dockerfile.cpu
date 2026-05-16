@@ -1,0 +1,70 @@
+# CPU image used by the `server` and `train-tokenizer` compose services.
+# Multi-stage: build with the full rust toolchain, run on debian:slim.
+# syntax=docker/dockerfile:1.7
+
+FROM rust:1.93-slim-bookworm AS builder
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY tests ./tests
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release \
+        --bin rusty-gpt \
+        --bin train-tokenizer \
+        --bin collect-source \
+    && mkdir -p /out \
+    && cp target/release/rusty-gpt /out/ \
+    && cp target/release/train-tokenizer /out/ \
+    && cp target/release/collect-source /out/
+
+
+# Dev stage: builder + cargo-watch + the comfort tooling you want when
+# attaching a shell or VS Code dev container. Only used by
+# compose.override.yaml and .devcontainer/devcontainer.json.
+# Source is bind-mounted over /workspace at runtime; CARGO_TARGET_DIR
+# points at a named volume so the target/ cache persists across restarts.
+FROM builder AS dev
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        openssh-client \
+        less \
+        curl \
+        procps \
+        sudo \
+        vim-tiny \
+        ripgrep \
+        fd-find \
+        jq \
+    && rm -rf /var/lib/apt/lists/*
+RUN cargo install cargo-watch --locked --version "^8" \
+    && rm -rf /usr/local/cargo/registry/cache
+WORKDIR /workspace
+ENV CARGO_TARGET_DIR=/cargo-target
+ENTRYPOINT []
+CMD ["bash"]
+
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+RUN mkdir -p checkpoints data
+
+COPY --from=builder /out/rusty-gpt        /usr/local/bin/rusty-gpt
+COPY --from=builder /out/train-tokenizer  /usr/local/bin/train-tokenizer
+COPY --from=builder /out/collect-source   /usr/local/bin/collect-source
+
+EXPOSE 8787
+ENTRYPOINT ["/usr/local/bin/rusty-gpt"]
+CMD ["--help"]

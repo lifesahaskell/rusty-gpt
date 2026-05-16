@@ -1,0 +1,77 @@
+# CUDA image used by the `trainer` compose service.
+# Requires the host to have an NVIDIA driver + nvidia-container-toolkit installed.
+# syntax=docker/dockerfile:1.7
+
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        build-essential \
+        pkg-config \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain 1.93.0 --profile minimal
+
+# Stub libcuda is needed at link time; the real one comes from the host driver at runtime.
+ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY tests ./tests
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --features cuda --bin rusty-gpt \
+    && mkdir -p /out \
+    && cp target/release/rusty-gpt /out/
+
+
+# Dev stage: builder + cargo-watch + the comfort tooling you want when
+# attaching a shell or VS Code dev container to the trainer. Only used by
+# compose.override.yaml and .devcontainer/cuda/devcontainer.json.
+# Source is bind-mounted over /workspace at runtime; CARGO_TARGET_DIR
+# points at a named volume so the target/ cache persists across restarts.
+FROM builder AS dev
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        openssh-client \
+        less \
+        procps \
+        sudo \
+        vim-tiny \
+        ripgrep \
+        fd-find \
+    && rm -rf /var/lib/apt/lists/*
+RUN cargo install cargo-watch --locked --version "^8" \
+    && rm -rf /usr/local/cargo/registry/cache
+WORKDIR /workspace
+ENV CARGO_TARGET_DIR=/cargo-target \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+ENTRYPOINT []
+CMD ["bash"]
+
+
+# Runtime base keeps nvrtc + cudart available for cubecl's JIT path.
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+WORKDIR /app
+RUN mkdir -p checkpoints data
+
+COPY --from=builder /out/rusty-gpt /usr/local/bin/rusty-gpt
+
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+ENTRYPOINT ["/usr/local/bin/rusty-gpt"]
+CMD ["--backend", "cuda", "--model", "minigpt"]
