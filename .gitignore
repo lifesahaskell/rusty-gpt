@@ -9,3 +9,5 @@ data/huggingface-cache/
 .claude/
 data-secret/
 /docs/sprints/
+data/*.txt
+data/*.json
