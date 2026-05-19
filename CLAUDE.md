@@ -16,7 +16,8 @@ Run all commands from the crate root.
 # Build / lint / format (CPU build; cuda is opt-in via --features cuda)
 cargo build
 cargo build --release
-cargo clippy --all-targets          # has known pre-existing warnings, see Gotchas
+cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --features cuda -- -D warnings
 cargo fmt --all -- --check
 cargo check --features cuda         # verify the cuda gate still compiles
 
@@ -136,7 +137,7 @@ mini-gpt-ui/                    separate React frontend that calls the /api serv
 data/input.txt                  ~1 MB Shakespeare-style training corpus (committed)
 data-secret/                    gitignored corpora directory (e.g. fafolang.txt, claude_src.txt)
 checkpoints/                    gitignored .mpk model files + tokenizer.json (BPE artifact for MiniGPT)
-.github/workflows/ci.yml        GitHub Actions: cargo fmt --check, cargo clippy, cargo test on push/PR
+.github/workflows/ci.yml        GitHub Actions: cargo fmt --check, strict CPU/CUDA cargo clippy, cargo test on push/PR
 .gitignore                      excludes /target/, /checkpoints/, /data-secret/
 ```
 

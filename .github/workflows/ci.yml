@@ -20,7 +20,7 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy-and-test:
-    name: cargo clippy + test
+    name: cargo clippy -D warnings + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,9 +31,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # CI builds CPU-only (no `cuda` feature) so it does not need the CUDA
-      # toolkit installed on the runner. Enable it locally with
-      # `cargo build --features cuda` if you have CUDA available.
-      - run: cargo clippy --all-targets
+      - name: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
-      - run: cargo test
+      - name: cargo clippy --all-targets --features cuda -- -D warnings
+        run: cargo clippy --all-targets --features cuda -- -D warnings
+
+      - name: cargo test
+        run: cargo test
