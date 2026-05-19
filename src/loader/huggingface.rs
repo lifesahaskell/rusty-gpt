@@ -91,24 +91,30 @@ impl HuggingFaceDatasetSpec {
     }
 
     fn cache_path(&self, cache_dir: &Path) -> PathBuf {
-        let digest = Sha256::digest(self.cache_key());
+        let digest_hex: String = Sha256::digest(self.cache_key())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let dataset = safe_cache_component(&self.dataset);
         let config = safe_cache_component(&self.config);
         let split = safe_cache_component(&self.split);
         let column = safe_cache_component(&self.column);
         cache_dir.join(format!(
-            "{dataset}__{config}__{split}__{column}__offset-{}__rows-{}__{digest:x}.txt",
+            "{dataset}__{config}__{split}__{column}__offset-{}__rows-{}__{digest_hex}.txt",
             self.offset, self.rows,
         ))
     }
 
     fn page_cache_path(&self, cache_dir: &Path, offset: usize, length: usize) -> PathBuf {
-        let digest = Sha256::digest(self.cache_key());
+        let digest_hex: String = Sha256::digest(self.cache_key())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let dataset = safe_cache_component(&self.dataset);
         let config = safe_cache_component(&self.config);
         let split = safe_cache_component(&self.split);
         cache_dir.join("pages").join(format!(
-            "{dataset}__{config}__{split}__offset-{offset}__length-{length}__{digest:x}.json"
+            "{dataset}__{config}__{split}__offset-{offset}__length-{length}__{digest_hex}.json"
         ))
     }
 }

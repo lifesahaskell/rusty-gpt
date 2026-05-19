@@ -340,8 +340,11 @@ pub fn sha256_file_hex(path: &Path) -> anyhow::Result<Option<String>> {
         return Ok(None);
     }
     let bytes = fs::read(path)?;
-    let digest = Sha256::digest(bytes);
-    Ok(Some(format!("{digest:x}")))
+    let digest_hex: String = Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Ok(Some(digest_hex))
 }
 
 #[cfg(test)]
