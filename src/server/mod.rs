@@ -1,12 +1,19 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router, extract::State};
+use axum::{
+    Extension, Json, Router,
+    extract::{ConnectInfo, State},
+};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor, TensorData};
 use serde::{Deserialize, Serialize};
+use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::model::{GenerationOptions, MiniGpt};
 use crate::observability::{EventLogger, RuntimeEvent};
@@ -20,6 +27,97 @@ pub struct ServerState<B: Backend> {
     device: B::Device,
     logger: EventLogger,
     provenance: ServerProvenance,
+    limits: ServerLimits,
+    rate_limiter: Mutex<RateLimiter>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerLimits {
+    pub max_prompt_bytes: usize,
+    pub max_output_tokens: usize,
+    pub rate_limit_rps: usize,
+    pub rate_limit_burst: usize,
+}
+
+impl Default for ServerLimits {
+    fn default() -> Self {
+        Self {
+            max_prompt_bytes: 8192,
+            max_output_tokens: 512,
+            rate_limit_rps: 5,
+            rate_limit_burst: 10,
+        }
+    }
+}
+
+impl ServerLimits {
+    pub fn max_request_body_bytes(self) -> usize {
+        self.max_prompt_bytes.saturating_add(4096)
+    }
+}
+
+#[derive(Debug)]
+struct RateLimiter {
+    buckets: HashMap<IpAddr, TokenBucket>,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            buckets: HashMap::new(),
+        }
+    }
+
+    fn try_acquire(&mut self, peer_ip: IpAddr, limits: ServerLimits, now: Instant) -> RateDecision {
+        if limits.rate_limit_rps == 0 {
+            return RateDecision::Allowed;
+        }
+
+        let bucket = self
+            .buckets
+            .entry(peer_ip)
+            .or_insert_with(|| TokenBucket::new(limits.rate_limit_burst, now));
+        bucket.try_acquire(limits, now)
+    }
+}
+
+#[derive(Debug)]
+struct TokenBucket {
+    tokens: f64,
+    updated_at: Instant,
+}
+
+impl TokenBucket {
+    fn new(burst: usize, now: Instant) -> Self {
+        Self {
+            tokens: burst as f64,
+            updated_at: now,
+        }
+    }
+
+    fn try_acquire(&mut self, limits: ServerLimits, now: Instant) -> RateDecision {
+        let elapsed = now.saturating_duration_since(self.updated_at);
+        self.updated_at = now;
+        let refill = elapsed.as_secs_f64() * limits.rate_limit_rps as f64;
+        self.tokens = (self.tokens + refill).min(limits.rate_limit_burst as f64);
+
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            RateDecision::Allowed
+        } else {
+            let missing = 1.0 - self.tokens;
+            let retry_after = (missing / limits.rate_limit_rps as f64).ceil().max(1.0) as u64;
+            RateDecision::Limited {
+                retry_after_seconds: retry_after,
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RateDecision {
+    Allowed,
+    Limited { retry_after_seconds: u64 },
 }
 
 pub struct ServerProvenance {
@@ -67,12 +165,32 @@ impl<B: Backend> ServerState<B> {
         logger: EventLogger,
         provenance: ServerProvenance,
     ) -> Self {
+        Self::new_with_limits(
+            model,
+            tokenizer,
+            device,
+            logger,
+            provenance,
+            ServerLimits::default(),
+        )
+    }
+
+    pub fn new_with_limits(
+        model: MiniGpt<B>,
+        tokenizer: RuntimeTokenizer,
+        device: B::Device,
+        logger: EventLogger,
+        provenance: ServerProvenance,
+        limits: ServerLimits,
+    ) -> Self {
         Self {
             model,
             tokenizer,
             device,
             logger,
             provenance,
+            limits,
+            rate_limiter: Mutex::new(RateLimiter::new()),
         }
     }
 
@@ -98,8 +216,19 @@ where
     B: Backend + Send + Sync + 'static,
     B::Device: Send + Sync + 'static,
 {
+    router_with_limits(ServerLimits::default())
+}
+
+pub fn router_with_limits<B>(limits: ServerLimits) -> Router<SharedServerState<B>>
+where
+    B: Backend + Send + Sync + 'static,
+    B::Device: Send + Sync + 'static,
+{
     Router::new()
-        .route("/generate", post(generate::<B>))
+        .route(
+            "/generate",
+            post(generate::<B>).layer(RequestBodyLimitLayer::new(limits.max_request_body_bytes())),
+        )
         .route("/info", get(info::<B>))
         // NOTE: S2-T1 (rate limit) must exempt this route — monitoring probes hit it.
         .route("/health", get(health::<B>))
@@ -139,10 +268,12 @@ pub struct InfoResponse {
 
 async fn generate<B>(
     State(state): State<SharedServerState<B>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     Json(request): Json<GenerateRequest>,
-) -> Result<Json<GenerateResponse>, (StatusCode, String)>
+) -> Result<Json<GenerateResponse>, GenerateError>
 where
-    B: Backend,
+    B: Backend + Send + Sync + 'static,
+    B::Device: Send + Sync + 'static,
 {
     let started_at = Instant::now();
     state.logger.log(RuntimeEvent::GenerateRequestAccepted {
@@ -158,10 +289,24 @@ where
             started_at,
         ));
     }
-    if request.max_tokens == 0 {
-        return Err(logged_bad_request(
+    let prompt_bytes = request.prompt.len();
+    if prompt_bytes > state.limits.max_prompt_bytes {
+        return Err(logged_error(
             &state.logger,
-            "max_tokens must be greater than zero",
+            GenerateError::PromptTooLarge {
+                max_bytes: state.limits.max_prompt_bytes,
+                actual_bytes: prompt_bytes,
+            },
+            started_at,
+        ));
+    }
+    if request.max_tokens == 0 || request.max_tokens > state.limits.max_output_tokens {
+        return Err(logged_error(
+            &state.logger,
+            GenerateError::MaxTokensOutOfRange {
+                max_allowed: state.limits.max_output_tokens,
+                requested: request.max_tokens,
+            },
             started_at,
         ));
     }
@@ -179,19 +324,44 @@ where
             started_at,
         ));
     }
-
     let prompt_tokens = state
         .tokenizer
         .try_encode(&request.prompt)
         .map_err(|err| logged_bad_request(&state.logger, err, started_at))?;
+    let generation_options = GenerationOptions::sampling(request.temperature, request.top_k)
+        .map_err(|err| logged_bad_request(&state.logger, err, started_at))?;
+
+    let peer_ip = peer
+        .as_ref()
+        .map(|Extension(ConnectInfo(addr))| addr.ip())
+        .unwrap_or(IpAddr::from([127, 0, 0, 1]));
+    let rate_decision = {
+        let mut limiter = state
+            .rate_limiter
+            .lock()
+            .map_err(|_| GenerateError::Internal("rate limiter lock was poisoned".to_string()))?;
+        limiter.try_acquire(peer_ip, state.limits, Instant::now())
+    };
+    if let RateDecision::Limited {
+        retry_after_seconds,
+    } = rate_decision
+    {
+        return Err(logged_error(
+            &state.logger,
+            GenerateError::RateLimited {
+                retry_after_seconds,
+            },
+            started_at,
+        ));
+    }
+
     let generated_tokens = state
         .model
         .generate_with_cache_options(
             &prompt_tokens,
             request.max_tokens,
             &state.device,
-            GenerationOptions::sampling(request.temperature, request.top_k)
-                .map_err(|err| logged_bad_request(&state.logger, err, started_at))?,
+            generation_options,
         )
         .map_err(|err| logged_bad_request(&state.logger, err, started_at))?;
     let attention_tokens = context_window(&generated_tokens, state.model.block_size());
@@ -215,19 +385,143 @@ where
     }))
 }
 
-fn bad_request(message: impl Into<String>) -> (StatusCode, String) {
-    (StatusCode::BAD_REQUEST, message.into())
+#[derive(Debug, Serialize)]
+#[serde(tag = "error", rename_all = "snake_case")]
+enum GenerateErrorBody {
+    PromptTooLarge {
+        max_bytes: usize,
+        actual_bytes: usize,
+    },
+    MaxTokensOutOfRange {
+        max_allowed: usize,
+        requested: usize,
+    },
+    RateLimited {
+        retry_after_seconds: u64,
+    },
+    BadRequest {
+        message: String,
+    },
+    Internal {
+        message: String,
+    },
+}
+
+#[derive(Debug)]
+enum GenerateError {
+    BadRequest(String),
+    PromptTooLarge {
+        max_bytes: usize,
+        actual_bytes: usize,
+    },
+    MaxTokensOutOfRange {
+        max_allowed: usize,
+        requested: usize,
+    },
+    RateLimited {
+        retry_after_seconds: u64,
+    },
+    Internal(String),
+}
+
+impl GenerateError {
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::BadRequest(_)
+            | Self::PromptTooLarge { .. }
+            | Self::MaxTokensOutOfRange { .. } => StatusCode::BAD_REQUEST,
+            Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+            Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    fn reason(&self) -> String {
+        match self {
+            Self::BadRequest(message) => message.clone(),
+            Self::PromptTooLarge {
+                max_bytes,
+                actual_bytes,
+            } => format!("prompt_too_large max_bytes={max_bytes} actual_bytes={actual_bytes}"),
+            Self::MaxTokensOutOfRange {
+                max_allowed,
+                requested,
+            } => {
+                format!("max_tokens_out_of_range max_allowed={max_allowed} requested={requested}")
+            }
+            Self::RateLimited {
+                retry_after_seconds,
+            } => format!("rate_limited retry_after_seconds={retry_after_seconds}"),
+            Self::Internal(message) => message.clone(),
+        }
+    }
+
+    fn body(&self) -> GenerateErrorBody {
+        match self {
+            Self::BadRequest(message) => GenerateErrorBody::BadRequest {
+                message: message.clone(),
+            },
+            Self::PromptTooLarge {
+                max_bytes,
+                actual_bytes,
+            } => GenerateErrorBody::PromptTooLarge {
+                max_bytes: *max_bytes,
+                actual_bytes: *actual_bytes,
+            },
+            Self::MaxTokensOutOfRange {
+                max_allowed,
+                requested,
+            } => GenerateErrorBody::MaxTokensOutOfRange {
+                max_allowed: *max_allowed,
+                requested: *requested,
+            },
+            Self::RateLimited {
+                retry_after_seconds,
+            } => GenerateErrorBody::RateLimited {
+                retry_after_seconds: *retry_after_seconds,
+            },
+            Self::Internal(message) => GenerateErrorBody::Internal {
+                message: message.clone(),
+            },
+        }
+    }
+}
+
+impl IntoResponse for GenerateError {
+    fn into_response(self) -> Response {
+        let status = self.status();
+        let retry_after = match self {
+            Self::RateLimited {
+                retry_after_seconds,
+            } => Some(retry_after_seconds),
+            _ => None,
+        };
+        let mut response = (status, Json(self.body())).into_response();
+        if let Some(seconds) = retry_after
+            && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        response
+    }
+}
+
+fn bad_request(message: impl Into<String>) -> GenerateError {
+    GenerateError::BadRequest(message.into())
 }
 
 fn logged_bad_request(
     logger: &EventLogger,
     message: impl Into<String>,
     started_at: Instant,
-) -> (StatusCode, String) {
+) -> GenerateError {
     let error = bad_request(message);
+    logged_error(logger, error, started_at)
+}
+
+fn logged_error(logger: &EventLogger, error: GenerateError, started_at: Instant) -> GenerateError {
     logger.log(RuntimeEvent::GenerateRequestRejected {
-        status: error.0.as_u16(),
-        reason: error.1.clone(),
+        status: error.status().as_u16(),
+        reason: error.reason(),
         elapsed_ms: started_at.elapsed().as_millis(),
     });
     error
@@ -317,7 +611,7 @@ fn context_window(tokens: &[usize], block_size: usize) -> &[usize] {
 fn attention_for_tokens<B: Backend>(
     state: &ServerState<B>,
     tokens: &[usize],
-) -> Result<Vec<AttentionData>, (StatusCode, String)> {
+) -> Result<Vec<AttentionData>, GenerateError> {
     let input: Vec<i64> = tokens.iter().map(|&token| token as i64).collect();
     let token_tensor: Tensor<B, 2, Int> =
         Tensor::from_data(TensorData::new(input, [1, tokens.len()]), &state.device);
@@ -327,17 +621,13 @@ fn attention_for_tokens<B: Backend>(
     for (layer, attention) in attentions.into_iter().enumerate() {
         let [batch_size, num_heads, seq_len, _] = attention.shape().dims();
         if batch_size != 1 {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("expected attention batch size 1, got {batch_size}"),
-            ));
+            return Err(GenerateError::Internal(format!(
+                "expected attention batch size 1, got {batch_size}"
+            )));
         }
 
         let values = attention.into_data().to_vec::<f32>().map_err(|err| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to serialize attention tensor: {err}"),
-            )
+            GenerateError::Internal(format!("failed to serialize attention tensor: {err}"))
         })?;
 
         for head in 0..num_heads {
@@ -366,14 +656,398 @@ fn attention_for_tokens<B: Backend>(
 mod tests {
     use super::*;
     use crate::observability::LogFormat;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Method, Request};
     use burn::backend::ndarray::{NdArray, NdArrayDevice};
     use std::sync::Mutex;
+    use tower::ServiceExt;
+
+    type TestBackend = NdArray<f32, i64>;
+
+    fn test_state(limits: ServerLimits) -> Arc<ServerState<TestBackend>> {
+        let device = NdArrayDevice::Cpu;
+        let model = MiniGpt::<TestBackend>::new(7, 8, 1, 6, 2, &device);
+        let tokenizer = RuntimeTokenizer::char_from_text("abcdefg");
+        Arc::new(ServerState::new_with_limits(
+            model,
+            tokenizer,
+            device,
+            EventLogger::stdout(LogFormat::Plain),
+            ServerProvenance::fresh(),
+            limits,
+        ))
+    }
+
+    async fn post_generate(
+        state: Arc<ServerState<TestBackend>>,
+        limits: ServerLimits,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value, axum::http::HeaderMap) {
+        let response = router_with_limits::<TestBackend>(limits)
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/generate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, body, headers)
+    }
+
+    async fn get_route(
+        state: Arc<ServerState<TestBackend>>,
+        limits: ServerLimits,
+        uri: &str,
+    ) -> StatusCode {
+        router_with_limits::<TestBackend>(limits)
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
 
     #[test]
     fn checkpoint_source_serializes_to_spec_strings() {
         assert_eq!("none", CheckpointSource::None.as_str());
         assert_eq!("explicit", CheckpointSource::Explicit.as_str());
         assert_eq!("latest", CheckpointSource::Latest.as_str());
+    }
+
+    #[test]
+    fn rate_limiter_tracks_peer_ips_independently() {
+        let limits = ServerLimits {
+            rate_limit_rps: 1,
+            rate_limit_burst: 1,
+            ..ServerLimits::default()
+        };
+        let now = Instant::now();
+        let mut limiter = RateLimiter::new();
+
+        assert_eq!(
+            RateDecision::Allowed,
+            limiter.try_acquire(IpAddr::from([127, 0, 0, 1]), limits, now)
+        );
+        assert_eq!(
+            RateDecision::Limited {
+                retry_after_seconds: 1
+            },
+            limiter.try_acquire(IpAddr::from([127, 0, 0, 1]), limits, now)
+        );
+        assert_eq!(
+            RateDecision::Allowed,
+            limiter.try_acquire(IpAddr::from([127, 0, 0, 2]), limits, now)
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_rejects_prompt_one_byte_over_configured_limit() {
+        let limits = ServerLimits {
+            max_prompt_bytes: 2,
+            rate_limit_rps: 0,
+            ..ServerLimits::default()
+        };
+        let (status, body, _) = post_generate(
+            test_state(limits),
+            limits,
+            serde_json::json!({
+                "prompt": "abc",
+                "max_tokens": 1,
+                "temperature": 1.0,
+                "top_k": null
+            }),
+        )
+        .await;
+
+        assert_eq!(StatusCode::BAD_REQUEST, status);
+        assert_eq!(
+            serde_json::json!({"error":"prompt_too_large","max_bytes":2,"actual_bytes":3}),
+            body
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_accepts_prompt_exactly_at_configured_limit() {
+        let limits = ServerLimits {
+            max_prompt_bytes: 2,
+            max_output_tokens: 1,
+            rate_limit_rps: 0,
+            ..ServerLimits::default()
+        };
+        let (status, _, _) = post_generate(
+            test_state(limits),
+            limits,
+            serde_json::json!({
+                "prompt": "ab",
+                "max_tokens": 1,
+                "temperature": 1.0,
+                "top_k": null
+            }),
+        )
+        .await;
+
+        assert_eq!(StatusCode::OK, status);
+    }
+
+    #[tokio::test]
+    async fn generate_rejects_max_tokens_above_configured_limit() {
+        let limits = ServerLimits {
+            max_output_tokens: 1,
+            rate_limit_rps: 0,
+            ..ServerLimits::default()
+        };
+        let (status, body, _) = post_generate(
+            test_state(limits),
+            limits,
+            serde_json::json!({
+                "prompt": "ab",
+                "max_tokens": 2,
+                "temperature": 1.0,
+                "top_k": null
+            }),
+        )
+        .await;
+
+        assert_eq!(StatusCode::BAD_REQUEST, status);
+        assert_eq!(
+            serde_json::json!({"error":"max_tokens_out_of_range","max_allowed":1,"requested":2}),
+            body
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_rejects_zero_max_tokens_with_structured_error() {
+        let limits = ServerLimits {
+            max_output_tokens: 1,
+            rate_limit_rps: 0,
+            ..ServerLimits::default()
+        };
+        let (status, body, _) = post_generate(
+            test_state(limits),
+            limits,
+            serde_json::json!({
+                "prompt": "ab",
+                "max_tokens": 0,
+                "temperature": 1.0,
+                "top_k": null
+            }),
+        )
+        .await;
+
+        assert_eq!(StatusCode::BAD_REQUEST, status);
+        assert_eq!(
+            serde_json::json!({"error":"max_tokens_out_of_range","max_allowed":1,"requested":0}),
+            body
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_accepts_max_tokens_exactly_at_configured_limit() {
+        let limits = ServerLimits {
+            max_prompt_bytes: 8,
+            max_output_tokens: 1,
+            rate_limit_rps: 0,
+            ..ServerLimits::default()
+        };
+        let (status, _, _) = post_generate(
+            test_state(limits),
+            limits,
+            serde_json::json!({
+                "prompt": "ab",
+                "max_tokens": 1,
+                "temperature": 1.0,
+                "top_k": null
+            }),
+        )
+        .await;
+
+        assert_eq!(StatusCode::OK, status);
+    }
+
+    #[tokio::test]
+    async fn invalid_cap_requests_do_not_consume_rate_limit_tokens() {
+        let limits = ServerLimits {
+            max_output_tokens: 1,
+            rate_limit_rps: 1,
+            rate_limit_burst: 1,
+            ..ServerLimits::default()
+        };
+        let state = test_state(limits);
+
+        for _ in 0..3 {
+            let (status, _, _) = post_generate(
+                Arc::clone(&state),
+                limits,
+                serde_json::json!({
+                    "prompt": "ab",
+                    "max_tokens": 2,
+                    "temperature": 1.0,
+                    "top_k": null
+                }),
+            )
+            .await;
+            assert_eq!(StatusCode::BAD_REQUEST, status);
+        }
+
+        let (status, _, _) = post_generate(
+            state,
+            limits,
+            serde_json::json!({
+                "prompt": "ab",
+                "max_tokens": 1,
+                "temperature": 1.0,
+                "top_k": null
+            }),
+        )
+        .await;
+
+        assert_eq!(StatusCode::OK, status);
+    }
+
+    #[tokio::test]
+    async fn tokenizer_rejected_requests_do_not_consume_rate_limit_tokens() {
+        let limits = ServerLimits {
+            max_output_tokens: 1,
+            rate_limit_rps: 1,
+            rate_limit_burst: 1,
+            ..ServerLimits::default()
+        };
+        let state = test_state(limits);
+
+        let (status, _, _) = post_generate(
+            Arc::clone(&state),
+            limits,
+            serde_json::json!({
+                "prompt": "z",
+                "max_tokens": 1,
+                "temperature": 1.0,
+                "top_k": null
+            }),
+        )
+        .await;
+        assert_eq!(StatusCode::BAD_REQUEST, status);
+
+        let (status, _, _) = post_generate(
+            state,
+            limits,
+            serde_json::json!({
+                "prompt": "ab",
+                "max_tokens": 1,
+                "temperature": 1.0,
+                "top_k": null
+            }),
+        )
+        .await;
+        assert_eq!(StatusCode::OK, status);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_allows_burst_then_returns_retry_after() {
+        let limits = ServerLimits {
+            max_output_tokens: 1,
+            rate_limit_rps: 1,
+            rate_limit_burst: 2,
+            ..ServerLimits::default()
+        };
+        let state = test_state(limits);
+        let mut statuses = Vec::new();
+        let mut retry_after = None;
+
+        for _ in 0..4 {
+            let (status, body, headers) = post_generate(
+                Arc::clone(&state),
+                limits,
+                serde_json::json!({
+                    "prompt": "ab",
+                    "max_tokens": 1,
+                    "temperature": 1.0,
+                    "top_k": null
+                }),
+            )
+            .await;
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                assert_eq!(
+                    serde_json::json!({"error":"rate_limited","retry_after_seconds":1}),
+                    body
+                );
+                retry_after = headers.get(header::RETRY_AFTER).cloned();
+            }
+            statuses.push(status);
+        }
+
+        assert_eq!(
+            vec![
+                StatusCode::OK,
+                StatusCode::OK,
+                StatusCode::TOO_MANY_REQUESTS,
+                StatusCode::TOO_MANY_REQUESTS
+            ],
+            statuses
+        );
+        assert_eq!(Some(HeaderValue::from_static("1")), retry_after);
+    }
+
+    #[tokio::test]
+    async fn info_and_health_are_exempt_from_generate_body_limit_and_rate_limit() {
+        let limits = ServerLimits {
+            max_prompt_bytes: 1,
+            rate_limit_rps: 1,
+            rate_limit_burst: 1,
+            ..ServerLimits::default()
+        };
+        let state = test_state(limits);
+
+        assert_eq!(
+            StatusCode::OK,
+            get_route(Arc::clone(&state), limits, "/info").await
+        );
+        assert_eq!(StatusCode::OK, get_route(state, limits, "/health").await);
+    }
+
+    #[tokio::test]
+    async fn generate_route_rejects_request_body_over_prompt_limit_plus_headroom() {
+        let limits = ServerLimits {
+            max_prompt_bytes: 1,
+            rate_limit_rps: 0,
+            ..ServerLimits::default()
+        };
+        let prompt = "a".repeat(limits.max_request_body_bytes());
+        let response = router_with_limits::<TestBackend>(limits)
+            .with_state(test_state(limits))
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/generate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "prompt": prompt,
+                            "max_tokens": 1,
+                            "temperature": 1.0,
+                            "top_k": null
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(StatusCode::PAYLOAD_TOO_LARGE, response.status());
     }
 
     #[test]
@@ -470,6 +1144,7 @@ mod tests {
 
         let response = generate(
             State(state),
+            None,
             Json(GenerateRequest {
                 prompt: "ab".to_string(),
                 max_tokens: 1,
@@ -512,6 +1187,7 @@ mod tests {
 
         let response = generate(
             State(state),
+            None,
             Json(GenerateRequest {
                 prompt: "".to_string(),
                 max_tokens: 1,
@@ -740,6 +1416,7 @@ mod tests {
 
         let response = generate(
             State(state),
+            None,
             Json(GenerateRequest {
                 prompt: "ab".to_string(),
                 max_tokens: 1,
@@ -750,7 +1427,7 @@ mod tests {
         .await;
 
         let err = response.expect_err("zero top_k should be rejected");
-        assert_eq!(StatusCode::BAD_REQUEST, err.0);
-        assert_eq!("top_k must be greater than zero", err.1);
+        assert_eq!(StatusCode::BAD_REQUEST, err.status());
+        assert_eq!("top_k must be greater than zero", err.reason());
     }
 }

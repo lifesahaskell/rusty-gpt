@@ -5682,6 +5682,7 @@ dependencies = [
  "sha2 0.11.0",
  "signal-hook 0.4.4",
  "tokio",
+ "tower",
  "tower-http",
 ]
 
@@ -6706,6 +6707,7 @@ dependencies = [
  "futures-util",
  "http",
  "http-body",
+ "http-body-util",
  "pin-project-lite",
  "tower",
  "tower-layer",

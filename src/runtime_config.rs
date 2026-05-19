@@ -9,7 +9,15 @@ use std::path::PathBuf;
 pub(crate) const DEFAULT_INPUT_PATH: &str = "data/input.txt";
 pub(crate) const DEFAULT_MINIGPT_CHECKPOINT_PATH: &str = "checkpoints/mini_gpt";
 pub(crate) const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:8787";
+pub(crate) const DEFAULT_MAX_PROMPT_BYTES: usize = 8192;
+pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: usize = 512;
+pub(crate) const DEFAULT_RATE_LIMIT_RPS: usize = 5;
+pub(crate) const DEFAULT_RATE_LIMIT_BURST: usize = 10;
 const LOG_FORMAT_ENV: &str = "RUSTY_GPT_LOG_FORMAT";
+const MAX_PROMPT_BYTES_ENV: &str = "RUSTY_GPT_MAX_PROMPT_BYTES";
+const MAX_OUTPUT_TOKENS_ENV: &str = "RUSTY_GPT_MAX_OUTPUT_TOKENS";
+const RATE_LIMIT_RPS_ENV: &str = "RUSTY_GPT_RATE_LIMIT_RPS";
+const RATE_LIMIT_BURST_ENV: &str = "RUSTY_GPT_RATE_LIMIT_BURST";
 const BENCHMARK_PROMPT_LENS_ENV: &str = "RUSTY_GPT_BENCHMARK_PROMPT_LENS";
 const BENCHMARK_GEN_LENS_ENV: &str = "RUSTY_GPT_BENCHMARK_GEN_LENS";
 const BENCHMARK_WARMUPS_ENV: &str = "RUSTY_GPT_BENCHMARK_WARMUPS";
@@ -361,6 +369,10 @@ pub(crate) struct RuntimeConfig {
     pub(crate) load_latest_checkpoint: bool,
     pub(crate) serve: bool,
     pub(crate) server_addr: SocketAddr,
+    pub(crate) max_prompt_bytes: usize,
+    pub(crate) max_output_tokens: usize,
+    pub(crate) rate_limit_rps: usize,
+    pub(crate) rate_limit_burst: usize,
     pub(crate) log_format: LogFormat,
     pub(crate) benchmark_config: BenchmarkConfig,
 }
@@ -372,6 +384,10 @@ pub(crate) struct RuntimeEnv {
     pub(crate) model: Option<String>,
     pub(crate) checkpoint: Option<String>,
     pub(crate) server_addr: Option<String>,
+    pub(crate) max_prompt_bytes: Option<String>,
+    pub(crate) max_output_tokens: Option<String>,
+    pub(crate) rate_limit_rps: Option<String>,
+    pub(crate) rate_limit_burst: Option<String>,
     pub(crate) log_format: Option<String>,
     pub(crate) benchmark_prompt_lens: Option<String>,
     pub(crate) benchmark_gen_lens: Option<String>,
@@ -401,6 +417,10 @@ impl RuntimeEnv {
             model: env::var("RUSTY_GPT_MODEL").ok(),
             checkpoint: env::var("RUSTY_GPT_MINIGPT_CHECKPOINT").ok(),
             server_addr: env::var("RUSTY_GPT_SERVER_ADDR").ok(),
+            max_prompt_bytes: env::var(MAX_PROMPT_BYTES_ENV).ok(),
+            max_output_tokens: env::var(MAX_OUTPUT_TOKENS_ENV).ok(),
+            rate_limit_rps: env::var(RATE_LIMIT_RPS_ENV).ok(),
+            rate_limit_burst: env::var(RATE_LIMIT_BURST_ENV).ok(),
             log_format: env::var(LOG_FORMAT_ENV).ok(),
             benchmark_prompt_lens: env::var(BENCHMARK_PROMPT_LENS_ENV).ok(),
             benchmark_gen_lens: env::var(BENCHMARK_GEN_LENS_ENV).ok(),
@@ -463,6 +483,10 @@ where
     let mut arg_model = None;
     let mut arg_checkpoint = None;
     let mut arg_server_addr = None;
+    let mut arg_max_prompt_bytes = None;
+    let mut arg_max_output_tokens = None;
+    let mut arg_rate_limit_rps = None;
+    let mut arg_rate_limit_burst = None;
     let mut arg_log_format = None;
     let mut arg_benchmark_prompt_lens = None;
     let mut arg_benchmark_gen_lens = None;
@@ -511,6 +535,22 @@ where
                     .get(index + 1)
                     .context("--server-addr requires a value like 127.0.0.1:8787")?;
                 arg_server_addr = Some(value.as_str());
+                index += 2;
+            }
+            "--max-prompt-bytes" => {
+                arg_max_prompt_bytes = Some(parse_arg_value(&args, index, "--max-prompt-bytes")?);
+                index += 2;
+            }
+            "--max-output-tokens" => {
+                arg_max_output_tokens = Some(parse_arg_value(&args, index, "--max-output-tokens")?);
+                index += 2;
+            }
+            "--rate-limit-rps" => {
+                arg_rate_limit_rps = Some(parse_arg_value(&args, index, "--rate-limit-rps")?);
+                index += 2;
+            }
+            "--rate-limit-burst" => {
+                arg_rate_limit_burst = Some(parse_arg_value(&args, index, "--rate-limit-burst")?);
                 index += 2;
             }
             "--log-format" => {
@@ -652,6 +692,36 @@ where
     let server_addr = server_addr_text
         .parse()
         .with_context(|| format!("invalid server address '{server_addr_text}'"))?;
+    let max_prompt_bytes = parse_config_usize(
+        arg_max_prompt_bytes,
+        env.max_prompt_bytes.as_deref(),
+        DEFAULT_MAX_PROMPT_BYTES,
+        MAX_PROMPT_BYTES_ENV,
+    )?;
+    let max_output_tokens = parse_config_usize(
+        arg_max_output_tokens,
+        env.max_output_tokens.as_deref(),
+        DEFAULT_MAX_OUTPUT_TOKENS,
+        MAX_OUTPUT_TOKENS_ENV,
+    )?;
+    let rate_limit_rps = parse_config_usize(
+        arg_rate_limit_rps,
+        env.rate_limit_rps.as_deref(),
+        DEFAULT_RATE_LIMIT_RPS,
+        RATE_LIMIT_RPS_ENV,
+    )?;
+    let rate_limit_burst = parse_config_usize(
+        arg_rate_limit_burst,
+        env.rate_limit_burst.as_deref(),
+        DEFAULT_RATE_LIMIT_BURST,
+        RATE_LIMIT_BURST_ENV,
+    )?;
+    validate_server_limits(
+        max_prompt_bytes,
+        max_output_tokens,
+        rate_limit_rps,
+        rate_limit_burst,
+    )?;
     let backend = parse_backend_name(arg_backend.or(env.backend.as_deref()).unwrap_or("cpu"))?;
     let log_format = match arg_log_format.or(env.log_format.as_deref()) {
         Some(value) => LogFormat::parse(value)?,
@@ -706,9 +776,48 @@ where
         load_latest_checkpoint,
         serve,
         server_addr,
+        max_prompt_bytes,
+        max_output_tokens,
+        rate_limit_rps,
+        rate_limit_burst,
         log_format,
         benchmark_config,
     })
+}
+
+fn parse_config_usize(
+    arg_value: Option<usize>,
+    env_value: Option<&str>,
+    default: usize,
+    env_name: &str,
+) -> Result<usize> {
+    if let Some(value) = arg_value {
+        return Ok(value);
+    }
+    if let Some(value) = env_value {
+        return value
+            .parse()
+            .with_context(|| format!("invalid {env_name} value: {value}"));
+    }
+    Ok(default)
+}
+
+fn validate_server_limits(
+    max_prompt_bytes: usize,
+    max_output_tokens: usize,
+    rate_limit_rps: usize,
+    rate_limit_burst: usize,
+) -> Result<()> {
+    if max_prompt_bytes == 0 {
+        bail!("max_prompt_bytes must be greater than zero");
+    }
+    if max_output_tokens == 0 {
+        bail!("max_output_tokens must be greater than zero");
+    }
+    if rate_limit_rps != 0 && rate_limit_burst == 0 {
+        bail!("rate_limit_burst must be greater than zero when rate_limit_rps is non-zero");
+    }
+    Ok(())
 }
 
 fn default_log_format(backend: BackendChoice) -> LogFormat {
@@ -1001,6 +1110,95 @@ mod tests {
         let config = parse_args(&["--serve"]).unwrap();
 
         assert!(config.serve);
+    }
+
+    #[test]
+    fn server_limits_default_to_security_caps() {
+        let config = parse_args(&[]).unwrap();
+
+        assert_eq!(DEFAULT_MAX_PROMPT_BYTES, config.max_prompt_bytes);
+        assert_eq!(DEFAULT_MAX_OUTPUT_TOKENS, config.max_output_tokens);
+        assert_eq!(DEFAULT_RATE_LIMIT_RPS, config.rate_limit_rps);
+        assert_eq!(DEFAULT_RATE_LIMIT_BURST, config.rate_limit_burst);
+    }
+
+    #[test]
+    fn server_limits_can_be_selected_from_env() {
+        let config = parse_args_with_env(
+            &[],
+            RuntimeEnv {
+                max_prompt_bytes: Some("1024".to_string()),
+                max_output_tokens: Some("64".to_string()),
+                rate_limit_rps: Some("2".to_string()),
+                rate_limit_burst: Some("4".to_string()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(1024, config.max_prompt_bytes);
+        assert_eq!(64, config.max_output_tokens);
+        assert_eq!(2, config.rate_limit_rps);
+        assert_eq!(4, config.rate_limit_burst);
+    }
+
+    #[test]
+    fn server_limit_cli_overrides_take_precedence_over_env() {
+        let config = parse_args_with_env(
+            &[
+                "--max-prompt-bytes",
+                "2048",
+                "--max-output-tokens",
+                "128",
+                "--rate-limit-rps",
+                "3",
+                "--rate-limit-burst",
+                "6",
+            ],
+            RuntimeEnv {
+                max_prompt_bytes: Some("1024".to_string()),
+                max_output_tokens: Some("64".to_string()),
+                rate_limit_rps: Some("2".to_string()),
+                rate_limit_burst: Some("4".to_string()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(2048, config.max_prompt_bytes);
+        assert_eq!(128, config.max_output_tokens);
+        assert_eq!(3, config.rate_limit_rps);
+        assert_eq!(6, config.rate_limit_burst);
+    }
+
+    #[test]
+    fn zero_rate_limit_rps_disables_limiter_without_requiring_burst() {
+        let config = parse_args(&["--rate-limit-rps", "0", "--rate-limit-burst", "0"]).unwrap();
+
+        assert_eq!(0, config.rate_limit_rps);
+        assert_eq!(0, config.rate_limit_burst);
+    }
+
+    #[test]
+    fn rejects_invalid_server_limit_invariants() {
+        let cases = [
+            (
+                &["--max-prompt-bytes", "0"][..],
+                "max_prompt_bytes must be greater than zero",
+            ),
+            (
+                &["--max-output-tokens", "0"][..],
+                "max_output_tokens must be greater than zero",
+            ),
+            (
+                &["--rate-limit-rps", "1", "--rate-limit-burst", "0"][..],
+                "rate_limit_burst must be greater than zero",
+            ),
+        ];
+
+        for (args, expected) in cases {
+            expect_parse_error(args, expected);
+        }
     }
 
     #[test]

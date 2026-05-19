@@ -18,6 +18,10 @@ Every CLI flag and `RUSTY_GPT_*` environment variable accepted by the
 | `--load-checkpoint` | — | off | With `--serve`, loads MiniGPT API weights from `--checkpoint`. The checkpoint must match the model shape and tokenizer vocabulary from `--input`. |
 | `--load-latest-checkpoint` | — | off | With `--serve`, loads the newest `.mpk` file in `checkpoints/`. |
 | `--server-addr <host:port>` | `RUSTY_GPT_SERVER_ADDR` | `127.0.0.1:8787` | Address used by `--serve`. |
+| `--max-prompt-bytes <n>` | `RUSTY_GPT_MAX_PROMPT_BYTES` | `8192` | `POST /api/generate` prompt byte cap. Must be > 0. |
+| `--max-output-tokens <n>` | `RUSTY_GPT_MAX_OUTPUT_TOKENS` | `512` | `POST /api/generate` `max_tokens` cap. Must be > 0. |
+| `--rate-limit-rps <n>` | `RUSTY_GPT_RATE_LIMIT_RPS` | `5` | In-process generate request refill rate. `0` disables rate limiting. |
+| `--rate-limit-burst <n>` | `RUSTY_GPT_RATE_LIMIT_BURST` | `10` | In-process generate request burst. Must be > 0 unless rate limiting is disabled. |
 
 ## Model shape
 
@@ -82,6 +86,33 @@ Accepts optional `top_k` in addition to `prompt`, `max_tokens`, and
 `temperature`. API requests require `temperature > 0`; internal greedy
 generation remains available for benchmarks and tests via zero-temperature
 generation options.
+
+The generate route validates `prompt` and `max_tokens` before tokenizer/model
+work. A prompt whose UTF-8 byte length exceeds `--max-prompt-bytes` returns
+HTTP 400 with `{"error":"prompt_too_large","max_bytes":N,"actual_bytes":M}`.
+`max_tokens == 0` or a value above `--max-output-tokens` returns HTTP 400 with
+`{"error":"max_tokens_out_of_range","max_allowed":N,"requested":M}`. The
+route also has a body-size cap of `max_prompt_bytes + 4096` bytes.
+
+Validated generate requests use an in-process token bucket configured by
+`--rate-limit-rps` and `--rate-limit-burst`. Exceeding the bucket returns HTTP
+429 with `Retry-After` and `{"error":"rate_limited","retry_after_seconds":N}`.
+Invalid cap requests do not consume rate-limit tokens. The limiter is
+per-process; if the API is scaled to N replicas, the effective limit is
+approximately N times the configured values. `GET /api/info` and
+`GET /api/health` are exempt.
+
+To reproduce a 429 with defaults overridden:
+
+```bash
+cargo run --bin rusty-gpt -- --serve --rate-limit-rps 1 --rate-limit-burst 1
+
+for i in 1 2 3; do
+  curl -i -sS -X POST http://127.0.0.1:8787/api/generate \
+    -H 'Content-Type: application/json' \
+    -d '{"prompt":"Once","max_tokens":1,"temperature":1.0}'
+done
+```
 
 ### Checkpoint metadata sidecar
 

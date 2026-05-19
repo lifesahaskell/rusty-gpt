@@ -75,6 +75,10 @@ Defaults live in `src/runtime_config.rs`; validation rules in `Hyperparameters::
 | `--load-checkpoint` | — | flag; load MiniGPT weights from `--checkpoint` before serving / interactive |
 | `--load-latest-checkpoint` | — | flag; load the newest `*.mpk` in `checkpoints/` (mutually exclusive with `--load-checkpoint`) |
 | `--server-addr` | `RUSTY_GPT_SERVER_ADDR` | `host:port`, default `127.0.0.1:8787` |
+| `--max-prompt-bytes` | `RUSTY_GPT_MAX_PROMPT_BYTES` | int, default `8192`; generate prompt byte cap |
+| `--max-output-tokens` | `RUSTY_GPT_MAX_OUTPUT_TOKENS` | int, default `512`; generate `max_tokens` cap |
+| `--rate-limit-rps` | `RUSTY_GPT_RATE_LIMIT_RPS` | int, default `5`; `0` disables generate rate limiting |
+| `--rate-limit-burst` | `RUSTY_GPT_RATE_LIMIT_BURST` | int, default `10`; generate burst capacity |
 | `--log-format` | `RUSTY_GPT_LOG_FORMAT` | `plain` \| `json` — default depends on backend; controls `observability::EventLogger` output |
 | `--benchmark-generation` | — | flag; runs naive-vs-cached generation benchmarks (requires `--model minigpt` or `compare`) |
 | — | `RUSTY_GPT_BPE_TOKENIZER` | path, default `checkpoints/tokenizer.json` |
@@ -191,13 +195,15 @@ Other invariants:
 
 `src/server/mod.rs` exposes an Axum `Router<SharedServerState<B>>` with `POST /generate`, `GET /info`, and `GET /health`. `runtime_orchestration::run_http_server` nests that router under `/api` (final routes: `/api/generate`, `/api/info`, `/api/health`), binds to `--server-addr` (default `127.0.0.1:8787`), and serves with `axum::serve`.
 
-`ServerState` holds a `MiniGpt`, a `RuntimeTokenizer`, a `B::Device`, an `EventLogger`, and a `ServerProvenance` (uptime + checkpoint source/basename/sha256 + tokenizer sha256, populated once at startup by `run_http_server`). The model can come from one of three places at startup: a fresh template (default), `--load-checkpoint <path>`, or `--load-latest-checkpoint` (newest `*.mpk` in `checkpoints/`). The two `--load-*` flags are mutually exclusive — `runtime_config.rs` enforces this at parse time.
+`ServerState` holds a `MiniGpt`, a `RuntimeTokenizer`, a `B::Device`, an `EventLogger`, `ServerProvenance` (uptime + checkpoint source/basename/sha256 + tokenizer sha256, populated once at startup by `run_http_server`), generate request limits, and the in-process token bucket. The model can come from one of three places at startup: a fresh template (default), `--load-checkpoint <path>`, or `--load-latest-checkpoint` (newest `*.mpk` in `checkpoints/`). The two `--load-*` flags are mutually exclusive — `runtime_config.rs` enforces this at parse time.
 
 `GET /api/health` is the liveness probe: returns status, uptime, model shape, checkpoint source (`"none" | "explicit" | "latest"`), checkpoint+tokenizer sha256, and **only file basenames — never absolute paths** (information-disclosure boundary, enforced by `health_never_exposes_absolute_path` test). It is intentionally outside any future rate limiter so monitoring probes don't get 429'd.
 
 `GenerateResponse` includes per-layer/per-head attention matrices (`AttentionData { layer, head, weights }`) for visualization; the React UI in `mini-gpt-ui/` is the primary consumer.
 
 `POST /api/generate` accepts an optional `top_k` alongside `prompt`, `max_tokens`, and `temperature`. API requests require `temperature > 0` (sampling); `top_k == 0` is rejected. Greedy decoding (`GenerationOptions::greedy()`, temperature 0) stays available internally for benchmarks/tests. Generation entry points have `_with_options` variants in `src/model/mod.rs`.
+
+`POST /api/generate` validates `prompt` byte length and `max_tokens` before tokenizer/model work, applies a route-local body-size limit of `max_prompt_bytes + 4096`, then consumes one token from the in-process rate limiter. `GET /api/info` and `GET /api/health` stay exempt. The limiter is per-process; scaled replicas multiply the effective limit.
 
 ### Sibling tooling
 
@@ -213,6 +219,7 @@ Other invariants:
 - **MiniGPT needs `checkpoints/tokenizer.json` to exist** — there is no auto-train fallback. If absent, `runtime_assets::load_minigpt_tokenizer` returns an error containing the exact `train-tokenizer` command to run. `RUSTY_GPT_BPE_TOKENIZER` overrides the path.
 - **Strict checkpoint loading rejects tokenizer-hash mismatches**: if you trained against tokenizer A and try to load that checkpoint against a differently-trained `tokenizer.json`, the strict loader bails with the expected vs. actual sha256. The lenient loader exists for tests/back-compat — don't use it in production codepaths.
 - **Server routes live under `/api`** — `src/server/mod.rs` defines `/generate`, `/info`, and `/health`, but `run_http_server` nests them under `/api`. `curl http://localhost:8787/generate` returns 404; the right paths are `/api/generate`, `/api/info`, `/api/health`.
+- **New API endpoints must opt into request body limits intentionally** — `POST /api/generate` attaches its body-size limit directly to that route so health/info are not constrained. Any new body-bearing `/api/*` endpoint should add an explicit route-local limit instead of relying on a global default.
 - **`--serve` only hosts MiniGPT** — the other three model variants are training-only and cannot be served. `--load-checkpoint` and `--load-latest-checkpoint` are mutually exclusive (parse-time error).
 - **Checkpoint dir scan** — `--load-latest-checkpoint` reads from the hardcoded `checkpoints/` directory (`DEFAULT_CHECKPOINT_DIR` in `src/runtime_assets.rs`), regardless of `--checkpoint`. The `--checkpoint` flag only matters for explicit save/load paths.
 - **Interactive mode constraints**: `--interactive-generate` requires both `--backend cpu` and `--model minigpt`; any other combination errors out in `run_cpu_demo` / `main`.

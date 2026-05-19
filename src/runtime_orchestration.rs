@@ -8,7 +8,7 @@ use rusty_gpt::model::persistence::sha256_file_hex;
 use rusty_gpt::model::{MiniGpt, MultiAttentionModel, SingleAttentionModel, TrivialModel};
 use rusty_gpt::observability::{EventLogger, RuntimeEvent};
 use rusty_gpt::server;
-use rusty_gpt::server::{CheckpointSource, ServerProvenance, ServerState};
+use rusty_gpt::server::{CheckpointSource, ServerLimits, ServerProvenance, ServerState};
 use rusty_gpt::tokenizer::RuntimeTokenizer;
 use rusty_gpt::utils::BenchmarkConfig;
 use std::io::{self, BufRead, Write};
@@ -86,6 +86,7 @@ pub(crate) struct ServerRuntimeOptions<'a> {
     pub(crate) load_latest_checkpoint_enabled: bool,
     pub(crate) backend_label: &'static str,
     pub(crate) logger: EventLogger,
+    pub(crate) limits: ServerLimits,
 }
 
 pub(crate) fn run_http_server_with_runtime<B>(
@@ -150,17 +151,18 @@ where
         checkpoint_sha256,
         tokenizer_sha256,
     };
-    let state = Arc::new(ServerState::new(
+    let state = Arc::new(ServerState::new_with_limits(
         model,
         tokenizer,
         device.clone(),
         options.logger.clone(),
         provenance,
+        options.limits,
     ));
     let vocab_size = state.model_vocab_size();
     let block_size = state.model_block_size();
     let app = Router::new()
-        .nest("/api", server::router::<B>())
+        .nest("/api", server::router_with_limits::<B>(options.limits))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind(options.server_addr)
         .await
@@ -172,9 +174,12 @@ where
         vocab_size,
         block_size,
     });
-    axum::serve(listener, app)
-        .await
-        .context("HTTP server failed")
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("HTTP server failed")
 }
 
 pub(crate) fn run_demo<B: Backend>(

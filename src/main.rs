@@ -9,6 +9,7 @@ use burn::backend::ndarray::{NdArray, NdArrayDevice};
 #[cfg(test)]
 use rusty_gpt::observability::LogFormat;
 use rusty_gpt::observability::{EventLogger, RuntimeEvent};
+use rusty_gpt::server::ServerLimits;
 #[cfg(test)]
 use rusty_gpt::utils::BenchmarkConfig;
 use std::env;
@@ -64,6 +65,12 @@ fn main() -> Result<()> {
     });
 
     if config.serve {
+        let limits = ServerLimits {
+            max_prompt_bytes: config.max_prompt_bytes,
+            max_output_tokens: config.max_output_tokens,
+            rate_limit_rps: config.rate_limit_rps,
+            rate_limit_burst: config.rate_limit_burst,
+        };
         return match config.backend {
             BackendChoice::Cpu => run_http_server_with_runtime::<NdArray<f32, i64>>(
                 &text,
@@ -75,6 +82,7 @@ fn main() -> Result<()> {
                     load_latest_checkpoint_enabled: config.load_latest_checkpoint,
                     backend_label: "cpu",
                     logger,
+                    limits,
                 },
                 &NdArrayDevice::Cpu,
             ),
@@ -89,6 +97,7 @@ fn main() -> Result<()> {
                     load_latest_checkpoint_enabled: config.load_latest_checkpoint,
                     backend_label: "cuda",
                     logger,
+                    limits,
                 },
                 &CudaDevice::default(),
             ),
