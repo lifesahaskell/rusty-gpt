@@ -128,12 +128,12 @@ cargo clippy --all-targets
 cargo fmt --all -- --check
 cargo check --features cuda
 
-# Tests (107 unit + 1 integration)
+# Tests (199 unit + 3 integration)
 cargo test
 cargo test --test default_runtime
 cargo test multi_head_attention_returns_model_dim_for_each_token_position
 
-# Quick demo (CPU, trivial model)
+# Quick demo (CPU, MiniGPT — requires checkpoints/tokenizer.json; see "Train a BPE tokenizer" below)
 cargo run
 
 # Quick smoke run
@@ -186,6 +186,41 @@ cargo run --release --features cuda --bin rusty-gpt -- --backend cuda --model mi
     --vocab-size 2048 \
     'hf://Salesforce/wikitext?config=wikitext-2-raw-v1&split=train&column=text&rows=1000'
 ```
+
+`--input` and `--corpus` validate their argument syntactically before any
+I/O. Only local paths and `hf://<org>/<dataset>[@<revision>][?query]` URIs
+are accepted; anything else that looks like a URI scheme (`http://…`,
+`https://…`, `file://…`, `s3://…`, etc.) is rejected at parse time with an
+error pointing at the expected `hf://` form.
+
+### Checkpoint durability
+
+MiniGPT training installs a SIGINT/SIGTERM handler. On the first signal,
+the run finishes the current step, writes
+`<checkpoint>.interrupted-step-<N>.mpk` + matching
+`.interrupted-step-<N>.metadata.json`, and exits with code 130. A second
+signal within ~2 seconds skips the save and aborts immediately. The handler
+is installed **only** on the training path — `--serve` and
+`--interactive-generate` use the default Ctrl-C behavior.
+
+Two flags control mid-run checkpointing:
+
+| Flag                     | Env var                            | Default        | Purpose                                                                 |
+| ------------------------ | ---------------------------------- | -------------- | ----------------------------------------------------------------------- |
+| `--checkpoint-interval N` | `RUSTY_GPT_CHECKPOINT_INTERVAL`    | `0` (disabled) | Save `<checkpoint>.step-<N>.mpk` + sidecar every N training steps        |
+| `--checkpoint-keep K`     | `RUSTY_GPT_CHECKPOINT_KEEP`        | `3`            | Retention window: keep the K newest periodic snapshots, prune the rest  |
+
+The final end-of-run save and any `.interrupted-step-*` save are **never**
+pruned regardless of `--checkpoint-keep`.
+
+```bash
+# Save every 200 steps, keep the 5 most recent periodic snapshots
+cargo run --release --bin rusty-gpt -- --model minigpt \
+    --checkpoint-interval 200 --checkpoint-keep 5
+```
+
+`scripts/run_training.sh` does **not** currently pass these flags through;
+use a direct `cargo run` invocation when you need periodic checkpoints.
 
 ### Train inside the container
 
@@ -283,8 +318,10 @@ and skips `.git`, `target`, `node_modules`, `dist`, `build`, `.next`,
 ### Code-level
 
 ```bash
-cargo test                                   # 107 unit + 1 integration
+cargo test                                   # 199 unit + 3 integration
 cargo test --test default_runtime            # CPU-default smoke test
+cargo test --test graceful_shutdown          # SIGINT-triggered checkpoint save
+cargo test --test periodic_checkpoints       # --checkpoint-interval / --checkpoint-keep behavior
 cargo test multi_head_attention_returns_model_dim_for_each_token_position
 ```
 
@@ -412,3 +449,40 @@ The two dev containers use separate target volumes (`cargo-target-cpu`,
 `cargo-target-cuda`) because feature flags produce incompatible artifacts.
 A switch always recompiles the affected half of the dep graph — this is
 expected, not a bug. The registry cache is shared so the fetch is fast.
+
+### Training was interrupted; what artifacts do I have?
+
+A first Ctrl-C (or SIGTERM) during MiniGPT training leaves
+`<checkpoint>.interrupted-step-<N>.mpk` and matching
+`.interrupted-step-<N>.metadata.json` next to your usual checkpoint, then
+the process exits 130. The sidecar records `interrupted: true` and
+`interrupted_at_step: N` so the artifact is identifiable later.
+
+Load it like any other checkpoint:
+
+```bash
+cargo run --bin rusty-gpt -- --serve \
+    --checkpoint checkpoints/mini_gpt.interrupted-step-1750 --load-checkpoint
+```
+
+A second Ctrl-C within ~2 seconds skips the save and aborts immediately, so
+under double-Ctrl-C you may have no interrupted artifact at all — the last
+recoverable file is then whatever the most recent periodic save was (see
+[Checkpoint durability](#checkpoint-durability)). Automatic resume from an
+interrupted step (`--resume-checkpoint`) is on the Sprint 3 backlog, not
+yet implemented; today you load the weights and start a new training run.
+
+### `--input` / `--corpus` rejected with "unsupported input URI scheme"
+
+`--input` (for the main binary) and `--corpus` (for `train-tokenizer`) are
+validated up front. Only two forms are accepted:
+
+- A local filesystem path (relative or absolute).
+- A Hugging Face URI of the form
+  `hf://<org>/<dataset>[@<revision>][?key=value&key=value...]`.
+
+Anything else that parses as a `<scheme>://...` URI — `http://`, `https://`,
+`file://`, `s3://`, `gs://`, etc. — is rejected at parse time, before any
+network or disk activity. The error message names the bad scheme and
+points at the expected `hf://` form. See the Hugging Face examples under
+[Training](#training) for a valid invocation.
