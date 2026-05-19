@@ -82,7 +82,7 @@ Inside the dev container (or via `docker compose exec server bash`):
 
 ```bash
 cargo test
-cargo clippy --all-targets
+cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 cargo run --bin rusty-gpt -- --serve --load-latest-checkpoint
 ```
@@ -124,7 +124,8 @@ docker compose -f compose.yaml up
 # Build / lint / format
 cargo build
 cargo build --release
-cargo clippy --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --features cuda -- -D warnings
 cargo fmt --all -- --check
 cargo check --features cuda
 
@@ -139,6 +140,17 @@ cargo run
 # Quick smoke run
 RUSTY_GPT_TRAIN_STEPS=1 cargo run -- --input tests/fixtures/input.txt
 ```
+
+Run clippy locally with `-- -D warnings` before opening a PR; CI treats every
+clippy warning as a failure for both the default feature set and the opt-in
+`cuda` feature. For mechanical lint fixes, use:
+
+```bash
+cargo clippy --all-targets --fix --allow-dirty -- -D warnings
+```
+
+Review the generated diff before committing. If CUDA dependencies are available
+locally, also run the strict CUDA lint command above.
 
 ---
 
