@@ -36,6 +36,13 @@ impl RuntimeTokenizer {
         }
     }
 
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Char(_) => "char",
+            Self::Bpe(_) => "bpe",
+        }
+    }
+
     pub fn encode(&self, text: &str) -> Vec<usize> {
         match self {
             Self::Char(tokenizer) => tokenizer.encode(text),
@@ -69,6 +76,23 @@ impl RuntimeTokenizer {
 mod tests {
     use super::*;
     use crate::tokenizer::bpe::BpeTrainer;
+
+    #[test]
+    fn runtime_tokenizer_kind_returns_char_or_bpe() {
+        let char_tokenizer = RuntimeTokenizer::char_from_text("abc");
+        assert_eq!("char", char_tokenizer.kind());
+
+        let bpe = BpeTrainer::new(258).train("banana banana banana");
+        let path = std::env::temp_dir().join(format!(
+            "rusty-gpt-tokenizer-kind-{}.json",
+            std::process::id()
+        ));
+        bpe.save(&path).unwrap();
+        let bpe_tokenizer = RuntimeTokenizer::load_bpe(&path).unwrap();
+        assert_eq!("bpe", bpe_tokenizer.kind());
+
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn runtime_tokenizer_loads_bpe_from_json() {

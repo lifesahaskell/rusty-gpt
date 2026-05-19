@@ -282,14 +282,17 @@ The container path runs both automatically (`docker compose up`).
 | Method | Path             | Notes                                                       |
 | ------ | ---------------- | ----------------------------------------------------------- |
 | GET    | `/api/info`      | Model shape and tokenizer info                              |
+| GET    | `/api/health`    | Liveness probe: status, uptime, model shape, checkpoint + tokenizer sha256 (basenames only — never absolute paths) |
 | POST   | `/api/generate`  | `{prompt, max_tokens, temperature, top_k?}`; `temperature > 0` required |
 
-Curl example:
+Curl examples:
 
 ```bash
 curl -X POST http://127.0.0.1:8787/api/generate \
     -H 'Content-Type: application/json' \
     -d '{"prompt":"Once upon","max_tokens":80,"temperature":0.8,"top_k":40}'
+
+curl -s http://127.0.0.1:8787/api/health | jq .
 ```
 
 ---
