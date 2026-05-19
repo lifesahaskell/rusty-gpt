@@ -1,10 +1,11 @@
+use crate::runtime_assets::DEFAULT_CHECKPOINT_DIR;
 use anyhow::{Context, Result, bail};
 use rusty_gpt::loader::InputSource;
 use rusty_gpt::observability::LogFormat;
 use rusty_gpt::utils::{BenchmarkConfig, parse_usize_list};
 use std::env;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub(crate) const DEFAULT_INPUT_PATH: &str = "data/input.txt";
 pub(crate) const DEFAULT_MINIGPT_CHECKPOINT_PATH: &str = "checkpoints/mini_gpt";
@@ -759,16 +760,17 @@ where
         InputSource::HuggingFace { .. } => PathBuf::from(input_source.display()),
     };
 
+    let checkpoint_path = match arg_checkpoint.or(env.checkpoint.as_deref()) {
+        Some(path) => validate_checkpoint_path(path, Path::new(DEFAULT_CHECKPOINT_DIR))?,
+        None => PathBuf::from(DEFAULT_MINIGPT_CHECKPOINT_PATH),
+    };
+
     Ok(RuntimeConfig {
         backend,
         model: parse_model_name(arg_model.or(env.model.as_deref()).unwrap_or("minigpt"))?,
         input_path,
         input_source,
-        checkpoint_path: PathBuf::from(
-            arg_checkpoint
-                .or(env.checkpoint.as_deref())
-                .unwrap_or(DEFAULT_MINIGPT_CHECKPOINT_PATH),
-        ),
+        checkpoint_path,
         hyperparameters,
         interactive,
         benchmark_generation,
@@ -820,6 +822,42 @@ fn validate_server_limits(
     Ok(())
 }
 
+pub(crate) fn validate_checkpoint_path(input: &str, root: &Path) -> Result<PathBuf> {
+    let root_input = root;
+    let root = root_input.canonicalize().with_context(|| {
+        format!(
+            "checkpoint path must be inside checkpoints/ (got: {input}, failed to resolve root: {})",
+            root_input.display()
+        )
+    })?;
+    let input_path = Path::new(input);
+    let candidate = if input_path.is_absolute() || input_path.starts_with(root_input) {
+        input_path.to_path_buf()
+    } else {
+        root_input.join(input_path)
+    };
+    let file_name = candidate.file_name().with_context(|| {
+        format!("checkpoint path must be inside checkpoints/ (got: {input}, resolved: <none>)")
+    })?;
+    let parent = candidate.parent().unwrap_or(&root);
+    let canonical_parent = parent.canonicalize().with_context(|| {
+        format!(
+            "checkpoint path must be inside checkpoints/ (got: {input}, failed to resolve parent: {})",
+            parent.display()
+        )
+    })?;
+    let resolved = canonical_parent.join(file_name);
+
+    if !resolved.starts_with(&root) {
+        bail!(
+            "checkpoint path must be inside checkpoints/ (got: {input}, resolved: {})",
+            resolved.display()
+        );
+    }
+
+    Ok(resolved)
+}
+
 fn default_log_format(backend: BackendChoice) -> LogFormat {
     match backend {
         BackendChoice::Cpu => LogFormat::Plain,
@@ -868,6 +906,10 @@ fn parse_model_name(name: &str) -> Result<ModelChoice> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs as unix_fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn parse_args(args: &[&str]) -> Result<RuntimeConfig> {
         parse_args_with_env(args, RuntimeEnv::default())
@@ -883,6 +925,146 @@ mod tests {
             err.to_string().contains(expected),
             "expected error to contain '{expected}', got '{err}'"
         );
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!(
+            "rusty-gpt-runtime-config-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn assert_checkpoint_error_contains(err: anyhow::Error) {
+        assert!(
+            err.to_string()
+                .contains("checkpoint path must be inside checkpoints/"),
+            "expected checkpoint confinement error, got '{err}'"
+        );
+    }
+
+    #[test]
+    fn checkpoint_validator_accepts_relative_path_inside_root() {
+        let dir = unique_temp_dir("relative");
+        let root = dir.join("checkpoints");
+        fs::create_dir_all(root.join("nested")).unwrap();
+
+        let path = validate_checkpoint_path("nested/mini_gpt", &root).unwrap();
+
+        assert_eq!(root.join("nested/mini_gpt"), path);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_validator_accepts_absolute_path_inside_root() {
+        let dir = unique_temp_dir("absolute");
+        let root = dir.join("checkpoints");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        let input = root.join("nested/mini_gpt");
+
+        let path = validate_checkpoint_path(input.to_str().unwrap(), &root).unwrap();
+
+        assert_eq!(input, path);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_validator_maps_bare_name_inside_root() {
+        let dir = unique_temp_dir("bare-name");
+        let root = dir.join("checkpoints");
+        fs::create_dir_all(&root).unwrap();
+
+        let path = validate_checkpoint_path("mini_gpt", &root).unwrap();
+
+        assert_eq!(root.join("mini_gpt"), path);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_validator_rejects_parent_traversal_outside_root() {
+        let dir = unique_temp_dir("traversal");
+        let root = dir.join("checkpoints");
+        fs::create_dir_all(&root).unwrap();
+
+        let err = validate_checkpoint_path("../secret", &root)
+            .expect_err("parent traversal should be rejected");
+
+        assert_checkpoint_error_contains(err);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_validator_rejects_symlink_parent_outside_root() {
+        let dir = unique_temp_dir("symlink");
+        let root = dir.join("checkpoints");
+        let outside = dir.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        unix_fs::symlink(&outside, root.join("linked-outside")).unwrap();
+
+        let err = validate_checkpoint_path("linked-outside/mini_gpt", &root)
+            .expect_err("symlink escaping the checkpoint root should be rejected");
+
+        assert_checkpoint_error_contains(err);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_validator_accepts_nonexistent_file_inside_existing_parent() {
+        let dir = unique_temp_dir("nonexistent-file");
+        let root = dir.join("checkpoints");
+        fs::create_dir_all(root.join("nested")).unwrap();
+
+        let path = validate_checkpoint_path("nested/new_checkpoint", &root).unwrap();
+
+        assert_eq!(root.join("nested/new_checkpoint"), path);
+        assert!(!path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_env_path_is_validated() {
+        fs::create_dir_all(DEFAULT_CHECKPOINT_DIR).unwrap();
+        let config = parse_args_with_env(
+            &[],
+            RuntimeEnv {
+                checkpoint: Some("mini_gpt".to_string()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+
+        assert!(config.checkpoint_path.ends_with("checkpoints/mini_gpt"));
+    }
+
+    #[test]
+    fn checkpoint_cli_path_rejects_parent_traversal() {
+        fs::create_dir_all(DEFAULT_CHECKPOINT_DIR).unwrap();
+        let err = parse_args(&["--checkpoint", "../secret"])
+            .expect_err("cli checkpoint traversal should fail");
+
+        assert_checkpoint_error_contains(err);
+    }
+
+    #[test]
+    fn checkpoint_env_path_rejects_parent_traversal() {
+        fs::create_dir_all(DEFAULT_CHECKPOINT_DIR).unwrap();
+        let err = parse_args_with_env(
+            &[],
+            RuntimeEnv {
+                checkpoint: Some("../secret".to_string()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .expect_err("env checkpoint traversal should fail");
+
+        assert_checkpoint_error_contains(err);
     }
 
     #[test]

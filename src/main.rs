@@ -563,17 +563,19 @@ mod tests {
 
     #[test]
     fn checkpoint_path_can_be_selected_from_args() {
+        fs::create_dir_all("checkpoints").unwrap();
         let config = parse_runtime_config_with_checkpoint(
             ["--checkpoint".to_string(), "checkpoints/custom".to_string()],
             RuntimeEnv::default(),
         )
         .unwrap();
 
-        assert_eq!(PathBuf::from("checkpoints/custom"), config.checkpoint_path);
+        assert!(config.checkpoint_path.ends_with("checkpoints/custom"));
     }
 
     #[test]
     fn checkpoint_arg_takes_precedence_over_env() {
+        fs::create_dir_all("checkpoints").unwrap();
         let config = parse_runtime_config_with_checkpoint(
             [
                 "--checkpoint".to_string(),
@@ -586,10 +588,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            PathBuf::from("checkpoints/from-arg"),
-            config.checkpoint_path
-        );
+        assert!(config.checkpoint_path.ends_with("checkpoints/from-arg"));
     }
 
     #[test]
