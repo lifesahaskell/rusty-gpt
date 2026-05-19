@@ -72,6 +72,13 @@ model's shape and tokenizer info. `GET /api/health` returns server uptime,
 model shape, and the checkpoint + tokenizer sha256 — designed for liveness
 probes and never exposes absolute filesystem paths.
 
+`POST /api/generate` enforces request caps before tokenizer/model work:
+`--max-prompt-bytes` / `RUSTY_GPT_MAX_PROMPT_BYTES` defaults to `8192`,
+`--max-output-tokens` / `RUSTY_GPT_MAX_OUTPUT_TOKENS` defaults to `512`.
+It is also rate-limited by `--rate-limit-rps` / `RUSTY_GPT_RATE_LIMIT_RPS`
+(default `5`) and `--rate-limit-burst` / `RUSTY_GPT_RATE_LIMIT_BURST`
+(default `10`); set RPS to `0` to disable.
+
 ## Architecture
 
 ```

@@ -295,6 +295,27 @@ curl -X POST http://127.0.0.1:8787/api/generate \
 curl -s http://127.0.0.1:8787/api/health | jq .
 ```
 
+Generate request protections:
+
+- `--max-prompt-bytes` / `RUSTY_GPT_MAX_PROMPT_BYTES`, default `8192`, rejects oversized prompts with `{"error":"prompt_too_large","max_bytes":N,"actual_bytes":M}`.
+- `--max-output-tokens` / `RUSTY_GPT_MAX_OUTPUT_TOKENS`, default `512`, rejects `max_tokens == 0` or over-cap requests with `{"error":"max_tokens_out_of_range","max_allowed":N,"requested":M}`.
+- `--rate-limit-rps` / `RUSTY_GPT_RATE_LIMIT_RPS`, default `5`, and `--rate-limit-burst` / `RUSTY_GPT_RATE_LIMIT_BURST`, default `10`, control the in-process generate limiter. `--rate-limit-rps 0` disables it. Invalid cap requests do not consume tokens; `/api/info` and `/api/health` are exempt.
+
+429 reproduction:
+
+```bash
+cargo run --bin rusty-gpt -- --serve --rate-limit-rps 1 --rate-limit-burst 1
+
+for i in 1 2 3; do
+  curl -i -sS -X POST http://127.0.0.1:8787/api/generate \
+    -H 'Content-Type: application/json' \
+    -d '{"prompt":"Once","max_tokens":1,"temperature":1.0}'
+done
+```
+
+The limiter is per-process. If the API is scaled to multiple replicas, the
+effective limit is approximately the configured limit times the replica count.
+
 ---
 
 ## Tooling binaries
