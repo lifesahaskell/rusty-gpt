@@ -19,6 +19,44 @@ pub struct ServerState<B: Backend> {
     tokenizer: RuntimeTokenizer,
     device: B::Device,
     logger: EventLogger,
+    provenance: ServerProvenance,
+}
+
+pub struct ServerProvenance {
+    pub started_at: Instant,
+    pub checkpoint_source: CheckpointSource,
+    pub checkpoint_basename: Option<String>,
+    pub checkpoint_sha256: Option<String>,
+    pub tokenizer_sha256: Option<String>,
+}
+
+impl ServerProvenance {
+    pub fn fresh() -> Self {
+        Self {
+            started_at: Instant::now(),
+            checkpoint_source: CheckpointSource::None,
+            checkpoint_basename: None,
+            checkpoint_sha256: None,
+            tokenizer_sha256: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointSource {
+    None,
+    Explicit,
+    Latest,
+}
+
+impl CheckpointSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Explicit => "explicit",
+            Self::Latest => "latest",
+        }
+    }
 }
 
 impl<B: Backend> ServerState<B> {
@@ -27,12 +65,14 @@ impl<B: Backend> ServerState<B> {
         tokenizer: RuntimeTokenizer,
         device: B::Device,
         logger: EventLogger,
+        provenance: ServerProvenance,
     ) -> Self {
         Self {
             model,
             tokenizer,
             device,
             logger,
+            provenance,
         }
     }
 
@@ -61,6 +101,8 @@ where
     Router::new()
         .route("/generate", post(generate::<B>))
         .route("/info", get(info::<B>))
+        // NOTE: S2-T1 (rate limit) must exempt this route — monitoring probes hit it.
+        .route("/health", get(health::<B>))
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,6 +247,68 @@ where
     })
 }
 
+#[derive(Debug, Serialize)]
+pub struct HealthResponse {
+    pub status: &'static str,
+    pub uptime_seconds: u64,
+    pub model: HealthModel,
+    pub checkpoint: HealthCheckpoint,
+    pub tokenizer: HealthTokenizer,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HealthTokenizer {
+    pub kind: &'static str,
+    pub sha256: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HealthModel {
+    pub kind: &'static str,
+    pub embed_dim: usize,
+    pub num_heads: usize,
+    pub num_layers: usize,
+    pub block_size: usize,
+    pub vocab_size: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HealthCheckpoint {
+    pub loaded: bool,
+    pub source: &'static str,
+    pub basename: Option<String>,
+    pub sha256: Option<String>,
+}
+
+async fn health<B>(State(state): State<SharedServerState<B>>) -> Json<HealthResponse>
+where
+    B: Backend,
+{
+    let provenance = &state.provenance;
+    Json(HealthResponse {
+        status: "ok",
+        uptime_seconds: provenance.started_at.elapsed().as_secs(),
+        model: HealthModel {
+            kind: "minigpt",
+            embed_dim: state.model.d_model(),
+            num_heads: state.model.num_heads(),
+            num_layers: state.model.num_layers(),
+            block_size: state.model.block_size(),
+            vocab_size: state.model.vocab_size(),
+        },
+        checkpoint: HealthCheckpoint {
+            loaded: provenance.checkpoint_source != CheckpointSource::None,
+            source: provenance.checkpoint_source.as_str(),
+            basename: provenance.checkpoint_basename.clone(),
+            sha256: provenance.checkpoint_sha256.clone(),
+        },
+        tokenizer: HealthTokenizer {
+            kind: state.tokenizer.kind(),
+            sha256: provenance.tokenizer_sha256.clone(),
+        },
+    })
+}
+
 fn context_window(tokens: &[usize], block_size: usize) -> &[usize] {
     let start = tokens.len().saturating_sub(block_size);
     &tokens[start..]
@@ -266,6 +370,13 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
+    fn checkpoint_source_serializes_to_spec_strings() {
+        assert_eq!("none", CheckpointSource::None.as_str());
+        assert_eq!("explicit", CheckpointSource::Explicit.as_str());
+        assert_eq!("latest", CheckpointSource::Latest.as_str());
+    }
+
+    #[test]
     fn context_window_crops_to_block_size() {
         assert_eq!(&[2, 3, 4], context_window(&[0, 1, 2, 3, 4], 3));
     }
@@ -281,6 +392,7 @@ mod tests {
             tokenizer,
             device,
             EventLogger::stdout(LogFormat::Plain),
+            ServerProvenance::fresh(),
         );
 
         assert_eq!(7, state.model.vocab_size());
@@ -302,6 +414,7 @@ mod tests {
             tokenizer,
             device,
             EventLogger::stdout(LogFormat::Plain),
+            ServerProvenance::fresh(),
         ));
 
         let Json(response) = info(State(state)).await;
@@ -322,6 +435,7 @@ mod tests {
             tokenizer,
             device,
             EventLogger::stdout(LogFormat::Plain),
+            ServerProvenance::fresh(),
         );
 
         let attention = attention_for_tokens(&state, &[0, 1, 2]).unwrap();
@@ -346,7 +460,13 @@ mod tests {
         let logger = EventLogger::with_sink(LogFormat::Json, move |line| {
             captured.lock().unwrap().push(line);
         });
-        let state = Arc::new(ServerState::new(model, tokenizer, device, logger));
+        let state = Arc::new(ServerState::new(
+            model,
+            tokenizer,
+            device,
+            logger,
+            ServerProvenance::fresh(),
+        ));
 
         let response = generate(
             State(state),
@@ -382,7 +502,13 @@ mod tests {
         let logger = EventLogger::with_sink(LogFormat::Json, move |line| {
             captured.lock().unwrap().push(line);
         });
-        let state = Arc::new(ServerState::new(model, tokenizer, device, logger));
+        let state = Arc::new(ServerState::new(
+            model,
+            tokenizer,
+            device,
+            logger,
+            ServerProvenance::fresh(),
+        ));
 
         let response = generate(
             State(state),
@@ -405,13 +531,212 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_reports_tokenizer_kind_and_sha256() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let model = MiniGpt::<TestBackend>::new(7, 8, 1, 6, 2, &device);
+        let tokenizer = RuntimeTokenizer::char_from_text("abcdefg");
+        let provenance = ServerProvenance {
+            started_at: Instant::now(),
+            checkpoint_source: CheckpointSource::None,
+            checkpoint_basename: None,
+            checkpoint_sha256: None,
+            tokenizer_sha256: Some("deadbeef".to_string()),
+        };
+        let state = Arc::new(ServerState::new(
+            model,
+            tokenizer,
+            device,
+            EventLogger::stdout(LogFormat::Plain),
+            provenance,
+        ));
+
+        let Json(response) = health(State(state)).await;
+
+        assert_eq!("char", response.tokenizer.kind);
+        assert_eq!(Some("deadbeef".to_string()), response.tokenizer.sha256);
+    }
+
+    #[tokio::test]
+    async fn health_never_exposes_absolute_path() {
+        type TestBackend = NdArray<f32, i64>;
+        let parent_dir = std::env::temp_dir().join(format!(
+            "rusty-gpt-health-disclosure-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        let checkpoint_path = parent_dir.join("mini_gpt.step-5000.mpk");
+        std::fs::write(&checkpoint_path, b"bytes").unwrap();
+
+        let device = NdArrayDevice::Cpu;
+        let model = MiniGpt::<TestBackend>::new(7, 8, 1, 6, 2, &device);
+        let tokenizer = RuntimeTokenizer::char_from_text("abcdefg");
+        let provenance = ServerProvenance {
+            started_at: Instant::now(),
+            checkpoint_source: CheckpointSource::Latest,
+            checkpoint_basename: checkpoint_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(String::from),
+            checkpoint_sha256: Some("placeholder-sha".to_string()),
+            tokenizer_sha256: None,
+        };
+        let state = Arc::new(ServerState::new(
+            model,
+            tokenizer,
+            device,
+            EventLogger::stdout(LogFormat::Plain),
+            provenance,
+        ));
+
+        let Json(response) = health(State(state)).await;
+        let serialized = serde_json::to_string(&response).unwrap();
+
+        assert!(
+            serialized.contains("mini_gpt.step-5000.mpk"),
+            "expected basename in response, got: {serialized}"
+        );
+        let parent_str = parent_dir.to_string_lossy();
+        assert!(
+            !serialized.contains(parent_str.as_ref()),
+            "absolute path leaked into health response: {serialized}"
+        );
+
+        let _ = std::fs::remove_file(checkpoint_path);
+        let _ = std::fs::remove_dir(parent_dir);
+    }
+
+    #[tokio::test]
+    async fn health_reports_explicit_checkpoint_sha256_matches_disk() {
+        use crate::model::persistence::sha256_file_hex;
+        type TestBackend = NdArray<f32, i64>;
+
+        let checkpoint_path = std::env::temp_dir().join(format!(
+            "rusty-gpt-health-checkpoint-{}.mpk",
+            std::process::id()
+        ));
+        std::fs::write(&checkpoint_path, b"fake-mpk-bytes-for-test").unwrap();
+        let expected_sha = sha256_file_hex(&checkpoint_path).unwrap().unwrap();
+        let expected_basename = checkpoint_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let device = NdArrayDevice::Cpu;
+        let model = MiniGpt::<TestBackend>::new(7, 8, 1, 6, 2, &device);
+        let tokenizer = RuntimeTokenizer::char_from_text("abcdefg");
+        let provenance = ServerProvenance {
+            started_at: Instant::now(),
+            checkpoint_source: CheckpointSource::Explicit,
+            checkpoint_basename: Some(expected_basename.clone()),
+            checkpoint_sha256: Some(expected_sha.clone()),
+            tokenizer_sha256: None,
+        };
+        let state = Arc::new(ServerState::new(
+            model,
+            tokenizer,
+            device,
+            EventLogger::stdout(LogFormat::Plain),
+            provenance,
+        ));
+
+        let Json(response) = health(State(state)).await;
+
+        assert!(response.checkpoint.loaded);
+        assert_eq!("explicit", response.checkpoint.source);
+        assert_eq!(Some(expected_basename), response.checkpoint.basename);
+        assert_eq!(Some(expected_sha), response.checkpoint.sha256);
+
+        let _ = std::fs::remove_file(checkpoint_path);
+    }
+
+    #[tokio::test]
+    async fn health_model_shape_matches_constructor_args() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        // MiniGpt::new(vocab_size, d_model, num_layers, block_size, num_heads, device)
+        let model = MiniGpt::<TestBackend>::new(11, 16, 3, 7, 4, &device);
+        let tokenizer = RuntimeTokenizer::char_from_text("abcdefg");
+        let state = Arc::new(ServerState::new(
+            model,
+            tokenizer,
+            device,
+            EventLogger::stdout(LogFormat::Plain),
+            ServerProvenance::fresh(),
+        ));
+
+        let Json(response) = health(State(state)).await;
+
+        assert_eq!("minigpt", response.model.kind);
+        assert_eq!(11, response.model.vocab_size);
+        assert_eq!(16, response.model.embed_dim);
+        assert_eq!(3, response.model.num_layers);
+        assert_eq!(7, response.model.block_size);
+        assert_eq!(4, response.model.num_heads);
+    }
+
+    #[tokio::test]
+    async fn health_fresh_template_reports_none_source() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let model = MiniGpt::<TestBackend>::new(7, 8, 1, 6, 2, &device);
+        let tokenizer = RuntimeTokenizer::char_from_text("abcdefg");
+        let state = Arc::new(ServerState::new(
+            model,
+            tokenizer,
+            device,
+            EventLogger::stdout(LogFormat::Plain),
+            ServerProvenance::fresh(),
+        ));
+
+        let Json(response) = health(State(state)).await;
+
+        assert!(!response.checkpoint.loaded);
+        assert_eq!("none", response.checkpoint.source);
+        assert!(response.checkpoint.basename.is_none());
+        assert!(response.checkpoint.sha256.is_none());
+
+        let serialized = serde_json::to_value(&response).unwrap();
+        assert!(serialized["checkpoint"]["basename"].is_null());
+        assert!(serialized["checkpoint"]["sha256"].is_null());
+    }
+
+    #[tokio::test]
+    async fn health_reports_status_ok_and_uptime() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let model = MiniGpt::<TestBackend>::new(7, 8, 1, 6, 2, &device);
+        let tokenizer = RuntimeTokenizer::char_from_text("abcdefg");
+        let state = Arc::new(ServerState::new(
+            model,
+            tokenizer,
+            device,
+            EventLogger::stdout(LogFormat::Plain),
+            ServerProvenance::fresh(),
+        ));
+
+        let Json(response) = health(State(state)).await;
+
+        assert_eq!("ok", response.status);
+        assert!(response.uptime_seconds < 5);
+    }
+
+    #[tokio::test]
     async fn generate_rejects_zero_top_k() {
         type TestBackend = NdArray<f32, i64>;
         let device = NdArrayDevice::Cpu;
         let model = MiniGpt::<TestBackend>::new(7, 8, 1, 6, 2, &device);
         let tokenizer = RuntimeTokenizer::char_from_text("abcdefg");
         let logger = EventLogger::stdout(LogFormat::Plain);
-        let state = Arc::new(ServerState::new(model, tokenizer, device, logger));
+        let state = Arc::new(ServerState::new(
+            model,
+            tokenizer,
+            device,
+            logger,
+            ServerProvenance::fresh(),
+        ));
 
         let response = generate(
             State(state),

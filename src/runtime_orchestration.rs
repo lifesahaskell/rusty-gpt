@@ -4,20 +4,22 @@ use burn::backend::Autodiff;
 use burn::backend::ndarray::{NdArray, NdArrayDevice};
 use burn::tensor::backend::Backend;
 use rusty_gpt::loader::data::DataLoader;
+use rusty_gpt::model::persistence::sha256_file_hex;
 use rusty_gpt::model::{MiniGpt, MultiAttentionModel, SingleAttentionModel, TrivialModel};
 use rusty_gpt::observability::{EventLogger, RuntimeEvent};
 use rusty_gpt::server;
-use rusty_gpt::server::ServerState;
+use rusty_gpt::server::{CheckpointSource, ServerProvenance, ServerState};
 use rusty_gpt::tokenizer::RuntimeTokenizer;
 use rusty_gpt::utils::BenchmarkConfig;
 use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::runtime_assets::{
     DEFAULT_CHECKPOINT_DIR, latest_checkpoint_path, load_minigpt_checkpoint,
-    load_minigpt_tokenizer, tokenizer_for_model,
+    load_minigpt_tokenizer, minigpt_tokenizer_path, tokenizer_for_model,
 };
 use crate::runtime_config::{Hyperparameters, ModelChoice};
 use crate::runtime_training::{TrainingDemoOptions, run_training_demo};
@@ -114,21 +116,46 @@ where
     B: Backend + Send + Sync + 'static,
     B::Device: Send + Sync + 'static,
 {
+    let started_at = Instant::now();
     let tokenizer = load_minigpt_tokenizer()?;
     let template = new_minigpt::<B>(tokenizer.vocab_size(), hyperparameters, device);
-    let model = if options.load_latest_checkpoint_enabled {
-        let latest_checkpoint = latest_checkpoint_path(Path::new(DEFAULT_CHECKPOINT_DIR))?;
-        load_minigpt_checkpoint(template, &latest_checkpoint, device, &options.logger)?
-    } else if options.load_checkpoint_enabled {
-        load_minigpt_checkpoint(template, options.checkpoint_path, device, &options.logger)?
-    } else {
-        template
+    let (model, checkpoint_source, checkpoint_path): (_, _, Option<PathBuf>) =
+        if options.load_latest_checkpoint_enabled {
+            let latest = latest_checkpoint_path(Path::new(DEFAULT_CHECKPOINT_DIR))?;
+            let loaded = load_minigpt_checkpoint(template, &latest, device, &options.logger)?;
+            (loaded, CheckpointSource::Latest, Some(latest))
+        } else if options.load_checkpoint_enabled {
+            let explicit = options.checkpoint_path.to_path_buf();
+            let loaded = load_minigpt_checkpoint(template, &explicit, device, &options.logger)?;
+            (loaded, CheckpointSource::Explicit, Some(explicit))
+        } else {
+            (template, CheckpointSource::None, None)
+        };
+    let (checkpoint_basename, checkpoint_sha256) = match &checkpoint_path {
+        Some(path) => {
+            let mpk = path.with_extension("mpk");
+            let basename = mpk
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(String::from);
+            (basename, sha256_file_hex(&mpk)?)
+        }
+        None => (None, None),
+    };
+    let tokenizer_sha256 = sha256_file_hex(Path::new(&minigpt_tokenizer_path()))?;
+    let provenance = ServerProvenance {
+        started_at,
+        checkpoint_source,
+        checkpoint_basename,
+        checkpoint_sha256,
+        tokenizer_sha256,
     };
     let state = Arc::new(ServerState::new(
         model,
         tokenizer,
         device.clone(),
         options.logger.clone(),
+        provenance,
     ));
     let vocab_size = state.model_vocab_size();
     let block_size = state.model_block_size();

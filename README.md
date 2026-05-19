@@ -68,7 +68,9 @@ curl -X POST http://127.0.0.1:8787/api/generate \
 
 Response includes the generated text, per-token splits, and `attention[]`
 matrices keyed by `layer` and `head`. `GET /api/info` returns the loaded
-model's shape and tokenizer info.
+model's shape and tokenizer info. `GET /api/health` returns server uptime,
+model shape, and the checkpoint + tokenizer sha256 — designed for liveness
+probes and never exposes absolute filesystem paths.
 
 ## Architecture
 
@@ -77,7 +79,7 @@ src/
   tokenizer/    char + BPE tokenizers (Tokenizer trait, runtime dispatch)
   loader/       random-window batch sampler producing (x, y) shifted by 1
   model/        the four models + persistence (.mpk + .metadata.json)
-  server/       Axum router for /api/generate + /api/info
+  server/       Axum router for /api/generate, /api/info, /api/health
   bin/          train-tokenizer, collect-source helper binaries
 
 mini-gpt-ui/    React + Vite UI (proxies /api/* to the server)
