@@ -10,7 +10,7 @@ Every CLI flag and `RUSTY_GPT_*` environment variable accepted by the
 | `--backend cpu\|cuda` | `RUSTY_GPT_BACKEND` | `cpu` | `cuda` is only available when the crate is built with `--features cuda` (requires the CUDA toolkit). |
 | `--input <path>` | `RUSTY_GPT_INPUT` | `data/input.txt` | Plain UTF-8 text. Also accepts `hf://` URIs (see [Hugging Face datasets](#hugging-face-datasets)). |
 | `--model <name>` | `RUSTY_GPT_MODEL` | `minigpt` | `trivial`, `single-attention`, `multi-attention`, `minigpt` (alias `mini-gpt`), `compare`. |
-| `--checkpoint <path>` | `RUSTY_GPT_MINIGPT_CHECKPOINT` | `checkpoints/mini_gpt` | Path without `.mpk` — Burn appends it. |
+| `--checkpoint <path>` | `RUSTY_GPT_MINIGPT_CHECKPOINT` | `checkpoints/mini_gpt` | Path without `.mpk` — Burn appends it. Explicit paths must resolve inside `checkpoints/`; bare names resolve there. |
 | `--log-format plain\|json` | `RUSTY_GPT_LOG_FORMAT` | backend default | CPU defaults to plain text; CUDA defaults to JSON Lines. |
 | — | `RUSTY_GPT_BPE_TOKENIZER` | `checkpoints/tokenizer.json` | BPE tokenizer JSON used by MiniGPT and `compare` runs. |
 | `--interactive-generate` | — | off | Requires `--backend cpu` and `--model minigpt`. |
