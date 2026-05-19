@@ -9,7 +9,7 @@ use std::process::Command;
 
 #[test]
 fn checkpoint_interval_and_keep_produce_expected_files() {
-    let tmp = std::env::temp_dir().join(format!(
+    let tmp = PathBuf::from("checkpoints").join(format!(
         "rusty-gpt-periodic-checkpoints-{}",
         std::process::id()
     ));
@@ -23,6 +23,16 @@ fn checkpoint_interval_and_keep_produce_expected_files() {
             "minigpt",
             "--input",
             "tests/fixtures/input.txt",
+            "--block-size",
+            "8",
+            "--batch-size",
+            "1",
+            "--embed-dim",
+            "8",
+            "--num-heads",
+            "2",
+            "--num-layers",
+            "1",
             "--train-steps",
             "4",
             "--checkpoint-interval",
