@@ -21,14 +21,16 @@ cargo clippy --all-targets --features cuda -- -D warnings
 cargo fmt --all -- --check
 cargo check --features cuda         # verify the cuda gate still compiles
 
-# Run the full test suite (~161 tests: lib + main + two bin targets + 1 integration)
+# Run the full test suite (lib + main + two bin targets + three integration suites)
 cargo test
 
 # Run a single unit test by path (filter is a substring match)
 cargo test multi_head_attention_returns_model_dim_for_each_token_position
 
-# Run the integration test only
+# Run a specific integration test target only
 cargo test --test default_runtime
+cargo test --test graceful_shutdown      # SIGINT-during-training, Unix-only (#![cfg(unix)])
+cargo test --test periodic_checkpoints   # --checkpoint-interval / --checkpoint-keep behavior
 
 # Default demo: CPU, MiniGPT model, data/input.txt (needs checkpoints/tokenizer.json)
 cargo run
@@ -109,7 +111,8 @@ src/
   runtime_config.rs             `RuntimeConfig`, `BackendChoice`, `ModelChoice`, `Hyperparameters`, `RuntimeEnv`; parses + validates CLI args and `RUSTY_GPT_*` env vars
   runtime_assets.rs             corpus / tokenizer / checkpoint resolution (`load_input_text`, `load_minigpt_tokenizer`, `latest_checkpoint_path`); also dispatches `hf://` URIs to `loader::huggingface`
   runtime_orchestration.rs      picks demo / training / interactive / server / benchmark dispatch (`run_cpu_demo`, `run_http_server_with_runtime`)
-  runtime_training.rs           training-demo orchestration: train/value split, checkpoint save with metadata sidecar, observability events
+  runtime_training.rs           training-demo orchestration: train/value split, periodic + interrupt-driven checkpoint saves with metadata sidecar, observability events
+  runtime_signals.rs            process-wide SIGINT/SIGTERM flag for graceful training shutdown; `install_training_signal_handler`, `interrupt_requested`, `INTERRUPTED_EXIT_CODE = 130`. Unix-only; no-op on other targets. Only installed on the **training** path — serving and interactive inference keep default Ctrl-C abort.
   observability.rs              `EventLogger`, `RuntimeEvent`, `LogFormat`; emits structured stdout events consumed by `scripts/*` and downstream tools
   bin/
     train-tokenizer.rs          CLI to train a BPE tokenizer and write checkpoints/tokenizer.json
@@ -120,6 +123,7 @@ src/
     bpe.rs                      BPE tokenizer + `BpeTrainer`; loads/saves JSON
   loader/
     mod.rs / data.rs            random-window batch sampler producing (x, y) shifted by 1; `BatchPrefetcher` for CPU prefetch
+    input_source.rs             strict `InputSource::parse` for `--input`/`--corpus` (local path vs `hf://org/dataset[@rev]`); purely syntactic — no I/O. `validate_local_size` enforces `DEFAULT_MAX_LOCAL_INPUT_BYTES = 1 GiB` via `fs::metadata` only. Every consumer must branch on the parsed enum, not re-parse the raw string.
     huggingface.rs              fetches `hf://dataset?config=…&split=…` URIs via the HF datasets-server API; caches under `data/huggingface-cache/`
   model/
     mod.rs                      four model variants + shared loss/log helpers; `MiniGptConfig`, `TrainingLogFormat`, `TrainingLogContext`
@@ -130,9 +134,14 @@ src/
   utils/mod.rs                  generation benchmarking helpers (`benchmark_generation`, `benchmark_generation_cases`)
 tests/
   default_runtime.rs            binary-level smoke test asserting CPU default does not load libcuda
-  fixtures/input.txt            small corpus used by the integration test
+  graceful_shutdown.rs          Unix-only (`#![cfg(unix)]`): spawns `cargo run --`, sends SIGINT mid-training, asserts the partial `<checkpoint>.interrupted-step-<N>.mpk` save lands and the process exits with code 130
+  periodic_checkpoints.rs       exercises `--checkpoint-interval` / `--checkpoint-keep`: numbered snapshots written, oldest `.step-N.` pruned, final + interrupted saves never pruned
+  fixtures/input.txt            small corpus used by the integration tests
   fixtures/tokenizer.json       BPE tokenizer fixture used by checkpoint-save unit tests
-scripts/                        helper shell scripts: run_training.sh, run_local.sh, run_e2e_tests.sh, build_release_candidate.sh
+scripts/                        helper shell scripts: run_training.sh, run_local.sh, run_e2e_tests.sh, build_release_candidate.sh, start_dev_server.sh, test_cuda_passthrough.sh, install_nvidia_container_toolkit.sh, and devcontainer e2e probes test_devcontainer_{generate,server,ui}.sh
+docker/                         Dockerfile.cpu (debian:slim runtime) and Dockerfile.cuda; both multi-stage with cargo registry/target cache mounts
+compose.yaml + compose.override.yaml  three Docker Compose profiles: `bootstrap` (one-shot train-tokenizer), `train` (one-shot CUDA MiniGPT training), `serve` (default — HTTP API + React UI). Binds ./checkpoints and ./data into containers.
+docs/                           configuration.md (canonical flag/env reference), development-runbook.md (operational recipes), release-and-evaluation.md, sprints/ (sprint plans)
 mini-gpt-ui/                    separate React frontend that calls the /api server — see its own README
 data/input.txt                  ~1 MB Shakespeare-style training corpus (committed)
 data-secret/                    gitignored corpora directory (e.g. fafolang.txt, claude_src.txt)
@@ -229,3 +238,6 @@ Other invariants:
 - **Env-mutating tests use `unsafe`**: Rust 2024 makes `env::set_var` / `env::remove_var` unsafe. Existing tests in `main.rs` wrap them in `unsafe { ... }` blocks with a SAFETY comment — follow the same pattern when adding more.
 - **Burn features**: `burn` is pulled in with `["train", "ndarray", "wgpu"]` in `Cargo.toml`. The `wgpu` feature isn't exercised at runtime but kept so the CPU build stays portable; `cuda` is the only opt-in feature.
 - **`data-secret/` is gitignored**: anything you drop there (e.g. `fafolang.txt`, `claude_src.txt`) won't be committed. Use it for corpora you don't want in the repo.
+- **Graceful shutdown is training-only**: `runtime_signals` only installs the SIGINT/SIGTERM handler on the training path. First interrupt breaks at the next step boundary so `runtime_training` can save `<checkpoint>.interrupted-step-<N>.mpk` and exit with `INTERRUPTED_EXIT_CODE` (130); a second interrupt within ~2s aborts immediately. **Do not install the handler on the serve/interactive paths** — they rely on the default Ctrl-C abort. The `.interrupted-step-*` save is never pruned by the `--checkpoint-keep` retention window.
+- **`--input` / `--corpus` are validated before any I/O**: `loader::input_source::InputSource::parse` is purely syntactic (scheme, charset, dataset/revision shape); local files additionally pass `validate_local_size` against `DEFAULT_MAX_LOCAL_INPUT_BYTES` (1 GiB) using `fs::metadata().len()` only. Consumers must branch on the parsed enum — never re-parse the raw string.
+- **Authoritative config reference lives in `docs/configuration.md`**: the flag/env table in this file is a fast lookup; if a default or constraint disagrees with `docs/configuration.md`, treat that file as truth and update here.
