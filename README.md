@@ -102,8 +102,6 @@ scripts/        compose-stack regression tests + native helper scripts
   env var table.
 - **[Release & evaluation](docs/release-and-evaluation.md)** — packaging
   release candidates and capturing benchmark artifacts.
-- **[Project refinement](docs/project-refinement-phase.md)** — engineering
-  backlog for runtime hardening.
 
 ## License
 
