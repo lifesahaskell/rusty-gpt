@@ -5,10 +5,12 @@ use burn::tensor::backend::Backend;
 use burn::tensor::{Bool, Int, Tensor, TensorData};
 
 pub mod generation;
+pub mod moe;
 pub mod persistence;
 pub mod training;
 
 pub use generation::GenerationOptions;
+pub use moe::{MoeFeedForward, MoeForwardAux, Router, RouterOutput};
 pub use training::{
     TrainingLogContext, TrainingLogFormat, TrainingMetrics, TrainingOutcome, TrainingParams,
 };
@@ -415,21 +417,55 @@ impl<B: Backend> Mlp<B> {
     }
 }
 
+/// Contract for the pluggable feed-forward slot inside a transformer [`Block`].
+///
+/// [`Mlp`] is the dense implementation used by [`MiniGpt`];
+/// [`moe::MoeFeedForward`] is the Mixture-of-Experts implementation. The slot
+/// is a generic parameter rather than an enum module because Burn serializes
+/// enum module records externally tagged, which would change the record tree
+/// of every existing dense checkpoint; with a generic defaulted to `Mlp<B>`,
+/// pre-MoE `.mpk` files keep loading unchanged.
+pub trait FeedForward<B: Backend>: Module<B> {
+    fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3>;
+}
+
+impl<B: Backend> FeedForward<B> for Mlp<B> {
+    fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        Mlp::forward(self, x)
+    }
+}
+
 #[derive(Module, Debug)]
-pub struct Block<B: Backend> {
+pub struct Block<B: Backend, F = Mlp<B>> {
     ln1: LayerNorm<B>,
     attn: MultiHeadAttention<B>,
     ln2: LayerNorm<B>,
-    mlp: Mlp<B>,
+    mlp: F,
 }
 
 impl<B: Backend> Block<B> {
     pub fn new(d_model: usize, num_heads: usize, device: &B::Device) -> Self {
+        Self::new_with_feed_forward(
+            d_model,
+            num_heads,
+            Mlp::new(d_model, 4 * d_model, device),
+            device,
+        )
+    }
+}
+
+impl<B: Backend, F: FeedForward<B>> Block<B, F> {
+    pub fn new_with_feed_forward(
+        d_model: usize,
+        num_heads: usize,
+        feed_forward: F,
+        device: &B::Device,
+    ) -> Self {
         Self {
             ln1: LayerNormConfig::new(d_model).init(device),
             attn: MultiHeadAttention::new(d_model, num_heads, device),
             ln2: LayerNormConfig::new(d_model).init(device),
-            mlp: Mlp::new(d_model, 4 * d_model, device),
+            mlp: feed_forward,
         }
     }
 
@@ -1090,6 +1126,125 @@ mod tests {
 
         assert_eq!([2, 3, 8], output.shape().dims());
         assert_eq!([2, 2, 3, 3], attention.shape().dims());
+    }
+
+    #[test]
+    fn block_built_via_new_uses_dense_mlp_feed_forward() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let block = Block::<TestBackend>::new(8, 2, &device);
+        let input = Tensor::<TestBackend, 3>::random(
+            [2, 3, 8],
+            burn::tensor::Distribution::Default,
+            &device,
+        );
+
+        // Forward first: Burn params initialize lazily, and cloning an
+        // unmaterialized module would re-run the random initializer.
+        let via_trait = FeedForward::forward(&block.mlp, input.clone())
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        // The default feed-forward slot is a plain dense Mlp.
+        let standalone: Mlp<TestBackend> = block.mlp.clone();
+        let direct = standalone
+            .forward(input)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+
+        assert_eq!(direct, via_trait);
+    }
+
+    #[test]
+    fn block_supports_moe_feed_forward_slot() {
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let moe = MoeFeedForward::<TestBackend>::new(8, 16, 4, 2, &device);
+        let block = Block::new_with_feed_forward(8, 2, moe, &device);
+        let input = Tensor::<TestBackend, 3>::zeros([2, 3, 8], &device);
+
+        let output = block.forward(input);
+
+        assert_eq!([2, 3, 8], output.shape().dims());
+    }
+
+    #[test]
+    fn minigpt_loads_checkpoints_saved_with_pre_feedforward_record_layout() {
+        type TestBackend = NdArray<f32, i64>;
+
+        // Mirror of the Block/MiniGpt struct layout before the feed-forward
+        // slot became generic; saving it reproduces the record tree of
+        // checkpoints written by older builds.
+        #[derive(Module, Debug)]
+        struct LegacyBlock<B: Backend> {
+            ln1: LayerNorm<B>,
+            attn: MultiHeadAttention<B>,
+            ln2: LayerNorm<B>,
+            mlp: Mlp<B>,
+        }
+
+        #[derive(Module, Debug)]
+        struct LegacyMiniGpt<B: Backend> {
+            token_embed: Embedding<B>,
+            position_embed: Embedding<B>,
+            blocks: Vec<LegacyBlock<B>>,
+            ln_final: LayerNorm<B>,
+            lm_head: Linear<B>,
+            vocab_size: usize,
+            max_position_embeddings: usize,
+        }
+
+        let device = NdArrayDevice::Cpu;
+        let path = std::env::temp_dir().join(format!(
+            "rusty-gpt-legacy-dense-record-{}",
+            std::process::id()
+        ));
+        let saved_path = path.with_extension("mpk");
+
+        let model = MiniGpt::<TestBackend>::new(7, 8, 2, 6, 2, &device);
+        let input = Tensor::<TestBackend, 2, Int>::from_data([[0, 1, 2], [3, 4, 5]], &device);
+        // Materialize the lazily-initialized params before cloning them into
+        // the legacy layout; cloning unmaterialized params would re-run the
+        // random initializer and the two models would diverge.
+        let expected = model
+            .forward_tokens(input.clone())
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let legacy = LegacyMiniGpt {
+            token_embed: model.token_embed.clone(),
+            position_embed: model.position_embed.clone(),
+            blocks: model
+                .blocks
+                .iter()
+                .map(|block| LegacyBlock {
+                    ln1: block.ln1.clone(),
+                    attn: block.attn.clone(),
+                    ln2: block.ln2.clone(),
+                    mlp: block.mlp.clone(),
+                })
+                .collect(),
+            ln_final: model.ln_final.clone(),
+            lm_head: model.lm_head.clone(),
+            vocab_size: model.vocab_size,
+            max_position_embeddings: model.max_position_embeddings,
+        };
+        persistence::save_model(legacy, &path).unwrap();
+
+        let template = MiniGpt::<TestBackend>::new(7, 8, 2, 6, 2, &device);
+        let loaded = persistence::load_model(template, &path, &device).unwrap();
+
+        assert_eq!(
+            expected,
+            loaded
+                .forward_tokens(input)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap()
+        );
+
+        let _ = std::fs::remove_file(saved_path);
     }
 
     #[test]

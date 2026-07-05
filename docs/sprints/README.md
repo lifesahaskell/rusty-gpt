@@ -36,7 +36,7 @@ with `S<n>-T<m>` task IDs and test-driven acceptance criteria.
 | Routing | Linear gate → softmax → top-k selection, renormalized weights | Switch/Mixtral-style; the standard reference design |
 | Load balancing | Auxiliary loss = num_experts × Σ(fraction of tokens per expert × mean router probability per expert), weighted into the training loss | Prevents expert collapse without capacity factors or token dropping |
 | Capacity / dropping | None — every token is processed by its top-k experts | CPU-first teaching repo; correctness and readability over throughput tricks |
-| Code sharing | `Block`'s feed-forward slot becomes a `FeedForward` enum (`Dense(Mlp)` \| `Moe(MoeFeedForward)`) | MoeGpt reuses `Block`, attention, masks, and all six forward variants instead of duplicating ~600 lines |
+| Code sharing | `Block`'s feed-forward slot becomes a generic parameter (`Block<B, F = Mlp<B>>` bounded by a `FeedForward<B>` trait implemented by `Mlp` and `MoeFeedForward`) — deviation from the originally planned enum, see the S1-T1 note in [sprint-1.md](sprint-1.md) | MoeGpt reuses `Block`, attention, masks, and all six forward variants instead of duplicating ~600 lines; the generic keeps the dense checkpoint record tree unchanged, which an enum module cannot |
 | Tokenizer | BPE (`checkpoints/tokenizer.json`), same as MiniGPT | `moe-gpt` is a full GPT, not a char-level toy |
 | Framework | Hand-built from `burn::nn::Linear` + softmax/top-k | Burn 0.21 has no built-in MoE module |
 

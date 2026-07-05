@@ -36,6 +36,24 @@ builder) for MoE construction later. Confirm `#[derive(Module)]` works on the
 enum with Burn 0.21 (Burn supports enum modules); if it does not, fall back to
 a two-field struct with exactly one populated option and document why.
 
+> **Deviation taken during implementation.** `#[derive(Module)]` does work on
+> enums in Burn 0.21, but the generated record item is an externally tagged
+> serde enum (`{"Dense": {...}}`), and record fields carry no
+> `#[serde(default)]` — so both the enum and the two-field-struct fallback
+> change `Block`'s record tree and break loading every existing dense
+> checkpoint, which the acceptance criteria forbid. Implemented instead as a
+> generic feed-forward slot: `Block<B, F = Mlp<B>>` plus a
+> `pub trait FeedForward<B: Backend>: Module<B>` implemented by `Mlp` (dense)
+> and `moe::MoeFeedForward`. The default parameter keeps `Block<B>` meaning
+> the dense block everywhere, so the record tree — and therefore old `.mpk`
+> checkpoints — are unchanged (locked in by the
+> `minigpt_loads_checkpoints_saved_with_pre_feedforward_record_layout` test).
+> Burn's derive supports generic module parameters
+> (`ModuleWithGenericModule<B, M>` in burn-core's own test suite). Later
+> sprints that reference `FeedForward::Dense` / `FeedForward::Moe` map to
+> `Mlp` / `MoeFeedForward` as `F`, e.g. MoeGpt uses
+> `Vec<Block<B, MoeFeedForward<B>>>`.
+
 **Files**: `src/model/mod.rs`
 
 **Acceptance criteria**
