@@ -5,10 +5,12 @@ use burn::tensor::backend::Backend;
 use burn::tensor::{Bool, Int, Tensor, TensorData};
 
 pub mod generation;
+pub mod moe;
 pub mod persistence;
 pub mod training;
 
 pub use generation::GenerationOptions;
+pub use moe::{MoeFeedForward, MoeForwardAux, Router, RouterOutput, load_balancing_loss};
 pub use training::{
     TrainingLogContext, TrainingLogFormat, TrainingMetrics, TrainingOutcome, TrainingParams,
 };
@@ -415,12 +417,66 @@ impl<B: Backend> Mlp<B> {
     }
 }
 
+/// Pluggable feed-forward slot for a transformer [`Block`].
+///
+/// `Dense` is the original single-[`Mlp`] path; `Moe` swaps in a
+/// mixture-of-experts feed-forward. The enum is itself a Burn module — Burn
+/// 0.21 supports `#[derive(Module)]` on enums — so both variants participate in
+/// autodiff, device movement, and checkpoint records like any other module.
+///
+/// Checkpoint note: wrapping the feed-forward in this enum changes the record
+/// tree for the `mlp` field from a bare `Mlp` record to a tagged `FeedForward`
+/// enum record, so a `Dense` block serializes under a `Dense` variant tag.
+/// Burn's `NamedMpkFileRecorder` tolerates loading a pre-enum bare-`Mlp` record
+/// into the single-variant-shaped `Dense` slot (verified by the
+/// `legacy_dense_checkpoint_loads_into_feed_forward` test), so legacy dense
+/// checkpoints keep loading.
+#[derive(Module, Debug)]
+pub enum FeedForward<B: Backend> {
+    Dense(Mlp<B>),
+    Moe(MoeFeedForward<B>),
+}
+
+impl<B: Backend> FeedForward<B> {
+    /// Construct the default dense feed-forward (`d_ff = 4 * d_model`).
+    pub fn dense(d_model: usize, device: &B::Device) -> Self {
+        FeedForward::Dense(Mlp::new(d_model, 4 * d_model, device))
+    }
+
+    /// Wrap an existing [`MoeFeedForward`] as the feed-forward slot.
+    pub fn moe(moe: MoeFeedForward<B>) -> Self {
+        FeedForward::Moe(moe)
+    }
+
+    /// Run the feed-forward, discarding any auxiliary loss. Kept for
+    /// dense-only callers and inference paths that never need the aux value.
+    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        self.forward_with_aux(x).0
+    }
+
+    /// Run the feed-forward and surface an optional auxiliary loss.
+    ///
+    /// `Dense` never produces an aux loss (`None`); `Moe` returns
+    /// `Some(load_balancing_loss)` so the training loop can fold it into the
+    /// total loss. This is the single feed-forward tail every [`Block`] forward
+    /// variant routes through.
+    pub fn forward_with_aux(&self, x: Tensor<B, 3>) -> (Tensor<B, 3>, Option<Tensor<B, 1>>) {
+        match self {
+            FeedForward::Dense(mlp) => (mlp.forward(x), None),
+            FeedForward::Moe(moe) => {
+                let (output, aux) = moe.forward(x);
+                (output, Some(aux.load_balancing_loss()))
+            }
+        }
+    }
+}
+
 #[derive(Module, Debug)]
 pub struct Block<B: Backend> {
     ln1: LayerNorm<B>,
     attn: MultiHeadAttention<B>,
     ln2: LayerNorm<B>,
-    mlp: Mlp<B>,
+    mlp: FeedForward<B>,
 }
 
 impl<B: Backend> Block<B> {
@@ -429,25 +485,64 @@ impl<B: Backend> Block<B> {
             ln1: LayerNormConfig::new(d_model).init(device),
             attn: MultiHeadAttention::new(d_model, num_heads, device),
             ln2: LayerNormConfig::new(d_model).init(device),
-            mlp: Mlp::new(d_model, 4 * d_model, device),
+            mlp: FeedForward::dense(d_model, device),
         }
+    }
+
+    /// Construct a block with an explicit feed-forward slot (dense or MoE),
+    /// leaving [`Block::new`]'s dense default untouched. Lets a later MoeGpt
+    /// build blocks whose feed-forward is a [`MoeFeedForward`].
+    pub fn new_with_feed_forward(
+        d_model: usize,
+        num_heads: usize,
+        feed_forward: FeedForward<B>,
+        device: &B::Device,
+    ) -> Self {
+        Self {
+            ln1: LayerNormConfig::new(d_model).init(device),
+            attn: MultiHeadAttention::new(d_model, num_heads, device),
+            ln2: LayerNormConfig::new(d_model).init(device),
+            mlp: feed_forward,
+        }
+    }
+
+    /// Single feed-forward tail shared by every forward variant: apply `ln2`,
+    /// run the feed-forward, add the residual, and surface the optional aux
+    /// loss. All other variants call this and discard the aux value, so there
+    /// is exactly one place the feed-forward is applied.
+    fn feed_forward_residual(&self, x: Tensor<B, 3>) -> (Tensor<B, 3>, Option<Tensor<B, 1>>) {
+        let (ff_output, aux) = self.mlp.forward_with_aux(self.ln2.forward(x.clone()));
+        (x + ff_output, aux)
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let x = x.clone() + self.attn.forward(self.ln1.forward(x));
-        x.clone() + self.mlp.forward(self.ln2.forward(x))
+        self.feed_forward_residual(x).0
     }
 
     pub fn forward_with_mask(&self, x: Tensor<B, 3>, mask: Tensor<B, 4, Bool>) -> Tensor<B, 3> {
+        self.forward_with_mask_and_aux(x, mask).0
+    }
+
+    /// Masked forward that also returns the feed-forward auxiliary loss.
+    ///
+    /// The training path uses this so a `Moe` feed-forward can surface its
+    /// load-balancing loss; a `Dense` feed-forward returns `None` and output
+    /// identical to [`Block::forward_with_mask`].
+    pub fn forward_with_mask_and_aux(
+        &self,
+        x: Tensor<B, 3>,
+        mask: Tensor<B, 4, Bool>,
+    ) -> (Tensor<B, 3>, Option<Tensor<B, 1>>) {
         let x = x.clone() + self.attn.forward_with_mask(self.ln1.forward(x), mask);
-        x.clone() + self.mlp.forward(self.ln2.forward(x))
+        self.feed_forward_residual(x)
     }
 
     pub fn forward_with_weights(&self, x: Tensor<B, 3>) -> (Tensor<B, 3>, Tensor<B, 4>) {
         let (attn_output, attn_weights) =
             self.attn.forward_with_weights(self.ln1.forward(x.clone()));
         let x = x + attn_output;
-        let x = x.clone() + self.mlp.forward(self.ln2.forward(x));
+        let (x, _aux) = self.feed_forward_residual(x);
         (x, attn_weights)
     }
 
@@ -460,7 +555,7 @@ impl<B: Backend> Block<B> {
             .attn
             .forward_with_weights_and_mask(self.ln1.forward(x.clone()), mask);
         let x = x + attn_output;
-        let x = x.clone() + self.mlp.forward(self.ln2.forward(x));
+        let (x, _aux) = self.feed_forward_residual(x);
         (x, attn_weights)
     }
 
@@ -477,7 +572,7 @@ impl<B: Backend> Block<B> {
             .attn
             .forward_with_cache(self.ln1.forward(x.clone()), cache);
         let x = x + attn_output;
-        let x = x.clone() + self.mlp.forward(self.ln2.forward(x));
+        let (x, _aux) = self.feed_forward_residual(x);
         (x, cache)
     }
 
@@ -1063,8 +1158,13 @@ mod tests {
         assert_eq!([8], block.ln2.beta.as_ref().unwrap().shape().dims());
         assert_eq!(2, block.attn.num_heads);
         assert_eq!(4, block.attn.head_dim);
-        assert_eq!([8, 32], block.mlp.fc1.weight.shape().dims());
-        assert_eq!([32, 8], block.mlp.fc2.weight.shape().dims());
+        // `Block::new` populates a `Dense` feed-forward preserving d_ff = 4 * d_model.
+        let mlp = match &block.mlp {
+            FeedForward::Dense(mlp) => mlp,
+            FeedForward::Moe(_) => panic!("Block::new should build a Dense feed-forward"),
+        };
+        assert_eq!([8, 32], mlp.fc1.weight.shape().dims());
+        assert_eq!([32, 8], mlp.fc2.weight.shape().dims());
     }
 
     #[test]
@@ -1090,6 +1190,123 @@ mod tests {
 
         assert_eq!([2, 3, 8], output.shape().dims());
         assert_eq!([2, 2, 3, 3], attention.shape().dims());
+    }
+
+    #[test]
+    fn block_new_uses_dense_feed_forward_matching_direct_mlp() {
+        // S1-T1: a Block built via `Block::new` uses a `Dense` feed-forward and
+        // its `FeedForward` produces identical output to the same `Mlp` applied
+        // directly on the same input tensor.
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let block = Block::<TestBackend>::new(8, 2, &device);
+        let input = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                (0..2 * 3 * 8).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
+                [2, 3, 8],
+            ),
+            &device,
+        );
+
+        let mlp = match &block.mlp {
+            FeedForward::Dense(mlp) => mlp,
+            FeedForward::Moe(_) => panic!("Block::new should build a Dense feed-forward"),
+        };
+        let via_enum = block
+            .mlp
+            .forward(input.clone())
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let via_mlp = mlp.forward(input).into_data().to_vec::<f32>().unwrap();
+
+        assert_eq!(via_mlp, via_enum);
+    }
+
+    #[test]
+    fn dense_feed_forward_reports_no_aux_loss() {
+        // S1-T5: `FeedForward::forward_with_aux` returns `None` for `Dense`.
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let ff = FeedForward::<TestBackend>::dense(8, &device);
+        let input = Tensor::<TestBackend, 3>::zeros([2, 3, 8], &device);
+
+        let (output, aux) = ff.forward_with_aux(input);
+
+        assert_eq!([2, 3, 8], output.shape().dims());
+        assert!(aux.is_none());
+    }
+
+    #[test]
+    fn block_forward_with_mask_and_aux_dense_matches_forward_with_mask() {
+        // S1-T5: dense `forward_with_mask_and_aux` returns `None` aux and output
+        // identical to `forward_with_mask`.
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let block = Block::<TestBackend>::new(8, 2, &device);
+        let input = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                (0..2 * 3 * 8).map(|i| (i as f32).sin()).collect::<Vec<_>>(),
+                [2, 3, 8],
+            ),
+            &device,
+        );
+        let mask = MultiHeadAttention::<TestBackend>::causal_mask(2, 2, 3, &device);
+
+        let plain = block
+            .forward_with_mask(input.clone(), mask.clone())
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let (with_aux, aux) = block.forward_with_mask_and_aux(input, mask);
+
+        assert!(aux.is_none());
+        assert_eq!(plain, with_aux.into_data().to_vec::<f32>().unwrap());
+    }
+
+    #[test]
+    fn block_with_moe_feed_forward_surfaces_load_balancing_loss() {
+        // S1-T5: a Moe feed-forward makes `forward_with_mask_and_aux` return
+        // `Some(aux)` matching `load_balancing_loss` on the router outputs for
+        // the same input.
+        type TestBackend = NdArray<f32, i64>;
+        let device = NdArrayDevice::Cpu;
+        let moe = moe::MoeFeedForward::<TestBackend>::new(8, 32, 4, 2, &device);
+        let block =
+            Block::<TestBackend>::new_with_feed_forward(8, 2, FeedForward::moe(moe), &device);
+        let input = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                (0..2 * 3 * 8)
+                    .map(|i| (i as f32) * 0.02)
+                    .collect::<Vec<_>>(),
+                [2, 3, 8],
+            ),
+            &device,
+        );
+        let mask = MultiHeadAttention::<TestBackend>::causal_mask(2, 2, 3, &device);
+
+        let (_output, aux) = block.forward_with_mask_and_aux(input.clone(), mask.clone());
+        let aux = aux.expect("Moe feed-forward should surface an aux loss");
+
+        // Recompute the aux loss independently: replay attention + ln2 to feed
+        // the router the exact tensor the block's feed-forward saw.
+        let post_attn =
+            input.clone() + block.attn.forward_with_mask(block.ln1.forward(input), mask);
+        let ff_input = block.ln2.forward(post_attn);
+        let expected = match &block.mlp {
+            FeedForward::Moe(moe) => {
+                let (_out, aux) = moe.forward(ff_input);
+                aux.load_balancing_loss()
+            }
+            FeedForward::Dense(_) => panic!("expected a Moe feed-forward"),
+        };
+
+        let aux_val: f32 = aux.into_scalar();
+        let expected_val: f32 = expected.into_scalar();
+        assert!(
+            (aux_val - expected_val).abs() <= 1e-5,
+            "block aux {aux_val} should match direct load_balancing_loss {expected_val}"
+        );
     }
 
     #[test]
