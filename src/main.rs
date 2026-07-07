@@ -116,6 +116,7 @@ fn main() -> Result<()> {
                 logger,
                 checkpoint_path: &config.checkpoint_path,
                 input_source: &input_display,
+                resume_from: config.resume_from.as_deref(),
             },
         ),
         #[cfg(feature = "cuda")]
@@ -137,6 +138,7 @@ fn main() -> Result<()> {
                     benchmark_generation: config.benchmark_generation,
                     benchmark_config: config.benchmark_config,
                     input_source: input_display.clone(),
+                    resume_from: config.resume_from.clone(),
                 },
             )
         }
@@ -458,6 +460,7 @@ mod tests {
                 benchmark_generation: false,
                 benchmark_config: BenchmarkConfig::default(),
                 input_source: "test".to_string(),
+                resume_from: None,
             },
         )
         .unwrap();
@@ -797,6 +800,7 @@ mod tests {
                 benchmark_generation: true,
                 benchmark_config: BenchmarkConfig::default(),
                 input_source: "test".to_string(),
+                resume_from: None,
             },
         )
         .expect_err("benchmarking should require minigpt or compare");

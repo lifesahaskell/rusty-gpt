@@ -363,6 +363,9 @@ pub(crate) struct RuntimeConfig {
     pub(crate) input_path: PathBuf,
     pub(crate) input_source: InputSource,
     pub(crate) checkpoint_path: PathBuf,
+    /// Checkpoint to resume MiniGPT training from (`--resume-from`). Confined
+    /// to `checkpoints/` exactly like `--checkpoint`. `None` for a fresh run.
+    pub(crate) resume_from: Option<PathBuf>,
     pub(crate) hyperparameters: Hyperparameters,
     pub(crate) interactive: bool,
     pub(crate) benchmark_generation: bool,
@@ -384,6 +387,7 @@ pub(crate) struct RuntimeEnv {
     pub(crate) input: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) checkpoint: Option<String>,
+    pub(crate) resume_from: Option<String>,
     pub(crate) server_addr: Option<String>,
     pub(crate) max_prompt_bytes: Option<String>,
     pub(crate) max_output_tokens: Option<String>,
@@ -417,6 +421,7 @@ impl RuntimeEnv {
             input: env::var("RUSTY_GPT_INPUT").ok(),
             model: env::var("RUSTY_GPT_MODEL").ok(),
             checkpoint: env::var("RUSTY_GPT_MINIGPT_CHECKPOINT").ok(),
+            resume_from: env::var("RUSTY_GPT_RESUME_FROM").ok(),
             server_addr: env::var("RUSTY_GPT_SERVER_ADDR").ok(),
             max_prompt_bytes: env::var(MAX_PROMPT_BYTES_ENV).ok(),
             max_output_tokens: env::var(MAX_OUTPUT_TOKENS_ENV).ok(),
@@ -483,6 +488,7 @@ where
     let mut arg_input = None;
     let mut arg_model = None;
     let mut arg_checkpoint = None;
+    let mut arg_resume_from = None;
     let mut arg_server_addr = None;
     let mut arg_max_prompt_bytes = None;
     let mut arg_max_output_tokens = None;
@@ -529,6 +535,13 @@ where
                     .get(index + 1)
                     .context("--checkpoint requires a value: path to a saved .mpk checkpoint without the extension")?;
                 arg_checkpoint = Some(value.as_str());
+                index += 2;
+            }
+            "--resume-from" => {
+                let value = args
+                    .get(index + 1)
+                    .context("--resume-from requires a value: path to a saved .mpk checkpoint without the extension")?;
+                arg_resume_from = Some(value.as_str());
                 index += 2;
             }
             "--server-addr" => {
@@ -765,12 +778,36 @@ where
         None => PathBuf::from(DEFAULT_MINIGPT_CHECKPOINT_PATH),
     };
 
+    let model = parse_model_name(arg_model.or(env.model.as_deref()).unwrap_or("minigpt"))?;
+
+    // `--resume-from` is confined to `checkpoints/` exactly like `--checkpoint`,
+    // and is only meaningful for checkpoint-backed models. Today that is
+    // MiniGPT; when `moe-gpt` lands (Sprint 5) add its `ModelChoice` variant to
+    // the guard below — the resume machinery in `runtime_training` is already
+    // model-agnostic, so only this parse-time check needs widening.
+    let resume_from = match arg_resume_from.or(env.resume_from.as_deref()) {
+        Some(path) => {
+            if !matches!(model, ModelChoice::MiniGpt) {
+                bail!(
+                    "--resume-from requires --model minigpt (the only checkpoint-backed model); got --model {}",
+                    model.label()
+                );
+            }
+            Some(validate_checkpoint_path(
+                path,
+                Path::new(DEFAULT_CHECKPOINT_DIR),
+            )?)
+        }
+        None => None,
+    };
+
     Ok(RuntimeConfig {
         backend,
-        model: parse_model_name(arg_model.or(env.model.as_deref()).unwrap_or("minigpt"))?,
+        model,
         input_path,
         input_source,
         checkpoint_path,
+        resume_from,
         hyperparameters,
         interactive,
         benchmark_generation,
@@ -1420,6 +1457,71 @@ mod tests {
         assert_eq!(
             "127.0.0.1:9001".parse::<SocketAddr>().unwrap(),
             config.server_addr
+        );
+    }
+
+    #[test]
+    fn resume_from_defaults_to_none() {
+        let config = parse_args(&[]).unwrap();
+
+        assert_eq!(None, config.resume_from);
+    }
+
+    #[test]
+    fn resume_from_arg_is_confined_to_checkpoints() {
+        fs::create_dir_all(DEFAULT_CHECKPOINT_DIR).unwrap();
+        let config =
+            parse_args(&["--model", "minigpt", "--resume-from", "mini_gpt.step-4"]).unwrap();
+
+        assert!(
+            config
+                .resume_from
+                .as_ref()
+                .expect("resume_from should be set")
+                .ends_with("checkpoints/mini_gpt.step-4")
+        );
+    }
+
+    #[test]
+    fn resume_from_can_be_selected_from_env() {
+        fs::create_dir_all(DEFAULT_CHECKPOINT_DIR).unwrap();
+        let config = parse_args_with_env(
+            &[],
+            RuntimeEnv {
+                resume_from: Some("mini_gpt.step-4".to_string()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .resume_from
+                .as_ref()
+                .expect("resume_from should be set")
+                .ends_with("checkpoints/mini_gpt.step-4")
+        );
+    }
+
+    #[test]
+    fn resume_from_rejects_parent_traversal() {
+        fs::create_dir_all(DEFAULT_CHECKPOINT_DIR).unwrap();
+        let err = parse_args(&["--model", "minigpt", "--resume-from", "../secret"])
+            .expect_err("resume-from traversal should fail");
+
+        assert_checkpoint_error_contains(err);
+    }
+
+    #[test]
+    fn resume_from_rejects_non_minigpt_model_at_parse_time() {
+        // Meaningless combination: only checkpoint-backed models can resume.
+        expect_parse_error(
+            &["--model", "trivial", "--resume-from", "mini_gpt.step-4"],
+            "--resume-from requires --model minigpt",
+        );
+        expect_parse_error(
+            &["--model", "compare", "--resume-from", "mini_gpt.step-4"],
+            "--resume-from requires --model minigpt",
         );
     }
 }
