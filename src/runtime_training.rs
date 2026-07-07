@@ -116,7 +116,12 @@ where
         log_context,
     )
     .with_prefetch_batches(run.hyperparameters.prefetch_batches)
-    .with_periodic_checkpoint_interval(run.hyperparameters.checkpoint_interval);
+    .with_periodic_checkpoint_interval(run.hyperparameters.checkpoint_interval)
+    .with_lr_schedule(
+        run.hyperparameters.lr_schedule,
+        run.hyperparameters.warmup_steps,
+        run.hyperparameters.min_learning_rate,
+    );
 
     match run.model_choice {
         ModelChoice::Trivial => {

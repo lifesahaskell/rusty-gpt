@@ -115,6 +115,7 @@ pub enum RuntimeEvent {
         training_loss: f64,
         value_loss: f64,
         value_perplexity: f64,
+        learning_rate: f64,
         elapsed_ms: u128,
         tokens_per_second: f64,
         steps_per_second: f64,
@@ -244,13 +245,14 @@ impl RuntimeEvent {
                 training_loss,
                 value_loss,
                 value_perplexity,
+                learning_rate,
                 elapsed_ms,
                 tokens_per_second,
                 steps_per_second,
                 step_ms_mean,
                 ..
             } => format!(
-                "Step {step}/{total_steps}: training loss = {training_loss:.4}, value loss = {value_loss:.4}, perplexity={value_perplexity:.4}, elapsed={elapsed_ms}ms, tokens_per_second={tokens_per_second:.2}, steps_per_second={steps_per_second:.4}, step_ms_mean={step_ms_mean:.2}"
+                "Step {step}/{total_steps}: training loss = {training_loss:.4}, value loss = {value_loss:.4}, perplexity={value_perplexity:.4}, learning_rate={learning_rate:.6}, elapsed={elapsed_ms}ms, tokens_per_second={tokens_per_second:.2}, steps_per_second={steps_per_second:.4}, step_ms_mean={step_ms_mean:.2}"
             ),
             Self::TrainingCompleted {
                 backend,
@@ -373,6 +375,7 @@ mod tests {
             training_loss: 1.25,
             value_loss: 1.5,
             value_perplexity: 4.481689,
+            learning_rate: 5e-4,
             elapsed_ms: 250,
             tokens_per_second: 8192.0,
             steps_per_second: 40.0,
@@ -383,6 +386,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!("training_progress", parsed["event"]);
         assert_eq!(4.481689, parsed["value_perplexity"]);
+        assert_eq!(5e-4, parsed["learning_rate"]);
         assert_eq!(8192.0, parsed["tokens_per_second"]);
         assert_eq!(40.0, parsed["steps_per_second"]);
         assert_eq!(25.0, parsed["step_ms_mean"]);

@@ -38,7 +38,10 @@ Every CLI flag and `RUSTY_GPT_*` environment variable accepted by the
 
 | Flag | Env var | Default | Notes |
 |---|---|---|---|
-| `--learning-rate <n>` | `RUSTY_GPT_LEARNING_RATE` | `1e-4` | Optimizer learning rate. |
+| `--learning-rate <n>` | `RUSTY_GPT_LEARNING_RATE` | `1e-4` | Optimizer base learning rate. Must be > 0. |
+| `--lr-schedule <name>` | `RUSTY_GPT_LR_SCHEDULE` | `constant` | `constant` \| `cosine`. `constant` yields the base LR at every step (behaviour-neutral); `cosine` applies optional warmup then cosine decay to `--min-learning-rate`. |
+| `--warmup-steps <n>` | `RUSTY_GPT_WARMUP_STEPS` | `0` | Linear warmup length in steps. Must be `< train_steps`. `0` disables warmup. Only consulted by the `cosine` schedule. |
+| `--min-learning-rate <n>` | `RUSTY_GPT_MIN_LEARNING_RATE` | `0.0` | Cosine-decay floor. Must be `>= 0` and `<= learning_rate`. Only consulted by the `cosine` schedule. |
 | `--train-steps <n>` | `RUSTY_GPT_TRAIN_STEPS` | `1000` | Must be > 0. |
 | `--eval-interval <n>` | `RUSTY_GPT_EVAL_INTERVAL` | `100` | `0` ⇒ log only the final step. |
 | `--prefetch-batches <n>` | `RUSTY_GPT_PREFETCH_BATCHES` | `2` | Number of prepared CPU batches queued ahead of training. |

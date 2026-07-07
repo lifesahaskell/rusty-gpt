@@ -92,6 +92,9 @@ Defaults live in `src/runtime_config.rs`; validation rules in `Hyperparameters::
 | `--num-layers` | `RUSTY_GPT_NUM_LAYERS` | int, default `4`; must be > 0 |
 | `--dropout` | `RUSTY_GPT_DROPOUT` | f64, default `0.1`; must be `>= 0` and `< 1` |
 | `--learning-rate` | `RUSTY_GPT_LEARNING_RATE` | f64, default `1e-4`; must be > 0 |
+| `--lr-schedule` | `RUSTY_GPT_LR_SCHEDULE` | `constant` (default) \| `cosine`; `constant` is behaviour-neutral, `cosine` = warmup + cosine decay to `--min-learning-rate` |
+| `--warmup-steps` | `RUSTY_GPT_WARMUP_STEPS` | int, default `0`; must be `< train_steps`; only used by the `cosine` schedule |
+| `--min-learning-rate` | `RUSTY_GPT_MIN_LEARNING_RATE` | f64, default `0.0`; must be `>= 0` and `<= learning_rate`; only used by the `cosine` schedule |
 | `--train-steps` | `RUSTY_GPT_TRAIN_STEPS` | int, must be > 0 |
 | `--eval-interval` | `RUSTY_GPT_EVAL_INTERVAL` | int (0 ⇒ log only final step) |
 | `--generate-tokens` | `RUSTY_GPT_GENERATE_TOKENS` | int, must be > 0 |

@@ -10,7 +10,8 @@ pub mod training;
 
 pub use generation::GenerationOptions;
 pub use training::{
-    TrainingLogContext, TrainingLogFormat, TrainingMetrics, TrainingOutcome, TrainingParams,
+    LrSchedule, LrScheduleParseError, TrainingLogContext, TrainingLogFormat, TrainingMetrics,
+    TrainingOutcome, TrainingParams, learning_rate_at_step,
 };
 #[cfg(test)]
 use training::{TrainingThroughput, should_log_training_step, training_progress_log_line};
@@ -829,6 +830,7 @@ mod tests {
             100,
             1.25,
             2.5,
+            5e-4,
             TrainingThroughput::from_progress(11, 32, 128, 250),
         );
         let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -840,6 +842,7 @@ mod tests {
         assert_eq!(100, parsed["total_steps"]);
         assert_eq!(1.25, parsed["training_loss"]);
         assert_eq!(2.5, parsed["value_loss"]);
+        assert_eq!(5e-4, parsed["learning_rate"]);
         assert_eq!(250, parsed["elapsed_ms"]);
         assert!(parsed["tokens_per_second"].as_f64().unwrap() > 0.0);
         assert!(parsed["steps_per_second"].as_f64().unwrap() > 0.0);

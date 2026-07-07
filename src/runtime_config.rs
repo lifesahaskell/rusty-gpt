@@ -1,6 +1,7 @@
 use crate::runtime_assets::DEFAULT_CHECKPOINT_DIR;
 use anyhow::{Context, Result, bail};
 use rusty_gpt::loader::InputSource;
+use rusty_gpt::model::LrSchedule;
 use rusty_gpt::observability::LogFormat;
 use rusty_gpt::utils::{BenchmarkConfig, parse_usize_list};
 use std::env;
@@ -32,6 +33,13 @@ pub(crate) const HEAD_DIM: usize = EMBED_DIM / NUM_HEADS;
 pub(crate) const NUM_LAYERS: usize = 4;
 pub(crate) const DROPOUT: f64 = 0.1;
 pub(crate) const LEARNING_RATE: f64 = 1e-4;
+/// Linear-warmup length in steps. `0` disables warmup (behaviour-neutral).
+pub(crate) const WARMUP_STEPS: usize = 0;
+/// Default learning-rate schedule. `Constant` reproduces the historical
+/// fixed-LR behaviour regardless of warmup / min-lr settings.
+pub(crate) const LR_SCHEDULE: LrSchedule = LrSchedule::Constant;
+/// Cosine-decay floor. `0.0` by default; only consulted by the cosine schedule.
+pub(crate) const MIN_LEARNING_RATE: f64 = 0.0;
 pub(crate) const TRAIN_STEPS: usize = 1000;
 pub(crate) const EVAL_INTERVAL: usize = 100;
 pub(crate) const GENERATE_TOKENS: usize = 80;
@@ -56,6 +64,9 @@ pub(crate) struct Hyperparameters {
     pub(crate) num_layers: usize,
     pub(crate) dropout: f64,
     pub(crate) learning_rate: f64,
+    pub(crate) warmup_steps: usize,
+    pub(crate) lr_schedule: LrSchedule,
+    pub(crate) min_learning_rate: f64,
     pub(crate) train_steps: usize,
     pub(crate) eval_interval: usize,
     pub(crate) generate_tokens: usize,
@@ -76,6 +87,9 @@ impl Default for Hyperparameters {
             num_layers: NUM_LAYERS,
             dropout: DROPOUT,
             learning_rate: LEARNING_RATE,
+            warmup_steps: WARMUP_STEPS,
+            lr_schedule: LR_SCHEDULE,
+            min_learning_rate: MIN_LEARNING_RATE,
             train_steps: TRAIN_STEPS,
             eval_interval: EVAL_INTERVAL,
             generate_tokens: GENERATE_TOKENS,
@@ -136,6 +150,21 @@ impl Hyperparameters {
             "RUSTY_GPT_LEARNING_RATE",
             env.learning_rate.as_deref(),
             &mut hyperparameters.learning_rate,
+        )?;
+        apply_optional_override(
+            "RUSTY_GPT_WARMUP_STEPS",
+            env.warmup_steps.as_deref(),
+            &mut hyperparameters.warmup_steps,
+        )?;
+        apply_optional_override(
+            "RUSTY_GPT_LR_SCHEDULE",
+            env.lr_schedule.as_deref(),
+            &mut hyperparameters.lr_schedule,
+        )?;
+        apply_optional_override(
+            "RUSTY_GPT_MIN_LEARNING_RATE",
+            env.min_learning_rate.as_deref(),
+            &mut hyperparameters.min_learning_rate,
         )?;
         apply_optional_override(
             "RUSTY_GPT_TRAIN_STEPS",
@@ -203,8 +232,17 @@ impl Hyperparameters {
         if self.learning_rate <= 0.0 {
             bail!("learning_rate must be greater than zero");
         }
+        if self.min_learning_rate < 0.0 {
+            bail!("min_learning_rate must be >= 0");
+        }
+        if self.min_learning_rate > self.learning_rate {
+            bail!("min_learning_rate must be <= learning_rate");
+        }
         if self.train_steps == 0 {
             bail!("train_steps must be greater than zero");
+        }
+        if self.warmup_steps >= self.train_steps {
+            bail!("warmup_steps must be less than train_steps");
         }
         if self.generate_tokens == 0 {
             bail!("generate_tokens must be greater than zero");
@@ -232,6 +270,9 @@ struct HyperparameterOverrides {
     num_layers: Option<usize>,
     dropout: Option<f64>,
     learning_rate: Option<f64>,
+    warmup_steps: Option<usize>,
+    lr_schedule: Option<LrSchedule>,
+    min_learning_rate: Option<f64>,
     train_steps: Option<usize>,
     eval_interval: Option<usize>,
     generate_tokens: Option<usize>,
@@ -263,6 +304,15 @@ impl HyperparameterOverrides {
         }
         if let Some(value) = self.learning_rate {
             hyperparameters.learning_rate = value;
+        }
+        if let Some(value) = self.warmup_steps {
+            hyperparameters.warmup_steps = value;
+        }
+        if let Some(value) = self.lr_schedule {
+            hyperparameters.lr_schedule = value;
+        }
+        if let Some(value) = self.min_learning_rate {
+            hyperparameters.min_learning_rate = value;
         }
         if let Some(value) = self.train_steps {
             hyperparameters.train_steps = value;
@@ -401,6 +451,9 @@ pub(crate) struct RuntimeEnv {
     pub(crate) num_layers: Option<String>,
     pub(crate) dropout: Option<String>,
     pub(crate) learning_rate: Option<String>,
+    pub(crate) warmup_steps: Option<String>,
+    pub(crate) lr_schedule: Option<String>,
+    pub(crate) min_learning_rate: Option<String>,
     pub(crate) train_steps: Option<String>,
     pub(crate) eval_interval: Option<String>,
     pub(crate) generate_tokens: Option<String>,
@@ -434,6 +487,9 @@ impl RuntimeEnv {
             num_layers: env::var("RUSTY_GPT_NUM_LAYERS").ok(),
             dropout: env::var("RUSTY_GPT_DROPOUT").ok(),
             learning_rate: env::var("RUSTY_GPT_LEARNING_RATE").ok(),
+            warmup_steps: env::var("RUSTY_GPT_WARMUP_STEPS").ok(),
+            lr_schedule: env::var("RUSTY_GPT_LR_SCHEDULE").ok(),
+            min_learning_rate: env::var("RUSTY_GPT_MIN_LEARNING_RATE").ok(),
             train_steps: env::var("RUSTY_GPT_TRAIN_STEPS").ok(),
             eval_interval: env::var("RUSTY_GPT_EVAL_INTERVAL").ok(),
             generate_tokens: env::var("RUSTY_GPT_GENERATE_TOKENS").ok(),
@@ -622,6 +678,21 @@ where
             "--learning-rate" => {
                 hyperparameter_overrides.learning_rate =
                     Some(parse_arg_value(&args, index, "--learning-rate")?);
+                index += 2;
+            }
+            "--warmup-steps" => {
+                hyperparameter_overrides.warmup_steps =
+                    Some(parse_arg_value(&args, index, "--warmup-steps")?);
+                index += 2;
+            }
+            "--lr-schedule" => {
+                hyperparameter_overrides.lr_schedule =
+                    Some(parse_arg_value(&args, index, "--lr-schedule")?);
+                index += 2;
+            }
+            "--min-learning-rate" => {
+                hyperparameter_overrides.min_learning_rate =
+                    Some(parse_arg_value(&args, index, "--min-learning-rate")?);
                 index += 2;
             }
             "--train-steps" => {
@@ -1420,6 +1491,99 @@ mod tests {
         assert_eq!(
             "127.0.0.1:9001".parse::<SocketAddr>().unwrap(),
             config.server_addr
+        );
+    }
+
+    #[test]
+    fn lr_schedule_defaults_are_behaviour_neutral() {
+        let config = parse_args(&[]).unwrap();
+
+        assert_eq!(LrSchedule::Constant, config.hyperparameters.lr_schedule);
+        assert_eq!(0, config.hyperparameters.warmup_steps);
+        assert_eq!(0.0, config.hyperparameters.min_learning_rate);
+    }
+
+    #[test]
+    fn lr_schedule_can_be_selected_from_cli() {
+        let config = parse_args(&[
+            "--lr-schedule",
+            "cosine",
+            "--warmup-steps",
+            "5",
+            "--min-learning-rate",
+            "1e-5",
+        ])
+        .unwrap();
+
+        assert_eq!(LrSchedule::Cosine, config.hyperparameters.lr_schedule);
+        assert_eq!(5, config.hyperparameters.warmup_steps);
+        assert_eq!(1e-5, config.hyperparameters.min_learning_rate);
+    }
+
+    #[test]
+    fn lr_schedule_can_be_selected_from_env() {
+        let config = parse_args_with_env(
+            &[],
+            RuntimeEnv {
+                lr_schedule: Some("cosine".to_string()),
+                warmup_steps: Some("8".to_string()),
+                min_learning_rate: Some("2e-5".to_string()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(LrSchedule::Cosine, config.hyperparameters.lr_schedule);
+        assert_eq!(8, config.hyperparameters.warmup_steps);
+        assert_eq!(2e-5, config.hyperparameters.min_learning_rate);
+    }
+
+    #[test]
+    fn lr_schedule_cli_overrides_take_precedence_over_env() {
+        let config = parse_args_with_env(
+            &["--lr-schedule", "constant"],
+            RuntimeEnv {
+                lr_schedule: Some("cosine".to_string()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(LrSchedule::Constant, config.hyperparameters.lr_schedule);
+    }
+
+    #[test]
+    fn rejects_unknown_lr_schedule() {
+        // The top-level context matches the shared "invalid --<flag> value" shape;
+        // the helpful "expected constant or cosine" hint rides along in the
+        // anyhow source chain (visible via the alternate `{:#}` formatter).
+        let err =
+            parse_args(&["--lr-schedule", "linear"]).expect_err("unknown lr schedule should fail");
+        assert!(
+            err.to_string()
+                .contains("invalid --lr-schedule value: linear"),
+            "expected top-level context, got '{err}'"
+        );
+        let chained = format!("{err:#}");
+        assert!(
+            chained.contains("unsupported lr schedule 'linear'"),
+            "expected schedule hint in error chain, got '{chained}'"
+        );
+    }
+
+    #[test]
+    fn rejects_warmup_steps_not_less_than_train_steps() {
+        expect_parse_error(
+            &["--warmup-steps", "10", "--train-steps", "10"],
+            "warmup_steps must be less than train_steps",
+        );
+    }
+
+    #[test]
+    fn rejects_min_learning_rate_above_learning_rate() {
+        expect_parse_error(
+            &["--min-learning-rate", "0.1", "--learning-rate", "0.01"],
+            "min_learning_rate must be <= learning_rate",
         );
     }
 }
