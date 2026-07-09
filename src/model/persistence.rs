@@ -57,6 +57,16 @@ pub struct CheckpointMetadata {
     /// it from filenames.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval: Option<usize>,
+    /// Absolute number of training steps completed at the moment this
+    /// checkpoint was written. Recorded on *every* save — the final
+    /// end-of-run save, each periodic `.step-N` snapshot, and any interrupted
+    /// save. `--resume-from` reads this field to continue the step counter
+    /// (and with it the LR schedule and `--checkpoint-interval` numbering)
+    /// exactly where the previous run stopped. Legacy sidecars written before
+    /// this field existed deserialize to `0` via `#[serde(default)]`, keeping
+    /// old dense checkpoints loadable (they simply resume from scratch).
+    #[serde(default)]
+    pub completed_steps: usize,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -446,11 +456,16 @@ mod tests {
             interrupted_at_step: None,
             step: None,
             interval: None,
+            completed_steps: 5,
         };
 
         save_checkpoint_metadata(&path, &metadata).unwrap();
 
-        assert_eq!(Some(metadata), load_checkpoint_metadata(&path).unwrap());
+        let loaded = load_checkpoint_metadata(&path).unwrap();
+        // The sidecar round-trips `completed_steps` verbatim — this is the
+        // field `--resume-from` reads to continue the step counter.
+        assert_eq!(Some(&5), loaded.as_ref().map(|m| &m.completed_steps));
+        assert_eq!(Some(metadata), loaded);
 
         let _ = std::fs::remove_file(metadata_path);
     }
@@ -507,6 +522,7 @@ mod tests {
                 interrupted_at_step: None,
                 step: None,
                 interval: None,
+                completed_steps: 0,
             },
         )
         .unwrap();
@@ -689,6 +705,7 @@ mod tests {
             interrupted_at_step: None,
             step: None,
             interval: None,
+            completed_steps: 0,
         };
         std::fs::write(&tokenizer_path, br#"{"tokenizer":"new"}"#).unwrap();
 
@@ -751,6 +768,7 @@ mod tests {
             interrupted_at_step: None,
             step: None,
             interval: None,
+            completed_steps: 0,
         };
 
         let report = checkpoint_compatibility_report(
@@ -810,6 +828,58 @@ mod tests {
             interrupted_at_step: None,
             step: None,
             interval: None,
+            completed_steps: 0,
         }
+    }
+
+    /// INVARIANT: legacy dense sidecars written before `completed_steps`
+    /// existed must keep loading. This fixture is a verbatim pre-S3-T2
+    /// sidecar (no `completed_steps` key). `#[serde(default)]` must fill it
+    /// with `0` rather than failing deserialization, so an old checkpoint
+    /// resumes from scratch instead of refusing to load.
+    #[test]
+    fn legacy_sidecar_without_completed_steps_defaults_to_zero() {
+        let legacy_json = r#"{
+            "version": 1,
+            "created_at_utc": "2026-05-14T00:00:00Z",
+            "git_commit": "deadbee",
+            "input_source": "data/input.txt",
+            "model_shape": {
+                "vocab_size": 7,
+                "block_size": 4,
+                "embed_dim": 8,
+                "num_heads": 2,
+                "num_layers": 1
+            },
+            "tokenizer": {
+                "path": "checkpoints/tokenizer.json",
+                "sha256": "hash",
+                "vocab_size": 7
+            },
+            "training": {
+                "backend": "cpu",
+                "train_tokens": 90,
+                "value_tokens": 10,
+                "batch_size": 2,
+                "learning_rate": 0.0001,
+                "train_steps": 10,
+                "eval_interval": 0,
+                "grad_clip_norm": 1.0,
+                "prefetch_batches": 0
+            },
+            "final_metrics": {
+                "final_value_loss": 1.25,
+                "final_perplexity": 3.49
+            }
+        }"#;
+
+        let metadata: CheckpointMetadata =
+            serde_json::from_str(legacy_json).expect("legacy sidecar must still deserialize");
+
+        assert_eq!(0, metadata.completed_steps);
+        // The other optional fields also default correctly for a legacy file.
+        assert!(!metadata.interrupted);
+        assert_eq!(None, metadata.step);
+        assert_eq!(10, metadata.training.train_steps);
     }
 }

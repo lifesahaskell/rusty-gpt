@@ -2,11 +2,12 @@ use anyhow::{Context, Result, bail};
 use rusty_gpt::loader::data::DataLoader;
 use rusty_gpt::model::persistence::{
     CheckpointMetadata, CheckpointModelShape, CheckpointTokenizer, CheckpointTrainingMetrics,
-    CheckpointTrainingRun, save_checkpoint_metadata, save_model, sha256_file_hex,
+    CheckpointTrainingRun, load_checkpoint_metadata, save_checkpoint_metadata, save_model,
+    sha256_file_hex,
 };
 use rusty_gpt::model::{
-    MiniGpt, MiniGptConfig, MultiAttentionModel, SingleAttentionModel, TrainingLogContext,
-    TrainingOutcome, TrainingParams, TrivialModel,
+    MiniGpt, MultiAttentionModel, SingleAttentionModel, TrainingLogContext, TrainingOutcome,
+    TrainingParams, TrivialModel,
 };
 use rusty_gpt::observability::{EventLogger, RuntimeEvent};
 use rusty_gpt::runtime_signals::{INTERRUPTED_EXIT_CODE, install_training_signal_handler};
@@ -16,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use crate::runtime_assets::{minigpt_tokenizer_path, tokenizer_for_model};
+use crate::runtime_assets::{load_minigpt_checkpoint, minigpt_tokenizer_path, tokenizer_for_model};
 use crate::runtime_config::{Hyperparameters, ModelChoice};
 
 pub(crate) fn run_training_demo<B>(
@@ -69,6 +70,7 @@ where
             benchmark_generation: options.benchmark_generation,
             benchmark_config: options.benchmark_config.clone(),
             input_source: &options.input_source,
+            resume_from: options.resume_from.as_deref(),
         })?;
     }
 
@@ -82,6 +84,9 @@ pub(crate) struct TrainingDemoOptions {
     pub(crate) benchmark_generation: bool,
     pub(crate) benchmark_config: BenchmarkConfig,
     pub(crate) input_source: String,
+    /// Resume MiniGPT training from this checkpoint (`--resume-from`). `None`
+    /// for a fresh run. Only the MiniGPT training arm consumes it.
+    pub(crate) resume_from: Option<PathBuf>,
 }
 
 struct TrainingRun<'a, B: burn::tensor::backend::AutodiffBackend> {
@@ -97,6 +102,7 @@ struct TrainingRun<'a, B: burn::tensor::backend::AutodiffBackend> {
     benchmark_generation: bool,
     benchmark_config: BenchmarkConfig,
     input_source: &'a str,
+    resume_from: Option<&'a Path>,
 }
 
 fn train_model<B>(run: TrainingRun<'_, B>) -> Result<()>
@@ -208,18 +214,19 @@ where
                     final_perplexity: 0.0,
                 },
             )?;
-            let outcome = MiniGpt::<B>::train_with_periodic_save(
+            // Fresh run builds a template; `--resume-from` loads weights via
+            // the strict metadata loader and reports the step count to continue
+            // from. `--train-steps` is the absolute target in both cases.
+            let (initial_model, start_step) = resolve_minigpt_start_model::<B>(&run)?;
+            let train_params = params
+                .with_grad_clip_norm(run.hyperparameters.minigpt_grad_clip_norm)
+                .with_start_step(start_step);
+            let outcome = MiniGpt::<B>::train_prebuilt_with_periodic_save(
+                initial_model,
                 run.data_loader,
                 run.value_loader,
                 run.device,
-                MiniGptConfig {
-                    vocab_size: run.vocab_size,
-                    d_model: run.hyperparameters.embed_dim,
-                    num_blocks: run.hyperparameters.num_layers,
-                    max_position_embeddings: run.hyperparameters.block_size,
-                    num_heads: run.hyperparameters.num_heads,
-                },
-                params.with_grad_clip_norm(run.hyperparameters.minigpt_grad_clip_norm),
+                train_params,
                 |model, step| {
                     save_periodic_minigpt_checkpoint(
                         model,
@@ -279,6 +286,85 @@ fn log_training_completed<B>(
     });
 }
 
+/// Build the model the training loop should start from and the absolute step
+/// index it should start at.
+///
+/// - Fresh run (`--resume-from` absent): a newly-initialised [`MiniGpt`] and
+///   step `0`.
+/// - Resume (`--resume-from <checkpoint>`): weights loaded through the strict
+///   metadata loader (shape + tokenizer-hash validated, diff-style error on
+///   mismatch) and the checkpoint's recorded `completed_steps` so the loop
+///   continues from `completed_steps + 1`. Optimizer moments are *not*
+///   restored — Burn only persists module weights.
+fn resolve_minigpt_start_model<B>(run: &TrainingRun<'_, B>) -> Result<(MiniGpt<B>, usize)>
+where
+    B: burn::tensor::backend::AutodiffBackend,
+{
+    let make_template = || {
+        MiniGpt::<B>::new(
+            run.vocab_size,
+            run.hyperparameters.embed_dim,
+            run.hyperparameters.num_layers,
+            run.hyperparameters.block_size,
+            run.hyperparameters.num_heads,
+            run.device,
+        )
+    };
+
+    let Some(resume_path) = run.resume_from else {
+        return Ok((make_template(), 0));
+    };
+
+    // Burn's recorder and the metadata loaders call `with_extension("mpk")`,
+    // which corrupts paths whose stem contains a dot (e.g. `mini_gpt.step-4`).
+    // Baking `.mpk` in makes `with_extension("mpk")` a no-op and keeps the
+    // sibling `.metadata.json` sidecar path correct for periodic/interrupted
+    // snapshots too. See `step_checkpoint_path` for the same trick.
+    let load_path = resume_load_path(resume_path);
+
+    let metadata = load_checkpoint_metadata(&load_path)
+        .with_context(|| {
+            format!(
+                "failed to read resume checkpoint metadata for {:?}",
+                load_path
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot resume from {:?}: missing metadata sidecar {:?}. --resume-from needs a checkpoint written with a completed_steps sidecar (train one with this build first).",
+                load_path,
+                rusty_gpt::model::persistence::metadata_path(&load_path)
+            )
+        })?;
+
+    let completed_steps = metadata.completed_steps;
+    let target = run.hyperparameters.train_steps;
+    if completed_steps >= target {
+        bail!(
+            "nothing to resume: checkpoint {:?} already completed {completed_steps} steps, which is >= --train-steps {target}. Raise --train-steps above {completed_steps} to continue training.",
+            load_path
+        );
+    }
+
+    let model = load_minigpt_checkpoint(make_template(), &load_path, run.device, &run.logger)
+        .with_context(|| format!("failed to resume minigpt training from {:?}", load_path))?;
+
+    Ok((model, completed_steps))
+}
+
+/// Normalise a `--resume-from` checkpoint path so downstream loaders (which
+/// call `with_extension("mpk")`) resolve the real on-disk `.mpk` file even when
+/// the stem contains a dot, e.g. `mini_gpt.step-4` → `mini_gpt.step-4.mpk`.
+fn resume_load_path(resume_path: &Path) -> PathBuf {
+    if resume_path.extension().and_then(|ext| ext.to_str()) == Some("mpk") {
+        resume_path.to_path_buf()
+    } else {
+        let mut raw = resume_path.as_os_str().to_owned();
+        raw.push(".mpk");
+        PathBuf::from(raw)
+    }
+}
+
 fn save_minigpt_checkpoint<B: burn::tensor::backend::AutodiffBackend>(
     outcome: TrainingOutcome<MiniGpt<B>>,
     checkpoint_path: &Path,
@@ -305,6 +391,8 @@ fn save_minigpt_checkpoint<B: burn::tensor::backend::AutodiffBackend>(
     save_model(outcome.model, &save_path)
         .with_context(|| format!("failed to save minigpt checkpoint to {:?}", save_path))?;
     let mut metadata = checkpoint_metadata(run, outcome.metrics)?;
+    // Absolute steps completed — the value `--resume-from` reads to continue.
+    metadata.completed_steps = outcome.steps_completed;
     if outcome.interrupted {
         metadata.interrupted = true;
         metadata.interrupted_at_step = Some(outcome.steps_completed);
@@ -399,6 +487,8 @@ where
     let mut metadata = metadata_template.clone();
     metadata.step = Some(step);
     metadata.interval = Some(interval);
+    // `step` here is the absolute completed-step count for this snapshot.
+    metadata.completed_steps = step;
     save_checkpoint_metadata(&save_path, &metadata).with_context(|| {
         format!(
             "failed to save periodic checkpoint metadata for {:?}",
@@ -558,6 +648,8 @@ fn checkpoint_metadata<B: burn::tensor::backend::AutodiffBackend>(
         interrupted_at_step: None,
         step: None,
         interval: None,
+        // Overwritten at each save site with the absolute completed-step count.
+        completed_steps: 0,
     })
 }
 

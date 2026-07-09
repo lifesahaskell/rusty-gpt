@@ -42,6 +42,13 @@ pub struct TrainingParams {
     /// regardless of what it does. Only MiniGPT wires a real callback —
     /// the smaller teaching variants always pass `0` plus a no-op closure.
     pub periodic_checkpoint_interval: usize,
+    /// Absolute step index the training loop begins at. `0` for a fresh run.
+    /// On `--resume-from`, this is set to the resumed checkpoint's
+    /// `completed_steps` so the loop iterates `start_step..steps`: it performs
+    /// exactly the *remaining* steps to reach the absolute `steps` target
+    /// while keeping the step counter (and therefore the LR schedule and the
+    /// periodic `.step-N` numbering) continuous across the resume boundary.
+    pub start_step: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -78,11 +85,18 @@ impl TrainingParams {
             grad_clipping: None,
             log_context,
             periodic_checkpoint_interval: 0,
+            start_step: 0,
         }
     }
 
     pub fn with_grad_clip_norm(mut self, norm: f32) -> Self {
         self.grad_clipping = Some(GradientClippingConfig::Norm(norm));
+        self
+    }
+
+    /// Resume a run at an absolute step offset (see [`TrainingParams::start_step`]).
+    pub fn with_start_step(mut self, start_step: usize) -> Self {
+        self.start_step = start_step;
         self
     }
 
@@ -261,9 +275,17 @@ where
     let started_at = std::time::Instant::now();
     let mut final_value_loss = None;
     let mut interrupted = false;
-    let mut steps_completed = 0usize;
+    // Track the absolute number of steps completed. Seeded with `start_step`
+    // so a resumed run that is interrupted before its first new step still
+    // reports the correct absolute progress (the count it resumed from).
+    let mut steps_completed = params.start_step;
 
-    for step in 0..params.steps {
+    // Iterate the *absolute* step range. On a fresh run `start_step == 0`, so
+    // this is `0..steps` exactly as before. On resume it is
+    // `completed_steps..steps`, performing only the remaining steps while
+    // keeping `step` — and everything keyed off it (LR schedule, periodic
+    // `.step-N` cadence, the logged step index) — continuous with the prior run.
+    for step in params.start_step..params.steps {
         // Honour any SIGINT/SIGTERM received before this step starts so the
         // operator gets a clean partial-checkpoint save instead of a hard
         // abort mid-step. See `runtime_signals` for the installer.
@@ -447,7 +469,7 @@ where
     where
         F: FnMut(&Self, usize) -> Result<(), String>,
     {
-        train_language_model(
+        Self::train_prebuilt_with_periodic_save(
             MiniGpt::<B>::new(
                 config.vocab_size,
                 config.d_model,
@@ -456,6 +478,35 @@ where
                 config.num_heads,
                 device,
             ),
+            loader,
+            value_loader,
+            device,
+            params,
+            periodic_save,
+        )
+    }
+
+    /// Same as [`MiniGpt::train_with_periodic_save`] but trains an
+    /// already-constructed model instead of a fresh template. This is the
+    /// resume entry point (`--resume-from`): the caller loads checkpoint
+    /// weights via the strict metadata loader and hands the model in here,
+    /// together with [`TrainingParams::start_step`] set to the checkpoint's
+    /// `completed_steps`. Optimizer state is *not* restored — Burn's recorder
+    /// only persists module weights, so AdamW rebuilds its moments from
+    /// scratch inside `train_language_model`.
+    pub fn train_prebuilt_with_periodic_save<F>(
+        model: Self,
+        loader: &DataLoader,
+        value_loader: &DataLoader,
+        device: &B::Device,
+        params: TrainingParams,
+        periodic_save: F,
+    ) -> Result<TrainingOutcome<Self>, String>
+    where
+        F: FnMut(&Self, usize) -> Result<(), String>,
+    {
+        train_language_model(
+            model,
             loader,
             value_loader,
             device,
@@ -471,4 +522,55 @@ where
 /// has not opted in to periodic saves.
 fn no_periodic_save<M>(_model: &M, _step: usize) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::loader::data::DataLoader;
+    use burn::backend::Autodiff;
+    use burn::backend::ndarray::{NdArray, NdArrayDevice};
+    use std::cell::RefCell;
+
+    type TestBackend = Autodiff<NdArray<f32, i64>>;
+
+    #[test]
+    fn start_step_runs_only_remaining_steps_with_continuous_indices() {
+        let device = NdArrayDevice::Cpu;
+        let loader = DataLoader {
+            tokens: (0..64usize).map(|value| value % 7).collect(),
+            block_size: 4,
+            batch_size: 2,
+        };
+        let value_loader = loader.clone();
+        let periodic_steps = RefCell::new(Vec::new());
+
+        // Resume a 4-step target from step 2: only steps 2 and 3 (absolute)
+        // should run, i.e. N=2 remaining steps.
+        let params = TrainingParams::new(1e-4, 4, 0, TrainingLogContext::plain("minigpt"))
+            .with_periodic_checkpoint_interval(1)
+            .with_start_step(2);
+        let model = MiniGpt::<TestBackend>::new(7, 8, 1, 4, 2, &device);
+
+        let outcome = MiniGpt::train_prebuilt_with_periodic_save(
+            model,
+            &loader,
+            &value_loader,
+            &device,
+            params,
+            |_model, step| {
+                periodic_steps.borrow_mut().push(step);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        // Absolute completed count reaches the 4-step target, not 2+4.
+        assert_eq!(4, outcome.steps_completed);
+        assert!(!outcome.interrupted);
+        // The periodic callback fires with absolute step numbers, continuous
+        // with a prior run: step 3 fires (multiple of interval 1, non-final);
+        // step 4 is the final and is suppressed. Numbering never restarts at 0.
+        assert_eq!(vec![3], *periodic_steps.borrow());
+    }
 }

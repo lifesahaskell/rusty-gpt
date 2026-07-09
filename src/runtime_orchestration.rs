@@ -32,6 +32,9 @@ pub(crate) struct CpuDemoOptions<'a> {
     pub(crate) logger: EventLogger,
     pub(crate) checkpoint_path: &'a Path,
     pub(crate) input_source: &'a str,
+    /// `--resume-from` checkpoint (already confined to `checkpoints/`), or
+    /// `None` for a fresh run. Only used on the MiniGPT training path.
+    pub(crate) resume_from: Option<&'a Path>,
 }
 
 pub(crate) fn run_cpu_demo(
@@ -74,6 +77,7 @@ pub(crate) fn run_cpu_demo(
                 benchmark_generation: options.benchmark_generation,
                 benchmark_config: options.benchmark_config.clone(),
                 input_source: options.input_source.to_string(),
+                resume_from: options.resume_from.map(Path::to_path_buf),
             },
         )
     }
