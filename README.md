@@ -52,6 +52,9 @@ environment and a CUDA one ([details](docs/development-runbook.md#container-base
 - **Attention visualization** — `POST /api/generate` returns per-layer /
   per-head attention weights alongside the generated tokens for the React
   UI to render.
+- **Experiment knobs** — `--lr-schedule constant|warmup-cosine|warmup-linear`
+  and `--sampling-policy random-window|sequential|shuffled-chunks` support
+  roadmap ablations without patching the training loop.
 - **Hugging Face datasets** — `--input hf://owner/dataset?…` pulls text
   directly via the datasets-server rows API with caching + retry/backoff.
 - **Dev stack in one command** — `docker compose up` brings up the API +

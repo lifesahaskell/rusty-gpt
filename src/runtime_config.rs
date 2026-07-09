@@ -1,6 +1,8 @@
 use crate::runtime_assets::DEFAULT_CHECKPOINT_DIR;
 use anyhow::{Context, Result, bail};
 use rusty_gpt::loader::InputSource;
+use rusty_gpt::loader::data::SamplingPolicy;
+use rusty_gpt::model::LearningRateSchedule;
 use rusty_gpt::observability::LogFormat;
 use rusty_gpt::utils::{BenchmarkConfig, parse_usize_list};
 use std::env;
@@ -32,6 +34,7 @@ pub(crate) const HEAD_DIM: usize = EMBED_DIM / NUM_HEADS;
 pub(crate) const NUM_LAYERS: usize = 4;
 pub(crate) const DROPOUT: f64 = 0.1;
 pub(crate) const LEARNING_RATE: f64 = 1e-4;
+pub(crate) const LR_WARMUP_STEPS: usize = 0;
 pub(crate) const TRAIN_STEPS: usize = 1000;
 pub(crate) const EVAL_INTERVAL: usize = 100;
 pub(crate) const GENERATE_TOKENS: usize = 80;
@@ -56,6 +59,9 @@ pub(crate) struct Hyperparameters {
     pub(crate) num_layers: usize,
     pub(crate) dropout: f64,
     pub(crate) learning_rate: f64,
+    pub(crate) learning_rate_schedule: LearningRateSchedule,
+    pub(crate) lr_warmup_steps: usize,
+    pub(crate) sampling_policy: SamplingPolicy,
     pub(crate) train_steps: usize,
     pub(crate) eval_interval: usize,
     pub(crate) generate_tokens: usize,
@@ -76,6 +82,9 @@ impl Default for Hyperparameters {
             num_layers: NUM_LAYERS,
             dropout: DROPOUT,
             learning_rate: LEARNING_RATE,
+            learning_rate_schedule: LearningRateSchedule::Constant,
+            lr_warmup_steps: LR_WARMUP_STEPS,
+            sampling_policy: SamplingPolicy::RandomWindow,
             train_steps: TRAIN_STEPS,
             eval_interval: EVAL_INTERVAL,
             generate_tokens: GENERATE_TOKENS,
@@ -137,6 +146,17 @@ impl Hyperparameters {
             env.learning_rate.as_deref(),
             &mut hyperparameters.learning_rate,
         )?;
+        if let Some(value) = env.learning_rate_schedule.as_deref() {
+            hyperparameters.learning_rate_schedule = parse_lr_schedule(value)?;
+        }
+        apply_optional_override(
+            "RUSTY_GPT_LR_WARMUP_STEPS",
+            env.lr_warmup_steps.as_deref(),
+            &mut hyperparameters.lr_warmup_steps,
+        )?;
+        if let Some(value) = env.sampling_policy.as_deref() {
+            hyperparameters.sampling_policy = parse_sampling_policy(value)?;
+        }
         apply_optional_override(
             "RUSTY_GPT_TRAIN_STEPS",
             env.train_steps.as_deref(),
@@ -206,6 +226,9 @@ impl Hyperparameters {
         if self.train_steps == 0 {
             bail!("train_steps must be greater than zero");
         }
+        if self.lr_warmup_steps > self.train_steps {
+            bail!("lr_warmup_steps must be <= train_steps");
+        }
         if self.generate_tokens == 0 {
             bail!("generate_tokens must be greater than zero");
         }
@@ -232,6 +255,9 @@ struct HyperparameterOverrides {
     num_layers: Option<usize>,
     dropout: Option<f64>,
     learning_rate: Option<f64>,
+    learning_rate_schedule: Option<LearningRateSchedule>,
+    lr_warmup_steps: Option<usize>,
+    sampling_policy: Option<SamplingPolicy>,
     train_steps: Option<usize>,
     eval_interval: Option<usize>,
     generate_tokens: Option<usize>,
@@ -263,6 +289,15 @@ impl HyperparameterOverrides {
         }
         if let Some(value) = self.learning_rate {
             hyperparameters.learning_rate = value;
+        }
+        if let Some(value) = self.learning_rate_schedule {
+            hyperparameters.learning_rate_schedule = value;
+        }
+        if let Some(value) = self.lr_warmup_steps {
+            hyperparameters.lr_warmup_steps = value;
+        }
+        if let Some(value) = self.sampling_policy {
+            hyperparameters.sampling_policy = value;
         }
         if let Some(value) = self.train_steps {
             hyperparameters.train_steps = value;
@@ -405,6 +440,9 @@ pub(crate) struct RuntimeEnv {
     pub(crate) num_layers: Option<String>,
     pub(crate) dropout: Option<String>,
     pub(crate) learning_rate: Option<String>,
+    pub(crate) learning_rate_schedule: Option<String>,
+    pub(crate) lr_warmup_steps: Option<String>,
+    pub(crate) sampling_policy: Option<String>,
     pub(crate) train_steps: Option<String>,
     pub(crate) eval_interval: Option<String>,
     pub(crate) generate_tokens: Option<String>,
@@ -439,6 +477,9 @@ impl RuntimeEnv {
             num_layers: env::var("RUSTY_GPT_NUM_LAYERS").ok(),
             dropout: env::var("RUSTY_GPT_DROPOUT").ok(),
             learning_rate: env::var("RUSTY_GPT_LEARNING_RATE").ok(),
+            learning_rate_schedule: env::var("RUSTY_GPT_LR_SCHEDULE").ok(),
+            lr_warmup_steps: env::var("RUSTY_GPT_LR_WARMUP_STEPS").ok(),
+            sampling_policy: env::var("RUSTY_GPT_SAMPLING_POLICY").ok(),
             train_steps: env::var("RUSTY_GPT_TRAIN_STEPS").ok(),
             eval_interval: env::var("RUSTY_GPT_EVAL_INTERVAL").ok(),
             generate_tokens: env::var("RUSTY_GPT_GENERATE_TOKENS").ok(),
@@ -635,6 +676,25 @@ where
             "--learning-rate" => {
                 hyperparameter_overrides.learning_rate =
                     Some(parse_arg_value(&args, index, "--learning-rate")?);
+                index += 2;
+            }
+            "--lr-schedule" => {
+                let value = args.get(index + 1).context(
+                    "--lr-schedule requires a value: constant, warmup-cosine, or warmup-linear",
+                )?;
+                hyperparameter_overrides.learning_rate_schedule = Some(parse_lr_schedule(value)?);
+                index += 2;
+            }
+            "--lr-warmup-steps" => {
+                hyperparameter_overrides.lr_warmup_steps =
+                    Some(parse_arg_value(&args, index, "--lr-warmup-steps")?);
+                index += 2;
+            }
+            "--sampling-policy" => {
+                let value = args.get(index + 1).context(
+                    "--sampling-policy requires a value: random-window, sequential, or shuffled-chunks",
+                )?;
+                hyperparameter_overrides.sampling_policy = Some(parse_sampling_policy(value)?);
                 index += 2;
             }
             "--train-steps" => {
@@ -940,6 +1000,28 @@ fn parse_model_name(name: &str) -> Result<ModelChoice> {
     }
 }
 
+fn parse_lr_schedule(value: &str) -> Result<LearningRateSchedule> {
+    match value {
+        "constant" => Ok(LearningRateSchedule::Constant),
+        "warmup-cosine" => Ok(LearningRateSchedule::WarmupCosine),
+        "warmup-linear" => Ok(LearningRateSchedule::WarmupLinear),
+        other => bail!(
+            "unsupported lr schedule '{other}'; expected constant, warmup-cosine, or warmup-linear"
+        ),
+    }
+}
+
+fn parse_sampling_policy(value: &str) -> Result<SamplingPolicy> {
+    match value {
+        "random-window" => Ok(SamplingPolicy::RandomWindow),
+        "sequential" => Ok(SamplingPolicy::Sequential),
+        "shuffled-chunks" => Ok(SamplingPolicy::ShuffledChunks),
+        other => bail!(
+            "unsupported sampling policy '{other}'; expected random-window, sequential, or shuffled-chunks"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1132,6 +1214,10 @@ mod tests {
                 "train_steps must be greater than zero",
             ),
             (
+                &["--train-steps", "10", "--lr-warmup-steps", "11"][..],
+                "lr_warmup_steps must be <= train_steps",
+            ),
+            (
                 &["--generate-tokens", "0"][..],
                 "generate_tokens must be greater than zero",
             ),
@@ -1160,7 +1246,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_hyperparameter_invariants_from_env() {
-        let cases: [EnvInvariantCase; 9] = [
+        let cases: [EnvInvariantCase; 10] = [
             (
                 "block_size",
                 |env| env.block_size = Some("0".to_string()),
@@ -1195,6 +1281,14 @@ mod tests {
                 "generate_tokens",
                 |env| env.generate_tokens = Some("0".to_string()),
                 "generate_tokens must be greater than zero",
+            ),
+            (
+                "lr_warmup_steps",
+                |env| {
+                    env.train_steps = Some("10".to_string());
+                    env.lr_warmup_steps = Some("11".to_string());
+                },
+                "lr_warmup_steps must be <= train_steps",
             ),
             (
                 "dropout",
@@ -1253,6 +1347,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_experiment_runtime_flags() {
+        let config = parse_args(&[
+            "--lr-schedule",
+            "warmup-cosine",
+            "--lr-warmup-steps",
+            "5",
+            "--sampling-policy",
+            "shuffled-chunks",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            LearningRateSchedule::WarmupCosine,
+            config.hyperparameters.learning_rate_schedule
+        );
+        assert_eq!(5, config.hyperparameters.lr_warmup_steps);
+        assert_eq!(
+            SamplingPolicy::ShuffledChunks,
+            config.hyperparameters.sampling_policy
+        );
+    }
+
+    #[test]
     fn rejects_missing_parser_owned_flag_values() {
         let cases = [
             (&["--server-addr"][..], "--server-addr requires a value"),
@@ -1276,6 +1393,11 @@ mod tests {
             (&["--block-size"][..], "--block-size requires a value"),
             (&["--dropout"][..], "--dropout requires a value"),
             (&["--learning-rate"][..], "--learning-rate requires a value"),
+            (&["--lr-schedule"][..], "--lr-schedule requires a value"),
+            (
+                &["--sampling-policy"][..],
+                "--sampling-policy requires a value",
+            ),
         ];
 
         for (args, expected) in cases {
@@ -1322,6 +1444,14 @@ mod tests {
             (
                 &["--dropout", "often"][..],
                 "invalid --dropout value: often",
+            ),
+            (
+                &["--lr-schedule", "banana"][..],
+                "unsupported lr schedule 'banana'",
+            ),
+            (
+                &["--sampling-policy", "banana"][..],
+                "unsupported sampling policy 'banana'",
             ),
         ];
 

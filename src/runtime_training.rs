@@ -122,6 +122,11 @@ where
         log_context,
     )
     .with_prefetch_batches(run.hyperparameters.prefetch_batches)
+    .with_learning_rate_schedule(
+        run.hyperparameters.learning_rate_schedule,
+        run.hyperparameters.lr_warmup_steps,
+    )
+    .with_sampling_policy(run.hyperparameters.sampling_policy)
     .with_periodic_checkpoint_interval(run.hyperparameters.checkpoint_interval);
 
     match run.model_choice {

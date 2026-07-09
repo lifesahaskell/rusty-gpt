@@ -439,6 +439,7 @@ mod tests {
             prefetch_batches: 2,
             checkpoint_interval: 0,
             checkpoint_keep: 3,
+            ..Hyperparameters::default()
         };
         let text = "abcdefghijklmnopqrstuvwxyz ".repeat(8);
 
@@ -786,6 +787,7 @@ mod tests {
             prefetch_batches: 0,
             checkpoint_interval: 0,
             checkpoint_keep: 3,
+            ..Hyperparameters::default()
         };
 
         let err = run_training_demo::<TestBackend>(

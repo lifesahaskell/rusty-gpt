@@ -91,7 +91,10 @@ Defaults live in `src/runtime_config.rs`; validation rules in `Hyperparameters::
 | `--num-heads` | `RUSTY_GPT_NUM_HEADS` | int, default `4`; must be > 0 |
 | `--num-layers` | `RUSTY_GPT_NUM_LAYERS` | int, default `4`; must be > 0 |
 | `--dropout` | `RUSTY_GPT_DROPOUT` | f64, default `0.1`; must be `>= 0` and `< 1` |
-| `--learning-rate` | `RUSTY_GPT_LEARNING_RATE` | f64, default `1e-4`; must be > 0 |
+| `--learning-rate` | `RUSTY_GPT_LEARNING_RATE` | f64, default `1e-4`; base LR, must be > 0 |
+| `--lr-schedule` | `RUSTY_GPT_LR_SCHEDULE` | `constant` \| `warmup-cosine` \| `warmup-linear` |
+| `--lr-warmup-steps` | `RUSTY_GPT_LR_WARMUP_STEPS` | int, default `0`; must be `<= train_steps` |
+| `--sampling-policy` | `RUSTY_GPT_SAMPLING_POLICY` | `random-window` \| `sequential` \| `shuffled-chunks` |
 | `--train-steps` | `RUSTY_GPT_TRAIN_STEPS` | int, must be > 0 |
 | `--eval-interval` | `RUSTY_GPT_EVAL_INTERVAL` | int (0 ⇒ log only final step) |
 | `--generate-tokens` | `RUSTY_GPT_GENERATE_TOKENS` | int, must be > 0 |
@@ -122,7 +125,7 @@ src/
     char.rs                     deterministic char-level tokenizer (sorted-unique chars ⇒ id)
     bpe.rs                      BPE tokenizer + `BpeTrainer`; loads/saves JSON
   loader/
-    mod.rs / data.rs            random-window batch sampler producing (x, y) shifted by 1; `BatchPrefetcher` for CPU prefetch
+    mod.rs / data.rs            batch sampler producing (x, y) shifted by 1; supports random-window, sequential, and shuffled-chunks policies; `BatchPrefetcher` for CPU prefetch
     input_source.rs             strict `InputSource::parse` for `--input`/`--corpus` (local path vs `hf://org/dataset[@rev]`); purely syntactic — no I/O. `validate_local_size` enforces `DEFAULT_MAX_LOCAL_INPUT_BYTES = 1 GiB` via `fs::metadata` only. Every consumer must branch on the parsed enum, not re-parse the raw string.
     huggingface.rs              fetches `hf://dataset?config=…&split=…` URIs via the HF datasets-server API; caches under `data/huggingface-cache/`
   model/

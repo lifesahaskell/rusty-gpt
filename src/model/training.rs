@@ -5,7 +5,7 @@ use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Int, Tensor};
 
-use crate::loader::data::{BatchPrefetcher, DataLoader, TokenBatch};
+use crate::loader::data::{BatchPrefetcher, DataLoader, SamplingPolicy, TokenBatch};
 use crate::observability::{EventLogger, LogFormat, RuntimeEvent};
 
 use super::{MiniGpt, MiniGptConfig, MultiAttentionModel, SingleAttentionModel, TrivialModel};
@@ -29,9 +29,42 @@ impl TrainingLogContext {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LearningRateSchedule {
+    Constant,
+    WarmupCosine,
+    WarmupLinear,
+}
+
+impl LearningRateSchedule {
+    fn rate(self, base_rate: f64, step: usize, total_steps: usize, warmup_steps: usize) -> f64 {
+        let step = step + 1;
+        if warmup_steps > 0 && step <= warmup_steps {
+            return base_rate * step as f64 / warmup_steps as f64;
+        }
+
+        match self {
+            Self::Constant => base_rate,
+            Self::WarmupCosine => {
+                let decay_steps = total_steps.saturating_sub(warmup_steps).max(1);
+                let progress = step.saturating_sub(warmup_steps) as f64 / decay_steps as f64;
+                base_rate * 0.5 * (1.0 + (std::f64::consts::PI * progress.min(1.0)).cos())
+            }
+            Self::WarmupLinear => {
+                let decay_steps = total_steps.saturating_sub(warmup_steps).max(1);
+                let progress = step.saturating_sub(warmup_steps) as f64 / decay_steps as f64;
+                base_rate * (1.0 - progress.min(1.0))
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TrainingParams {
     pub learning_rate: f64,
+    pub learning_rate_schedule: LearningRateSchedule,
+    pub lr_warmup_steps: usize,
+    pub sampling_policy: SamplingPolicy,
     pub steps: usize,
     pub eval_interval: usize,
     pub prefetch_batches: usize,
@@ -79,6 +112,9 @@ impl TrainingParams {
     ) -> Self {
         Self {
             learning_rate,
+            learning_rate_schedule: LearningRateSchedule::Constant,
+            lr_warmup_steps: 0,
+            sampling_policy: SamplingPolicy::RandomWindow,
             steps,
             eval_interval,
             prefetch_batches: 0,
@@ -102,6 +138,21 @@ impl TrainingParams {
 
     pub fn with_prefetch_batches(mut self, batches: usize) -> Self {
         self.prefetch_batches = batches;
+        self
+    }
+
+    pub fn with_learning_rate_schedule(
+        mut self,
+        schedule: LearningRateSchedule,
+        warmup_steps: usize,
+    ) -> Self {
+        self.learning_rate_schedule = schedule;
+        self.lr_warmup_steps = warmup_steps;
+        self
+    }
+
+    pub fn with_sampling_policy(mut self, policy: SamplingPolicy) -> Self {
+        self.sampling_policy = policy;
         self
     }
 
@@ -214,6 +265,7 @@ fn log_training_progress(
     training_loss: f64,
     value_loss: f64,
     throughput: TrainingThroughput,
+    learning_rate: f64,
 ) {
     context.logger.log(RuntimeEvent::TrainingProgress {
         backend: context.backend.to_string(),
@@ -227,6 +279,7 @@ fn log_training_progress(
         tokens_per_second: throughput.tokens_per_second,
         steps_per_second: throughput.steps_per_second,
         step_ms_mean: throughput.step_ms_mean,
+        learning_rate,
     });
 }
 
@@ -236,17 +289,28 @@ enum TrainingBatchSource<'a> {
 }
 
 impl<'a> TrainingBatchSource<'a> {
-    fn new(loader: &'a DataLoader, prefetch_batches: usize) -> Self {
+    fn new(loader: &'a DataLoader, prefetch_batches: usize, policy: SamplingPolicy) -> Self {
         if prefetch_batches == 0 {
             Self::Direct(loader)
         } else {
-            Self::Prefetch(BatchPrefetcher::new(loader.clone(), prefetch_batches))
+            Self::Prefetch(BatchPrefetcher::new_with_policy(
+                loader.clone(),
+                prefetch_batches,
+                policy,
+            ))
         }
     }
 
-    fn next_batch<B: Backend>(&self, device: &B::Device) -> Result<TokenBatch<B>, String> {
+    fn next_batch<B: Backend>(
+        &self,
+        device: &B::Device,
+        policy: SamplingPolicy,
+        step: usize,
+    ) -> Result<TokenBatch<B>, String> {
         match self {
-            Self::Direct(loader) => loader.next_batch(device),
+            Self::Direct(loader) => loader
+                .next_raw_batch_with_policy(policy, step)
+                .map(|batch| batch.into_tensors::<B>(device)),
             Self::Prefetch(prefetcher) => prefetcher.next_batch(device),
         }
     }
@@ -267,7 +331,8 @@ where
     B::FloatElem: Into<f64>,
     F: FnMut(&M, usize) -> Result<(), String>,
 {
-    let training_batches = TrainingBatchSource::new(loader, params.prefetch_batches);
+    let training_batches =
+        TrainingBatchSource::new(loader, params.prefetch_batches, params.sampling_policy);
     let mut optimizer = AdamWConfig::new()
         .with_grad_clipping(params.grad_clipping)
         .init();
@@ -294,12 +359,19 @@ where
             break;
         }
 
-        let (inputs, targets) = training_batches.next_batch::<B>(device)?;
+        let (inputs, targets) =
+            training_batches.next_batch::<B>(device, params.sampling_policy, step)?;
         let loss = language_model_loss(&loss_fn, forward(&model, inputs), targets);
+        let learning_rate = params.learning_rate_schedule.rate(
+            params.learning_rate,
+            step,
+            params.steps,
+            params.lr_warmup_steps,
+        );
 
         let grads = loss.backward();
         let grads = GradientsParams::from_grads(grads, &model);
-        model = optimizer.step(params.learning_rate, model, grads);
+        model = optimizer.step(learning_rate, model, grads);
         steps_completed = step + 1;
 
         // Periodic checkpoint cadence is orthogonal to `eval_interval` —
@@ -332,6 +404,7 @@ where
                 training_loss,
                 value_loss,
                 throughput,
+                learning_rate,
             );
         }
     }

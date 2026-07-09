@@ -26,6 +26,7 @@ Options:
   --benchmark-warmups n                  Warmup iterations per benchmark case
   --benchmark-iterations n               Measured iterations per benchmark case
   --artifacts-dir path                   Save run manifest and combined training/benchmark log
+  --                                    Pass remaining args through to rusty-gpt
   -h, --help                             Show this help
 
 Deprecated environment overrides (still honored, but emit a warning — use the flag instead):
@@ -71,11 +72,17 @@ EVAL_INTERVAL_ARG=""
 PREFETCH_BATCHES_ARG=""
 LOG_FORMAT_ARG=""
 BENCHMARK_ARGS=()
+PASSTHROUGH_ARGS=()
 ARTIFACTS_DIR_ARG=""
 TRAINING_FILE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --)
+      shift
+      PASSTHROUGH_ARGS+=("$@")
+      break
+      ;;
     --backend)
       require_value "$1" "$#"
       BACKEND_ARG="$2"
@@ -324,6 +331,7 @@ train_tokenizer=$TRAIN_TOKENIZER
 tokenizer_vocab_size=$TOKENIZER_VOCAB_SIZE
 training_tuning_args=${TRAINING_TUNING_ARGS[*]-}
 benchmark_args=${BENCHMARK_ARGS[*]-}
+passthrough_args=${PASSTHROUGH_ARGS[*]-}
 log_format_args=${LOG_FORMAT_ARGS[*]-}
 MANIFEST
 fi
@@ -359,4 +367,5 @@ run_logged "train and evaluate" cargo run "${CARGO_PROFILE_ARGS[@]}" "${CARGO_FE
   "${TRAINING_BACKEND_ARGS[@]}" \
   "${TRAINING_TUNING_ARGS[@]}" \
   "${LOG_FORMAT_ARGS[@]}" \
-  "${BENCHMARK_ARGS[@]}"
+  "${BENCHMARK_ARGS[@]}" \
+  "${PASSTHROUGH_ARGS[@]}"

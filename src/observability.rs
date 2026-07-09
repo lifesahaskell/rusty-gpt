@@ -119,6 +119,7 @@ pub enum RuntimeEvent {
         tokens_per_second: f64,
         steps_per_second: f64,
         step_ms_mean: f64,
+        learning_rate: f64,
     },
     TrainingCompleted {
         backend: String,
@@ -248,9 +249,10 @@ impl RuntimeEvent {
                 tokens_per_second,
                 steps_per_second,
                 step_ms_mean,
+                learning_rate,
                 ..
             } => format!(
-                "Step {step}/{total_steps}: training loss = {training_loss:.4}, value loss = {value_loss:.4}, perplexity={value_perplexity:.4}, elapsed={elapsed_ms}ms, tokens_per_second={tokens_per_second:.2}, steps_per_second={steps_per_second:.4}, step_ms_mean={step_ms_mean:.2}"
+                "Step {step}/{total_steps}: training loss = {training_loss:.4}, value loss = {value_loss:.4}, perplexity={value_perplexity:.4}, learning_rate={learning_rate:.6}, elapsed={elapsed_ms}ms, tokens_per_second={tokens_per_second:.2}, steps_per_second={steps_per_second:.4}, step_ms_mean={step_ms_mean:.2}"
             ),
             Self::TrainingCompleted {
                 backend,
@@ -377,6 +379,7 @@ mod tests {
             tokens_per_second: 8192.0,
             steps_per_second: 40.0,
             step_ms_mean: 25.0,
+            learning_rate: 1e-4,
         });
 
         let lines = lines.lock().unwrap();
@@ -386,5 +389,6 @@ mod tests {
         assert_eq!(8192.0, parsed["tokens_per_second"]);
         assert_eq!(40.0, parsed["steps_per_second"]);
         assert_eq!(25.0, parsed["step_ms_mean"]);
+        assert_eq!(1e-4, parsed["learning_rate"]);
     }
 }

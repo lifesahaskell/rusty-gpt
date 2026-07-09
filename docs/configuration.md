@@ -38,7 +38,10 @@ Every CLI flag and `RUSTY_GPT_*` environment variable accepted by the
 
 | Flag | Env var | Default | Notes |
 |---|---|---|---|
-| `--learning-rate <n>` | `RUSTY_GPT_LEARNING_RATE` | `1e-4` | Optimizer learning rate. |
+| `--learning-rate <n>` | `RUSTY_GPT_LEARNING_RATE` | `1e-4` | Base optimizer learning rate. |
+| `--lr-schedule constant\|warmup-cosine\|warmup-linear` | `RUSTY_GPT_LR_SCHEDULE` | `constant` | Learning-rate schedule used by training experiments. |
+| `--lr-warmup-steps <n>` | `RUSTY_GPT_LR_WARMUP_STEPS` | `0` | Linear warmup length; must be `<= train_steps`. |
+| `--sampling-policy random-window\|sequential\|shuffled-chunks` | `RUSTY_GPT_SAMPLING_POLICY` | `random-window` | Batch-window sampling strategy. |
 | `--train-steps <n>` | `RUSTY_GPT_TRAIN_STEPS` | `1000` | Must be > 0. |
 | `--eval-interval <n>` | `RUSTY_GPT_EVAL_INTERVAL` | `100` | `0` ⇒ log only the final step. |
 | `--prefetch-batches <n>` | `RUSTY_GPT_PREFETCH_BATCHES` | `2` | Number of prepared CPU batches queued ahead of training. |

@@ -12,7 +12,8 @@ pub mod training;
 pub use generation::GenerationOptions;
 pub use moe::{MoeFeedForward, MoeForwardAux, Router, RouterOutput, load_balancing_loss};
 pub use training::{
-    TrainingLogContext, TrainingLogFormat, TrainingMetrics, TrainingOutcome, TrainingParams,
+    LearningRateSchedule, TrainingLogContext, TrainingLogFormat, TrainingMetrics, TrainingOutcome,
+    TrainingParams,
 };
 #[cfg(test)]
 use training::{TrainingThroughput, should_log_training_step, training_progress_log_line};

@@ -21,6 +21,13 @@ impl RawTokenBatch {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamplingPolicy {
+    RandomWindow,
+    Sequential,
+    ShuffledChunks,
+}
+
 #[derive(Clone)]
 pub struct DataLoader {
     pub tokens: Vec<usize>,
@@ -35,6 +42,14 @@ impl DataLoader {
     }
 
     pub fn next_raw_batch(&self) -> Result<RawTokenBatch, String> {
+        self.next_raw_batch_with_policy(SamplingPolicy::RandomWindow, 0)
+    }
+
+    pub fn next_raw_batch_with_policy(
+        &self,
+        policy: SamplingPolicy,
+        step: usize,
+    ) -> Result<RawTokenBatch, String> {
         if self.tokens.len() <= self.block_size {
             return Err(format!(
                 "not enough tokens to build a batch: got {}, need at least {}",
@@ -46,8 +61,20 @@ impl DataLoader {
         let mut x: Vec<i64> = Vec::with_capacity(self.batch_size * self.block_size);
         let mut y: Vec<i64> = Vec::with_capacity(self.batch_size * self.block_size);
         let max_start = self.tokens.len() - self.block_size;
-        for _ in 0..self.batch_size {
-            let start = rand::random_range(0..max_start);
+        for item in 0..self.batch_size {
+            let start = match policy {
+                SamplingPolicy::RandomWindow => rand::random_range(0..max_start),
+                SamplingPolicy::Sequential => {
+                    ((step * self.batch_size + item) * self.block_size) % max_start
+                }
+                SamplingPolicy::ShuffledChunks => {
+                    // ponytail: cheap deterministic shuffle; replace with seeded epoch shuffle if this becomes production data loading.
+                    (step * self.batch_size + item)
+                        .wrapping_mul(1_103_515_245)
+                        .wrapping_add(12_345)
+                        % max_start
+                }
+            };
             x.extend(
                 self.tokens[start..start + self.block_size]
                     .iter()
@@ -75,13 +102,22 @@ pub struct BatchPrefetcher {
 
 impl BatchPrefetcher {
     pub fn new(loader: DataLoader, depth: usize) -> Self {
+        Self::new_with_policy(loader, depth, SamplingPolicy::RandomWindow)
+    }
+
+    pub fn new_with_policy(loader: DataLoader, depth: usize, policy: SamplingPolicy) -> Self {
         let depth = depth.max(1);
         let (sender, receiver) = sync_channel(depth);
         let worker = std::thread::spawn(move || {
+            let mut step = 0usize;
             loop {
-                if sender.send(loader.next_raw_batch()).is_err() {
+                if sender
+                    .send(loader.next_raw_batch_with_policy(policy, step))
+                    .is_err()
+                {
                     break;
                 }
+                step += 1;
             }
         });
 
@@ -151,6 +187,43 @@ mod tests {
             .expect_err("short token stream should fail");
 
         assert!(err.contains("not enough tokens"));
+    }
+
+    #[test]
+    fn sequential_policy_advances_by_step() {
+        let loader = DataLoader {
+            tokens: (0..20).collect(),
+            block_size: 2,
+            batch_size: 2,
+        };
+
+        let first = loader
+            .next_raw_batch_with_policy(SamplingPolicy::Sequential, 0)
+            .unwrap();
+        let second = loader
+            .next_raw_batch_with_policy(SamplingPolicy::Sequential, 1)
+            .unwrap();
+
+        assert_eq!(vec![0, 1, 2, 3], first.inputs);
+        assert_eq!(vec![4, 5, 6, 7], second.inputs);
+    }
+
+    #[test]
+    fn shuffled_chunks_policy_is_deterministic_for_step() {
+        let loader = DataLoader {
+            tokens: (0..20).collect(),
+            block_size: 2,
+            batch_size: 2,
+        };
+
+        let first = loader
+            .next_raw_batch_with_policy(SamplingPolicy::ShuffledChunks, 3)
+            .unwrap();
+        let second = loader
+            .next_raw_batch_with_policy(SamplingPolicy::ShuffledChunks, 3)
+            .unwrap();
+
+        assert_eq!(first.inputs, second.inputs);
     }
 
     #[test]
