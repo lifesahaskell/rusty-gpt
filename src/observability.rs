@@ -120,6 +120,8 @@ pub enum RuntimeEvent {
         steps_per_second: f64,
         step_ms_mean: f64,
         learning_rate: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aux_loss: Option<f64>,
     },
     TrainingCompleted {
         backend: String,
@@ -250,10 +252,16 @@ impl RuntimeEvent {
                 steps_per_second,
                 step_ms_mean,
                 learning_rate,
+                aux_loss,
                 ..
-            } => format!(
-                "Step {step}/{total_steps}: training loss = {training_loss:.4}, value loss = {value_loss:.4}, perplexity={value_perplexity:.4}, learning_rate={learning_rate:.6}, elapsed={elapsed_ms}ms, tokens_per_second={tokens_per_second:.2}, steps_per_second={steps_per_second:.4}, step_ms_mean={step_ms_mean:.2}"
-            ),
+            } => {
+                let aux = aux_loss
+                    .map(|loss| format!(", aux_loss={loss:.4}"))
+                    .unwrap_or_default();
+                format!(
+                    "Step {step}/{total_steps}: training loss = {training_loss:.4}, value loss = {value_loss:.4}, perplexity={value_perplexity:.4}, learning_rate={learning_rate:.6}{aux}, elapsed={elapsed_ms}ms, tokens_per_second={tokens_per_second:.2}, steps_per_second={steps_per_second:.4}, step_ms_mean={step_ms_mean:.2}"
+                )
+            }
             Self::TrainingCompleted {
                 backend,
                 model,
@@ -268,7 +276,7 @@ impl RuntimeEvent {
                 format!("Loaded minigpt checkpoint from {path} in {elapsed_ms}ms")
             }
             Self::CheckpointSaved { path, elapsed_ms } => {
-                format!("Saved minigpt checkpoint to {path} in {elapsed_ms}ms")
+                format!("Saved checkpoint to {path} in {elapsed_ms}ms")
             }
             Self::GenerateRequestAccepted {
                 max_tokens,
@@ -380,6 +388,7 @@ mod tests {
             steps_per_second: 40.0,
             step_ms_mean: 25.0,
             learning_rate: 1e-4,
+            aux_loss: None,
         });
 
         let lines = lines.lock().unwrap();

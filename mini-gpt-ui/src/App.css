@@ -459,6 +459,64 @@
   color: var(--text);
 }
 
+.routing-panel {
+  display: grid;
+  gap: 12px;
+  margin-top: 22px;
+}
+
+.routing-panel h3,
+.routing-layer h4 {
+  margin: 0;
+}
+
+.routing-layers {
+  display: grid;
+  gap: 14px;
+}
+
+.routing-layer {
+  display: grid;
+  gap: 8px;
+}
+
+.routing-grid {
+  display: grid;
+  gap: 6px;
+}
+
+.routing-token {
+  display: grid;
+  grid-template-columns: minmax(40px, 92px) 1fr;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.routing-token-label {
+  overflow: hidden;
+  color: var(--text);
+  font: 600 12px/1.2 var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.routing-experts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.routing-expert {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  min-height: 24px;
+  border-radius: 6px;
+  color: white;
+  font: 700 12px/1 var(--mono);
+}
+
 .empty-state {
   display: grid;
   gap: 10px;

@@ -39,6 +39,9 @@ pub(crate) const TRAIN_STEPS: usize = 1000;
 pub(crate) const EVAL_INTERVAL: usize = 100;
 pub(crate) const GENERATE_TOKENS: usize = 80;
 pub(crate) const MINIGPT_GRAD_CLIP_NORM: f32 = 1.0;
+pub(crate) const MOE_EXPERTS: usize = 4;
+pub(crate) const MOE_TOP_K: usize = 2;
+pub(crate) const MOE_AUX_LOSS_WEIGHT: f64 = 0.01;
 pub(crate) const PREFETCH_BATCHES: usize = 2;
 /// Default cadence (in training steps) for mid-run MiniGPT checkpoints.
 /// `0` disables periodic saves, preserving the historical behaviour of
@@ -66,6 +69,9 @@ pub(crate) struct Hyperparameters {
     pub(crate) eval_interval: usize,
     pub(crate) generate_tokens: usize,
     pub(crate) minigpt_grad_clip_norm: f32,
+    pub(crate) moe_experts: usize,
+    pub(crate) moe_top_k: usize,
+    pub(crate) moe_aux_loss_weight: f64,
     pub(crate) prefetch_batches: usize,
     pub(crate) checkpoint_interval: usize,
     pub(crate) checkpoint_keep: usize,
@@ -89,6 +95,9 @@ impl Default for Hyperparameters {
             eval_interval: EVAL_INTERVAL,
             generate_tokens: GENERATE_TOKENS,
             minigpt_grad_clip_norm: MINIGPT_GRAD_CLIP_NORM,
+            moe_experts: MOE_EXPERTS,
+            moe_top_k: MOE_TOP_K,
+            moe_aux_loss_weight: MOE_AUX_LOSS_WEIGHT,
             prefetch_batches: PREFETCH_BATCHES,
             checkpoint_interval: CHECKPOINT_INTERVAL,
             checkpoint_keep: CHECKPOINT_KEEP,
@@ -178,6 +187,21 @@ impl Hyperparameters {
             &mut hyperparameters.minigpt_grad_clip_norm,
         )?;
         apply_optional_override(
+            "RUSTY_GPT_MOE_EXPERTS",
+            env.moe_experts.as_deref(),
+            &mut hyperparameters.moe_experts,
+        )?;
+        apply_optional_override(
+            "RUSTY_GPT_MOE_TOP_K",
+            env.moe_top_k.as_deref(),
+            &mut hyperparameters.moe_top_k,
+        )?;
+        apply_optional_override(
+            "RUSTY_GPT_MOE_AUX_LOSS_WEIGHT",
+            env.moe_aux_loss_weight.as_deref(),
+            &mut hyperparameters.moe_aux_loss_weight,
+        )?;
+        apply_optional_override(
             "RUSTY_GPT_PREFETCH_BATCHES",
             env.prefetch_batches.as_deref(),
             &mut hyperparameters.prefetch_batches,
@@ -235,6 +259,18 @@ impl Hyperparameters {
         if self.minigpt_grad_clip_norm <= 0.0 {
             bail!("RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM must be greater than zero");
         }
+        if self.moe_experts == 0 {
+            bail!("moe_experts must be greater than zero");
+        }
+        if self.moe_top_k == 0 {
+            bail!("moe_top_k must be greater than zero");
+        }
+        if self.moe_top_k > self.moe_experts {
+            bail!("moe_top_k must be <= moe_experts");
+        }
+        if self.moe_aux_loss_weight < 0.0 {
+            bail!("moe_aux_loss_weight must be >= 0");
+        }
         if self.checkpoint_interval != 0 && self.checkpoint_keep == 0 {
             bail!(
                 "checkpoint_keep must be greater than zero when checkpoint_interval is non-zero (use --checkpoint-interval 0 to disable periodic checkpoints entirely)"
@@ -262,6 +298,9 @@ struct HyperparameterOverrides {
     eval_interval: Option<usize>,
     generate_tokens: Option<usize>,
     minigpt_grad_clip_norm: Option<f32>,
+    moe_experts: Option<usize>,
+    moe_top_k: Option<usize>,
+    moe_aux_loss_weight: Option<f64>,
     prefetch_batches: Option<usize>,
     checkpoint_interval: Option<usize>,
     checkpoint_keep: Option<usize>,
@@ -310,6 +349,15 @@ impl HyperparameterOverrides {
         }
         if let Some(value) = self.minigpt_grad_clip_norm {
             hyperparameters.minigpt_grad_clip_norm = value;
+        }
+        if let Some(value) = self.moe_experts {
+            hyperparameters.moe_experts = value;
+        }
+        if let Some(value) = self.moe_top_k {
+            hyperparameters.moe_top_k = value;
+        }
+        if let Some(value) = self.moe_aux_loss_weight {
+            hyperparameters.moe_aux_loss_weight = value;
         }
         if let Some(value) = self.prefetch_batches {
             hyperparameters.prefetch_batches = value;
@@ -360,6 +408,7 @@ pub(crate) enum ModelChoice {
     SingleAttention,
     MultiAttention,
     MiniGpt,
+    MoeGpt,
     Compare,
 }
 
@@ -371,6 +420,7 @@ impl ModelChoice {
                 ModelChoice::SingleAttention,
                 ModelChoice::MultiAttention,
                 ModelChoice::MiniGpt,
+                ModelChoice::MoeGpt,
             ],
             model => vec![model],
         }
@@ -382,12 +432,24 @@ impl ModelChoice {
             ModelChoice::SingleAttention => "single-attention",
             ModelChoice::MultiAttention => "multi-attention",
             ModelChoice::MiniGpt => "minigpt",
+            ModelChoice::MoeGpt => "moe-gpt",
             ModelChoice::Compare => "compare",
         }
     }
 
-    pub(crate) fn includes_minigpt(self) -> bool {
-        matches!(self, ModelChoice::MiniGpt | ModelChoice::Compare)
+    pub(crate) fn includes_generation_model(self) -> bool {
+        matches!(
+            self,
+            ModelChoice::MiniGpt | ModelChoice::MoeGpt | ModelChoice::Compare
+        )
+    }
+
+    pub(crate) fn uses_bpe_tokenizer(self) -> bool {
+        self.includes_generation_model()
+    }
+
+    pub(crate) fn is_checkpoint_backed(self) -> bool {
+        matches!(self, ModelChoice::MiniGpt | ModelChoice::MoeGpt)
     }
 }
 
@@ -447,6 +509,9 @@ pub(crate) struct RuntimeEnv {
     pub(crate) eval_interval: Option<String>,
     pub(crate) generate_tokens: Option<String>,
     pub(crate) minigpt_grad_clip_norm: Option<String>,
+    pub(crate) moe_experts: Option<String>,
+    pub(crate) moe_top_k: Option<String>,
+    pub(crate) moe_aux_loss_weight: Option<String>,
     pub(crate) prefetch_batches: Option<String>,
     pub(crate) checkpoint_interval: Option<String>,
     pub(crate) checkpoint_keep: Option<String>,
@@ -484,6 +549,9 @@ impl RuntimeEnv {
             eval_interval: env::var("RUSTY_GPT_EVAL_INTERVAL").ok(),
             generate_tokens: env::var("RUSTY_GPT_GENERATE_TOKENS").ok(),
             minigpt_grad_clip_norm: env::var("RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM").ok(),
+            moe_experts: env::var("RUSTY_GPT_MOE_EXPERTS").ok(),
+            moe_top_k: env::var("RUSTY_GPT_MOE_TOP_K").ok(),
+            moe_aux_loss_weight: env::var("RUSTY_GPT_MOE_AUX_LOSS_WEIGHT").ok(),
             prefetch_batches: env::var("RUSTY_GPT_PREFETCH_BATCHES").ok(),
             checkpoint_interval: env::var("RUSTY_GPT_CHECKPOINT_INTERVAL").ok(),
             checkpoint_keep: env::var("RUSTY_GPT_CHECKPOINT_KEEP").ok(),
@@ -717,6 +785,21 @@ where
                     Some(parse_arg_value(&args, index, "--grad-clip-norm")?);
                 index += 2;
             }
+            "--moe-experts" => {
+                hyperparameter_overrides.moe_experts =
+                    Some(parse_arg_value(&args, index, "--moe-experts")?);
+                index += 2;
+            }
+            "--moe-top-k" => {
+                hyperparameter_overrides.moe_top_k =
+                    Some(parse_arg_value(&args, index, "--moe-top-k")?);
+                index += 2;
+            }
+            "--moe-aux-loss-weight" => {
+                hyperparameter_overrides.moe_aux_loss_weight =
+                    Some(parse_arg_value(&args, index, "--moe-aux-loss-weight")?);
+                index += 2;
+            }
             "--prefetch-batches" => {
                 hyperparameter_overrides.prefetch_batches =
                     Some(parse_arg_value(&args, index, "--prefetch-batches")?);
@@ -841,15 +924,12 @@ where
     let model = parse_model_name(arg_model.or(env.model.as_deref()).unwrap_or("minigpt"))?;
 
     // `--resume-from` is confined to `checkpoints/` exactly like `--checkpoint`,
-    // and is only meaningful for checkpoint-backed models. Today that is
-    // MiniGPT; when `moe-gpt` lands (Sprint 5) add its `ModelChoice` variant to
-    // the guard below — the resume machinery in `runtime_training` is already
-    // model-agnostic, so only this parse-time check needs widening.
+    // and is only meaningful for the checkpoint-backed MiniGPT model.
     let resume_from = match arg_resume_from.or(env.resume_from.as_deref()) {
         Some(path) => {
-            if !matches!(model, ModelChoice::MiniGpt) {
+            if !model.is_checkpoint_backed() {
                 bail!(
-                    "--resume-from requires --model minigpt (the only checkpoint-backed model); got --model {}",
+                    "--resume-from requires --model minigpt or moe-gpt; got --model {}",
                     model.label()
                 );
             }
@@ -993,9 +1073,10 @@ fn parse_model_name(name: &str) -> Result<ModelChoice> {
         "single-attention" => Ok(ModelChoice::SingleAttention),
         "multi-attention" => Ok(ModelChoice::MultiAttention),
         "minigpt" | "mini-gpt" => Ok(ModelChoice::MiniGpt),
+        "moe-gpt" | "moegpt" => Ok(ModelChoice::MoeGpt),
         "compare" => Ok(ModelChoice::Compare),
         other => bail!(
-            "unsupported model '{other}'; expected trivial, single-attention, multi-attention, minigpt, or compare"
+            "unsupported model '{other}'; expected trivial, single-attention, multi-attention, minigpt, moe-gpt, or compare"
         ),
     }
 }

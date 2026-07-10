@@ -5,7 +5,9 @@ use burn::backend::ndarray::{NdArray, NdArrayDevice};
 use burn::tensor::backend::Backend;
 use rusty_gpt::loader::data::DataLoader;
 use rusty_gpt::model::persistence::sha256_file_hex;
-use rusty_gpt::model::{MiniGpt, MultiAttentionModel, SingleAttentionModel, TrivialModel};
+use rusty_gpt::model::{
+    MiniGpt, MoeGpt, MoeGptConfig, MultiAttentionModel, SingleAttentionModel, TrivialModel,
+};
 use rusty_gpt::observability::{EventLogger, RuntimeEvent};
 use rusty_gpt::server;
 use rusty_gpt::server::{CheckpointSource, ServerLimits, ServerProvenance, ServerState};
@@ -19,7 +21,7 @@ use std::time::Instant;
 
 use crate::runtime_assets::{
     DEFAULT_CHECKPOINT_DIR, latest_checkpoint_path, load_minigpt_checkpoint,
-    load_minigpt_tokenizer, minigpt_tokenizer_path, tokenizer_for_model,
+    load_minigpt_tokenizer, load_moegpt_checkpoint, minigpt_tokenizer_path, tokenizer_for_model,
 };
 use crate::runtime_config::{Hyperparameters, ModelChoice};
 use crate::runtime_training::{TrainingDemoOptions, run_training_demo};
@@ -54,12 +56,13 @@ pub(crate) fn run_cpu_demo(
         if options.benchmark_generation {
             bail!("generation benchmarks cannot run with --interactive-generate");
         }
-        if options.model_choice != ModelChoice::MiniGpt {
-            bail!("interactive generation requires --model minigpt");
+        if !options.model_choice.is_checkpoint_backed() {
+            bail!("interactive generation requires --model minigpt or moe-gpt");
         }
-        run_interactive_minigpt_generation::<Autodiff<NdArray<f32, i64>>>(
+        run_interactive_generation::<Autodiff<NdArray<f32, i64>>>(
             text,
             hyperparameters,
+            options.model_choice,
             &device,
             options.logger,
             options.checkpoint_path,
@@ -84,6 +87,7 @@ pub(crate) fn run_cpu_demo(
 }
 
 pub(crate) struct ServerRuntimeOptions<'a> {
+    pub(crate) model_choice: ModelChoice,
     pub(crate) server_addr: SocketAddr,
     pub(crate) checkpoint_path: &'a Path,
     pub(crate) load_checkpoint_enabled: bool,
@@ -123,18 +127,44 @@ where
 {
     let started_at = Instant::now();
     let tokenizer = load_minigpt_tokenizer()?;
-    let template = new_minigpt::<B>(tokenizer.vocab_size(), hyperparameters, device);
-    let (model, checkpoint_source, checkpoint_path): (_, _, Option<PathBuf>) =
-        if options.load_latest_checkpoint_enabled {
-            let latest = latest_checkpoint_path(Path::new(DEFAULT_CHECKPOINT_DIR))?;
-            let loaded = load_minigpt_checkpoint(template, &latest, device, &options.logger)?;
-            (loaded, CheckpointSource::Latest, Some(latest))
-        } else if options.load_checkpoint_enabled {
-            let explicit = options.checkpoint_path.to_path_buf();
-            let loaded = load_minigpt_checkpoint(template, &explicit, device, &options.logger)?;
-            (loaded, CheckpointSource::Explicit, Some(explicit))
-        } else {
-            (template, CheckpointSource::None, None)
+    if !options.model_choice.is_checkpoint_backed() {
+        bail!("--serve requires --model minigpt or moe-gpt");
+    }
+    let (model, checkpoint_source, checkpoint_path): (server::ServedModel<B>, _, Option<PathBuf>) =
+        match options.model_choice {
+            ModelChoice::MiniGpt => {
+                let template = new_minigpt::<B>(tokenizer.vocab_size(), hyperparameters, device);
+                if options.load_latest_checkpoint_enabled {
+                    let latest = latest_checkpoint_path(Path::new(DEFAULT_CHECKPOINT_DIR))?;
+                    let loaded =
+                        load_minigpt_checkpoint(template, &latest, device, &options.logger)?;
+                    (loaded.into(), CheckpointSource::Latest, Some(latest))
+                } else if options.load_checkpoint_enabled {
+                    let explicit = options.checkpoint_path.to_path_buf();
+                    let loaded =
+                        load_minigpt_checkpoint(template, &explicit, device, &options.logger)?;
+                    (loaded.into(), CheckpointSource::Explicit, Some(explicit))
+                } else {
+                    (template.into(), CheckpointSource::None, None)
+                }
+            }
+            ModelChoice::MoeGpt => {
+                let template = new_moegpt::<B>(tokenizer.vocab_size(), hyperparameters, device);
+                if options.load_latest_checkpoint_enabled {
+                    let latest = latest_checkpoint_path(Path::new(DEFAULT_CHECKPOINT_DIR))?;
+                    let loaded =
+                        load_moegpt_checkpoint(template, &latest, device, &options.logger)?;
+                    (loaded.into(), CheckpointSource::Latest, Some(latest))
+                } else if options.load_checkpoint_enabled {
+                    let explicit = options.checkpoint_path.to_path_buf();
+                    let loaded =
+                        load_moegpt_checkpoint(template, &explicit, device, &options.logger)?;
+                    (loaded.into(), CheckpointSource::Explicit, Some(explicit))
+                } else {
+                    (template.into(), CheckpointSource::None, None)
+                }
+            }
+            _ => unreachable!("serve model choices are validated above"),
         };
     let (checkpoint_basename, checkpoint_sha256) = match &checkpoint_path {
         Some(path) => {
@@ -232,22 +262,32 @@ pub(crate) fn run_demo<B: Backend>(
     Ok(())
 }
 
-fn run_interactive_minigpt_generation<B: burn::tensor::backend::AutodiffBackend>(
+fn run_interactive_generation<B: burn::tensor::backend::AutodiffBackend>(
     _text: &str,
     hyperparameters: Hyperparameters,
+    model_choice: ModelChoice,
     device: &B::Device,
     logger: EventLogger,
     checkpoint_path: &Path,
 ) -> Result<()> {
     let tokenizer = load_minigpt_tokenizer()?;
-    let template = new_minigpt::<B>(tokenizer.vocab_size(), hyperparameters, device);
-    let model = load_minigpt_checkpoint(template, checkpoint_path, device, &logger)?;
+    let model = match model_choice {
+        ModelChoice::MiniGpt => {
+            let template = new_minigpt::<B>(tokenizer.vocab_size(), hyperparameters, device);
+            load_minigpt_checkpoint(template, checkpoint_path, device, &logger)?.into()
+        }
+        ModelChoice::MoeGpt => {
+            let template = new_moegpt::<B>(tokenizer.vocab_size(), hyperparameters, device);
+            load_moegpt_checkpoint(template, checkpoint_path, device, &logger)?.into()
+        }
+        _ => bail!("interactive generation requires --model minigpt or moe-gpt"),
+    };
 
     interactive_generation_loop(&model, &tokenizer, hyperparameters.generate_tokens, device)
 }
 
 fn interactive_generation_loop<B: Backend>(
-    model: &MiniGpt<B>,
+    model: &server::ServedModel<B>,
     tokenizer: &RuntimeTokenizer,
     generate_tokens: usize,
     device: &B::Device,
@@ -295,7 +335,7 @@ fn interactive_generation_loop<B: Backend>(
 }
 
 fn print_attention_sanity<B: Backend>(
-    model: &MiniGpt<B>,
+    model: &server::ServedModel<B>,
     prompt: &[usize],
     device: &B::Device,
 ) -> Result<()> {
@@ -308,7 +348,10 @@ fn print_attention_sanity<B: Backend>(
         burn::tensor::TensorData::new(input, [1, prompt.len()]),
         device,
     );
-    let (_logits, attentions) = model.forward_tokens_with_attention(tokens);
+    let attentions = match model {
+        server::ServedModel::MiniGpt(model) => model.forward_tokens_with_attention(tokens).1,
+        server::ServedModel::MoeGpt(model) => model.forward_tokens_with_attention(tokens).1,
+    };
 
     if let Some(layer_0_attention) = attentions.first() {
         println!(
@@ -356,8 +399,34 @@ fn run_model_forward<B: Backend>(
             let model = new_minigpt::<B>(vocab_size, hyperparameters, device);
             model.forward_tokens(input)
         }
+        ModelChoice::MoeGpt => {
+            let model = new_moegpt::<B>(vocab_size, hyperparameters, device);
+            model.forward_tokens(input)
+        }
         ModelChoice::Compare => unreachable!("compare should be expanded before forward dispatch"),
     }
+}
+
+fn new_moegpt<B: Backend>(
+    vocab_size: usize,
+    hyperparameters: Hyperparameters,
+    device: &B::Device,
+) -> MoeGpt<B> {
+    MoeGpt::<B>::new(
+        MoeGptConfig {
+            base: rusty_gpt::model::MiniGptConfig {
+                vocab_size,
+                d_model: hyperparameters.embed_dim,
+                num_blocks: hyperparameters.num_layers,
+                max_position_embeddings: hyperparameters.block_size,
+                num_heads: hyperparameters.num_heads,
+            },
+            num_experts: hyperparameters.moe_experts,
+            top_k: hyperparameters.moe_top_k,
+            aux_loss_weight: hyperparameters.moe_aux_loss_weight,
+        },
+        device,
+    )
 }
 
 fn new_minigpt<B: Backend>(

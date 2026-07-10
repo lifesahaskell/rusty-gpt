@@ -75,11 +75,21 @@ fn is_false(value: &bool) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointModelShape {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     pub vocab_size: usize,
     pub block_size: usize,
     pub embed_dim: usize,
     pub num_heads: usize,
     pub num_layers: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub num_experts: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub moe_top_k: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,12 +110,20 @@ pub struct CheckpointTrainingRun {
     pub eval_interval: usize,
     pub grad_clip_norm: f32,
     pub prefetch_batches: usize,
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub moe_aux_loss_weight: f64,
+}
+
+fn is_zero_f64(value: &f64) -> bool {
+    *value == 0.0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CheckpointTrainingMetrics {
     pub final_value_loss: f64,
     pub final_perplexity: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_aux_loss: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +202,20 @@ pub fn checkpoint_compatibility_report(
 ) -> anyhow::Result<CheckpointCompatibilityReport> {
     let mut issues = Vec::new();
 
+    match (
+        expected_shape.kind.as_deref(),
+        metadata.model_shape.kind.as_deref(),
+    ) {
+        (Some("minigpt"), None) => {}
+        (Some(expected), Some(found)) if expected == found => {}
+        (Some(expected), found) => issues.push(CheckpointCompatibilityIssue {
+            field: "model_shape.kind".to_string(),
+            expected: expected.to_string(),
+            found: found.unwrap_or("legacy").to_string(),
+        }),
+        (None, _) => {}
+    }
+
     push_usize_issue(
         &mut issues,
         "model_shape.vocab_size",
@@ -213,6 +245,18 @@ pub fn checkpoint_compatibility_report(
         "model_shape.num_layers",
         expected_shape.num_layers,
         metadata.model_shape.num_layers,
+    );
+    push_usize_issue(
+        &mut issues,
+        "model_shape.num_experts",
+        expected_shape.num_experts,
+        metadata.model_shape.num_experts,
+    );
+    push_usize_issue(
+        &mut issues,
+        "model_shape.moe_top_k",
+        expected_shape.moe_top_k,
+        metadata.model_shape.moe_top_k,
     );
     push_usize_issue(
         &mut issues,
@@ -431,6 +475,9 @@ mod tests {
                 embed_dim: 8,
                 num_heads: 2,
                 num_layers: 1,
+                kind: Some("minigpt".to_string()),
+                num_experts: 0,
+                moe_top_k: 0,
             },
             tokenizer: CheckpointTokenizer {
                 path: "checkpoints/tokenizer.json".to_string(),
@@ -447,10 +494,12 @@ mod tests {
                 eval_interval: 0,
                 grad_clip_norm: 1.0,
                 prefetch_batches: 0,
+                moe_aux_loss_weight: 0.0,
             },
             final_metrics: CheckpointTrainingMetrics {
                 final_value_loss: 1.25,
                 final_perplexity: 3.49,
+                final_aux_loss: None,
             },
             interrupted: false,
             interrupted_at_step: None,
@@ -497,6 +546,9 @@ mod tests {
                     embed_dim: 8,
                     num_heads: 2,
                     num_layers: 1,
+                    kind: Some("minigpt".to_string()),
+                    num_experts: 0,
+                    moe_top_k: 0,
                 },
                 tokenizer: CheckpointTokenizer {
                     path: "tokenizer.json".to_string(),
@@ -513,10 +565,12 @@ mod tests {
                     eval_interval: 0,
                     grad_clip_norm: 1.0,
                     prefetch_batches: 0,
+                    moe_aux_loss_weight: 0.0,
                 },
                 final_metrics: CheckpointTrainingMetrics {
                     final_value_loss: 1.0,
                     final_perplexity: 2.71,
+                    final_aux_loss: None,
                 },
                 interrupted: false,
                 interrupted_at_step: None,
@@ -537,6 +591,9 @@ mod tests {
                 embed_dim: 8,
                 num_heads: 2,
                 num_layers: 1,
+                kind: Some("minigpt".to_string()),
+                num_experts: 0,
+                moe_top_k: 0,
             },
             None,
             &device,
@@ -577,6 +634,9 @@ mod tests {
                 embed_dim: 8,
                 num_heads: 2,
                 num_layers: 1,
+                kind: Some("minigpt".to_string()),
+                num_experts: 0,
+                moe_top_k: 0,
             },
             &tokenizer_path,
             &device,
@@ -612,6 +672,9 @@ mod tests {
                 embed_dim: 8,
                 num_heads: 2,
                 num_layers: 1,
+                kind: Some("minigpt".to_string()),
+                num_experts: 0,
+                moe_top_k: 0,
             },
             &tokenizer_path,
         )
@@ -647,6 +710,9 @@ mod tests {
                 embed_dim: 8,
                 num_heads: 2,
                 num_layers: 1,
+                kind: Some("minigpt".to_string()),
+                num_experts: 0,
+                moe_top_k: 0,
             },
             &tokenizer_path,
         )
@@ -680,6 +746,9 @@ mod tests {
                 embed_dim: 8,
                 num_heads: 2,
                 num_layers: 1,
+                kind: Some("minigpt".to_string()),
+                num_experts: 0,
+                moe_top_k: 0,
             },
             tokenizer: CheckpointTokenizer {
                 path: tokenizer_path.display().to_string(),
@@ -696,10 +765,12 @@ mod tests {
                 eval_interval: 0,
                 grad_clip_norm: 1.0,
                 prefetch_batches: 0,
+                moe_aux_loss_weight: 0.0,
             },
             final_metrics: CheckpointTrainingMetrics {
                 final_value_loss: 1.0,
                 final_perplexity: 2.71,
+                final_aux_loss: None,
             },
             interrupted: false,
             interrupted_at_step: None,
@@ -717,6 +788,9 @@ mod tests {
                 embed_dim: 8,
                 num_heads: 2,
                 num_layers: 1,
+                kind: Some("minigpt".to_string()),
+                num_experts: 0,
+                moe_top_k: 0,
             },
             Some(&tokenizer_path),
         )
@@ -743,6 +817,9 @@ mod tests {
                 embed_dim: 8,
                 num_heads: 2,
                 num_layers: 1,
+                kind: Some("minigpt".to_string()),
+                num_experts: 0,
+                moe_top_k: 0,
             },
             tokenizer: CheckpointTokenizer {
                 path: "tokenizer.json".to_string(),
@@ -759,10 +836,12 @@ mod tests {
                 eval_interval: 0,
                 grad_clip_norm: 1.0,
                 prefetch_batches: 0,
+                moe_aux_loss_weight: 0.0,
             },
             final_metrics: CheckpointTrainingMetrics {
                 final_value_loss: 1.0,
                 final_perplexity: 2.71,
+                final_aux_loss: None,
             },
             interrupted: false,
             interrupted_at_step: None,
@@ -779,6 +858,9 @@ mod tests {
                 embed_dim: 8,
                 num_heads: 2,
                 num_layers: 1,
+                kind: Some("minigpt".to_string()),
+                num_experts: 0,
+                moe_top_k: 0,
             },
             None,
         )
@@ -803,6 +885,9 @@ mod tests {
                 embed_dim: 8,
                 num_heads: 2,
                 num_layers: 1,
+                kind: Some("minigpt".to_string()),
+                num_experts: 0,
+                moe_top_k: 0,
             },
             tokenizer: CheckpointTokenizer {
                 path: "tokenizer.json".to_string(),
@@ -819,10 +904,12 @@ mod tests {
                 eval_interval: 0,
                 grad_clip_norm: 1.0,
                 prefetch_batches: 0,
+                moe_aux_loss_weight: 0.0,
             },
             final_metrics: CheckpointTrainingMetrics {
                 final_value_loss: 1.0,
                 final_perplexity: 2.71,
+                final_aux_loss: None,
             },
             interrupted: false,
             interrupted_at_step: None,

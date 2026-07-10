@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor, TensorData};
 
-use crate::model::{GenerationOptions, MiniGpt};
+use crate::model::{GenerationOptions, MiniGpt, MoeGpt};
 use crate::observability::{BenchmarkStats, EventLogger, RuntimeEvent};
 
 pub const DEFAULT_PROMPT_LENS: [usize; 3] = [10, 50, 100];
@@ -95,8 +95,54 @@ pub fn parse_usize_list(value: &str, label: &str) -> Result<Vec<usize>> {
     Ok(values)
 }
 
+pub enum GenerationModel<'a, B: Backend> {
+    MiniGpt(&'a MiniGpt<B>),
+    MoeGpt(&'a MoeGpt<B>),
+}
+
+impl<B: Backend> GenerationModel<'_, B> {
+    fn block_size(&self) -> usize {
+        match self {
+            Self::MiniGpt(model) => model.block_size(),
+            Self::MoeGpt(model) => model.block_size(),
+        }
+    }
+
+    fn vocab_size(&self) -> usize {
+        match self {
+            Self::MiniGpt(model) => model.vocab_size(),
+            Self::MoeGpt(model) => model.vocab_size(),
+        }
+    }
+
+    fn generate_with_options(
+        &self,
+        prompt: &[usize],
+        gen_len: usize,
+        device: &B::Device,
+        options: GenerationOptions,
+    ) -> Result<Vec<usize>, String> {
+        match self {
+            Self::MiniGpt(model) => model.generate_with_options(prompt, gen_len, device, options),
+            Self::MoeGpt(model) => model.generate_with_options(prompt, gen_len, device, options),
+        }
+    }
+
+    fn generate_cached_with_options(
+        &self,
+        prompt: Tensor<B, 2, Int>,
+        gen_len: usize,
+        options: GenerationOptions,
+    ) -> Vec<usize> {
+        match self {
+            Self::MiniGpt(model) => model.generate_cached_with_options(prompt, gen_len, options),
+            Self::MoeGpt(model) => model.generate_cached_with_options(prompt, gen_len, options),
+        }
+    }
+}
+
 pub fn benchmark_generation<B: Backend>(
-    model: &MiniGpt<B>,
+    model: &GenerationModel<'_, B>,
     device: &B::Device,
     config: &BenchmarkConfig,
     logger: &EventLogger,
@@ -127,7 +173,7 @@ pub fn benchmark_generation<B: Backend>(
 }
 
 pub fn benchmark_generation_cases<B: Backend>(
-    model: &MiniGpt<B>,
+    model: &GenerationModel<'_, B>,
     device: &B::Device,
     config: &BenchmarkConfig,
 ) -> Result<Vec<GenerationBenchmarkCase>, String> {
@@ -288,7 +334,8 @@ mod tests {
             iterations: 2,
         };
 
-        let cases = benchmark_generation_cases(&model, &device, &config).unwrap();
+        let cases = benchmark_generation_cases(&GenerationModel::MiniGpt(&model), &device, &config)
+            .unwrap();
 
         let GenerationBenchmarkCase::Result(result) = &cases[0] else {
             panic!("expected benchmark result");
@@ -331,7 +378,8 @@ mod tests {
             iterations: 1,
         };
 
-        let cases = benchmark_generation_cases(&model, &device, &config).unwrap();
+        let cases = benchmark_generation_cases(&GenerationModel::MiniGpt(&model), &device, &config)
+            .unwrap();
 
         assert!(matches!(
             &cases[0],
@@ -360,7 +408,7 @@ mod tests {
             captured.lock().unwrap().push(line);
         });
 
-        benchmark_generation(&model, &device, &config, &logger).unwrap();
+        benchmark_generation(&GenerationModel::MiniGpt(&model), &device, &config, &logger).unwrap();
 
         let lines = lines.lock().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();

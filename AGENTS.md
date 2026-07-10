@@ -44,6 +44,7 @@ Run from the repo root.
 - CUDA support is opt-in via `--features cuda`; CPU-only CI must not rely on CUDA code.
 - `data-secret/` is gitignored; use it only for private corpora.
 - Agents should use `git worktree` by default when making changes to this repository, keeping the main workspace stable.
+- Implementation agents must create independently mergeable PRs by default. Base feature branches on the remote target branch, usually `origin/main`, not on local-only commits or another feature branch, unless the user explicitly asks for a stacked PR. Before pushing or opening a PR, verify `git log <target>..HEAD` and `git diff --name-status <target>...HEAD` contain only the intended work. If a branch is accidentally stacked, rebuild it by cherry-picking the intended commit(s) onto the remote target branch before publishing.
 
 ## Guidance for agents
 - Preserve the existing architecture in `CLAUDE.md` and link to it rather than duplicating it.

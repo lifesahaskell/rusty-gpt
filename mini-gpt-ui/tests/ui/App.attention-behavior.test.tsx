@@ -20,10 +20,13 @@ const responseWithContextWindow = {
 }
 
 const modelInfo = {
+  model_kind: 'minigpt',
   vocab_size: 2048,
   num_layers: 4,
   num_heads: 4,
   block_size: 128,
+  num_experts: 0,
+  moe_top_k: 0,
   tokenizer_vocab_size: 2048,
   model_tokenizer_vocab_match: true,
 }

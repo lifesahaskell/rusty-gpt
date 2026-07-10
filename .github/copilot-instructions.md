@@ -16,6 +16,7 @@ This repository uses `AGENTS.md` and `CLAUDE.md` as the primary AI agent guidanc
 - Server routes are nested under `/api`: use `/api/generate` and `/api/info`.
 - The CPU default path must not load CUDA; `tests/default_runtime.rs` enforces this.
 - When editing the repo, use `git worktree` by default so agent changes remain isolated from the main workspace.
+- Implementation PRs must be independently mergeable. Start from the remote target branch, usually `origin/main`, and do not stack on local-only commits or another feature branch unless the user explicitly requests a stacked PR. Before pushing, inspect `git log <target>..HEAD` and `git diff --name-status <target>...HEAD`; rebuild by cherry-picking onto the target branch if unrelated commits appear.
 
 ## Workflow
 1. Inspect `README.md`, then `CLAUDE.md`, then `AGENTS.md`.

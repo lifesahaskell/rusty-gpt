@@ -8,9 +8,10 @@ use burn::tensor::{Int, Tensor};
 use crate::loader::data::{BatchPrefetcher, DataLoader, SamplingPolicy, TokenBatch};
 use crate::observability::{EventLogger, LogFormat, RuntimeEvent};
 
-use super::{MiniGpt, MiniGptConfig, MultiAttentionModel, SingleAttentionModel, TrivialModel};
-
-pub type TrainingLogFormat = LogFormat;
+use super::{
+    MiniGpt, MiniGptConfig, MoeGpt, MoeGptConfig, MultiAttentionModel, SingleAttentionModel,
+    TrivialModel,
+};
 
 #[derive(Clone)]
 pub struct TrainingLogContext {
@@ -88,6 +89,7 @@ pub struct TrainingParams {
 pub struct TrainingMetrics {
     pub final_value_loss: f64,
     pub final_perplexity: f64,
+    pub final_aux_loss: Option<f64>,
 }
 
 pub struct TrainingOutcome<M> {
@@ -258,28 +260,31 @@ impl TrainingThroughput {
     }
 }
 
-fn log_training_progress(
-    context: TrainingLogContext,
+struct TrainingProgressSnapshot {
     step: usize,
     steps: usize,
     training_loss: f64,
     value_loss: f64,
     throughput: TrainingThroughput,
     learning_rate: f64,
-) {
+    aux_loss: Option<f64>,
+}
+
+fn log_training_progress(context: TrainingLogContext, snapshot: TrainingProgressSnapshot) {
     context.logger.log(RuntimeEvent::TrainingProgress {
         backend: context.backend.to_string(),
         model: context.model.to_string(),
-        step,
-        total_steps: steps,
-        training_loss,
-        value_loss,
-        value_perplexity: perplexity(value_loss),
-        elapsed_ms: throughput.elapsed_ms,
-        tokens_per_second: throughput.tokens_per_second,
-        steps_per_second: throughput.steps_per_second,
-        step_ms_mean: throughput.step_ms_mean,
-        learning_rate,
+        step: snapshot.step,
+        total_steps: snapshot.steps,
+        training_loss: snapshot.training_loss,
+        value_loss: snapshot.value_loss,
+        value_perplexity: perplexity(snapshot.value_loss),
+        elapsed_ms: snapshot.throughput.elapsed_ms,
+        tokens_per_second: snapshot.throughput.tokens_per_second,
+        steps_per_second: snapshot.throughput.steps_per_second,
+        step_ms_mean: snapshot.throughput.step_ms_mean,
+        learning_rate: snapshot.learning_rate,
+        aux_loss: snapshot.aux_loss,
     });
 }
 
@@ -399,12 +404,15 @@ where
             final_value_loss = Some(value_loss);
             log_training_progress(
                 params.log_context.clone(),
-                step,
-                params.steps,
-                training_loss,
-                value_loss,
-                throughput,
-                learning_rate,
+                TrainingProgressSnapshot {
+                    step,
+                    steps: params.steps,
+                    training_loss,
+                    value_loss,
+                    throughput,
+                    learning_rate,
+                    aux_loss: None,
+                },
             );
         }
     }
@@ -421,6 +429,118 @@ where
         metrics: TrainingMetrics {
             final_value_loss,
             final_perplexity: perplexity(final_value_loss),
+            final_aux_loss: None,
+        },
+        steps_completed,
+        interrupted,
+    })
+}
+
+fn train_moe_language_model<B, F>(
+    mut model: MoeGpt<B>,
+    loader: &DataLoader,
+    value_loader: &DataLoader,
+    device: &B::Device,
+    params: TrainingParams,
+    mut periodic_save: F,
+) -> Result<TrainingOutcome<MoeGpt<B>>, String>
+where
+    B: AutodiffBackend,
+    B::FloatElem: Into<f64>,
+    F: FnMut(&MoeGpt<B>, usize) -> Result<(), String>,
+{
+    let training_batches =
+        TrainingBatchSource::new(loader, params.prefetch_batches, params.sampling_policy);
+    let mut optimizer = AdamWConfig::new()
+        .with_grad_clipping(params.grad_clipping)
+        .init();
+    let loss_fn = CrossEntropyLossConfig::new().init(device);
+    let started_at = std::time::Instant::now();
+    let mut final_value_loss = None;
+    let mut final_aux_loss = None;
+    let mut interrupted = false;
+    let mut steps_completed = params.start_step;
+
+    for step in params.start_step..params.steps {
+        if crate::runtime_signals::interrupt_requested() {
+            interrupted = true;
+            break;
+        }
+
+        let (inputs, targets) =
+            training_batches.next_batch::<B>(device, params.sampling_policy, step)?;
+        let (logits, auxes) = model.forward_tokens_with_aux(inputs);
+        let lm_loss = language_model_loss(&loss_fn, logits, targets);
+        let aux_count = auxes.len().max(1);
+        let mut aux_iter = auxes.into_iter().map(|aux| aux.load_balancing_loss());
+        let aux_loss = aux_iter
+            .next()
+            .map(|first| aux_iter.fold(first, |acc, aux| acc + aux) / aux_count as f32)
+            .expect("MoeGpt has at least one MoE block");
+        let aux_loss_value: f64 = aux_loss.clone().into_scalar().into();
+        let loss = lm_loss + aux_loss * model.aux_loss_weight() as f32;
+        let learning_rate = params.learning_rate_schedule.rate(
+            params.learning_rate,
+            step,
+            params.steps,
+            params.lr_warmup_steps,
+        );
+
+        let grads = loss.backward();
+        let grads = GradientsParams::from_grads(grads, &model);
+        model = optimizer.step(learning_rate, model, grads);
+        steps_completed = step + 1;
+
+        if params.periodic_checkpoint_interval > 0
+            && steps_completed != params.steps
+            && steps_completed.is_multiple_of(params.periodic_checkpoint_interval)
+        {
+            periodic_save(&model, steps_completed)?;
+        }
+
+        if should_log_training_step(step, params.steps, params.eval_interval) {
+            let throughput = TrainingThroughput::from_progress(
+                step + 1,
+                loader.batch_size,
+                loader.block_size,
+                started_at.elapsed().as_millis(),
+            );
+            let training_loss = loss.into_scalar().into();
+            let value_loss: f64 = value_loss(value_loader, device, &loss_fn, |inputs| {
+                model.forward_tokens(inputs)
+            })?
+            .into();
+            final_value_loss = Some(value_loss);
+            final_aux_loss = Some(aux_loss_value);
+            log_training_progress(
+                params.log_context.clone(),
+                TrainingProgressSnapshot {
+                    step,
+                    steps: params.steps,
+                    training_loss,
+                    value_loss,
+                    throughput,
+                    learning_rate,
+                    aux_loss: Some(aux_loss_value),
+                },
+            );
+        }
+    }
+
+    let final_value_loss = final_value_loss.unwrap_or_else(|| {
+        value_loss(value_loader, device, &loss_fn, |inputs| {
+            model.forward_tokens(inputs)
+        })
+        .map(Into::into)
+        .unwrap_or(f64::NAN)
+    });
+
+    Ok(TrainingOutcome {
+        model,
+        metrics: TrainingMetrics {
+            final_value_loss,
+            final_perplexity: perplexity(final_value_loss),
+            final_aux_loss,
         },
         steps_completed,
         interrupted,
@@ -587,6 +707,64 @@ where
             |model, inputs| model.forward_tokens(inputs),
             periodic_save,
         )
+    }
+}
+
+impl<B> MoeGpt<B>
+where
+    B: AutodiffBackend,
+    B::FloatElem: Into<f64>,
+{
+    pub fn train(
+        loader: &DataLoader,
+        value_loader: &DataLoader,
+        device: &B::Device,
+        config: MoeGptConfig,
+        params: TrainingParams,
+    ) -> Result<TrainingOutcome<Self>, String> {
+        Self::train_with_periodic_save(
+            loader,
+            value_loader,
+            device,
+            config,
+            params,
+            no_periodic_save,
+        )
+    }
+
+    pub fn train_with_periodic_save<F>(
+        loader: &DataLoader,
+        value_loader: &DataLoader,
+        device: &B::Device,
+        config: MoeGptConfig,
+        params: TrainingParams,
+        periodic_save: F,
+    ) -> Result<TrainingOutcome<Self>, String>
+    where
+        F: FnMut(&Self, usize) -> Result<(), String>,
+    {
+        Self::train_prebuilt_with_periodic_save(
+            MoeGpt::<B>::new(config, device),
+            loader,
+            value_loader,
+            device,
+            params,
+            periodic_save,
+        )
+    }
+
+    pub fn train_prebuilt_with_periodic_save<F>(
+        model: Self,
+        loader: &DataLoader,
+        value_loader: &DataLoader,
+        device: &B::Device,
+        params: TrainingParams,
+        periodic_save: F,
+    ) -> Result<TrainingOutcome<Self>, String>
+    where
+        F: FnMut(&Self, usize) -> Result<(), String>,
+    {
+        train_moe_language_model(model, loader, value_loader, device, params, periodic_save)
     }
 }
 

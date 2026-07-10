@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
 import { generateText, getModelInfo, type GenerateResponse, type ModelInfo } from './api'
 import AttentionHeatmap from './components/AttentionHeatmap'
+import ExpertRoutingHeatmap from './components/ExpertRoutingHeatmap'
 import TrainingDashboard from './components/TrainingDashboard'
 import './App.css'
 
@@ -74,6 +75,10 @@ function App() {
     response && selectedAttention ? Math.max(0, response.tokens.length - selectedAttention.weights.length) : 0
   const selectedAttentionRow =
     selectedToken !== null && selectedToken >= attentionTokenOffset ? selectedToken - attentionTokenOffset : null
+  const routingTokens =
+    response?.routing?.[0] === undefined
+      ? []
+      : response.tokens.slice(-response.routing[0].experts.length)
 
   const activateWorkspace = (index: number) => {
     const nextIndex = (index + workspaces.length) % workspaces.length
@@ -106,6 +111,10 @@ function App() {
           {modelInfo ? (
             <dl>
               <div>
+                <dt>Kind</dt>
+                <dd>{modelInfo.model_kind}</dd>
+              </div>
+              <div>
                 <dt>Vocabulary</dt>
                 <dd>{modelInfo.vocab_size}</dd>
               </div>
@@ -129,6 +138,14 @@ function App() {
                 <dt>Context</dt>
                 <dd>{modelInfo.block_size}</dd>
               </div>
+              {modelInfo.num_experts > 0 && (
+                <div>
+                  <dt>Experts</dt>
+                  <dd>
+                    {modelInfo.num_experts} / top {modelInfo.moe_top_k}
+                  </dd>
+                </div>
+              )}
             </dl>
           ) : (
             <p role={modelInfoError ? 'alert' : undefined}>
@@ -293,6 +310,9 @@ function App() {
                 tokens={response.tokens}
                 selectedRow={selectedAttentionRow}
               />
+              {response.routing && (
+                <ExpertRoutingHeatmap routing={response.routing} tokens={routingTokens} />
+              )}
               <button
                 className="secondary-action"
                 type="button"

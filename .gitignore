@@ -1,7 +1,11 @@
 /target/
 /checkpoints/
 data/huggingface-cache/
-.codex
+.codex/*
+!.codex/skills/
+.codex/skills/*
+!.codex/skills/ci-triage-agent/
+!.codex/skills/ci-triage-agent/**
 .vscode/
 .idea/
 .log/
