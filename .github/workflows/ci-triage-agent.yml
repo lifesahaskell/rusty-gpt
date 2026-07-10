@@ -1,0 +1,74 @@
+name: CI Triage Agent
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      window_hours:
+        description: "How many recent workflow-run hours to inspect"
+        required: false
+        default: "24"
+      create_issues:
+        description: "Create or update GitHub issues for broken CI"
+        required: false
+        type: boolean
+        default: true
+      attempt_trivial_fixes:
+        description: "Invoke CI_TRIAGE_AUTO_FIX_COMMAND for trivial failures"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  actions: read
+  checks: read
+  contents: read
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: ci-triage-agent
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    name: Inspect PR and workflow health
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      WINDOW_HOURS: ${{ inputs.window_hours || '24' }}
+      CREATE_ISSUES_INPUT: ${{ inputs.create_issues }}
+      ATTEMPT_TRIVIAL_FIXES_INPUT: ${{ inputs.attempt_trivial_fixes }}
+      CI_TRIAGE_AUTO_FIX_COMMAND: ${{ vars.CI_TRIAGE_AUTO_FIX_COMMAND }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run CI triage agent
+        run: |
+          create_issues="${CREATE_ISSUES_INPUT:-true}"
+          attempt_trivial_fixes="${ATTEMPT_TRIVIAL_FIXES_INPUT:-true}"
+
+          args=(
+            --repo "$GITHUB_REPOSITORY"
+            --window-hours "$WINDOW_HOURS"
+            --artifact-dir ci-triage-reports
+          )
+
+          if [[ "$create_issues" == "true" ]]; then
+            args+=(--create-issues)
+          fi
+
+          if [[ "$attempt_trivial_fixes" == "true" ]]; then
+            args+=(--attempt-trivial-fixes)
+          fi
+
+          python3 scripts/ci_triage_agent.py "${args[@]}"
+
+      - name: Upload CI triage reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ci-triage-reports
+          path: ci-triage-reports/
+          if-no-files-found: ignore

@@ -1,0 +1,60 @@
+{
+  "repository": "lifesahaskell/rusty-gpt",
+  "default_branch": "main",
+  "pulls": [
+    {
+      "number": 42,
+      "title": "Bump burn from 0.21.0 to 0.21.1",
+      "html_url": "https://github.com/lifesahaskell/rusty-gpt/pull/42",
+      "user": {
+        "login": "dependabot[bot]"
+      },
+      "head": {
+        "ref": "dependabot/cargo/burn-0.21.1",
+        "sha": "abc123"
+      }
+    }
+  ],
+  "check_runs_by_sha": {
+    "abc123": {
+      "check_runs": [
+        {
+          "name": "cargo clippy --all-targets -- -D warnings",
+          "conclusion": "failure",
+          "html_url": "https://github.com/lifesahaskell/rusty-gpt/actions/runs/1/job/1",
+          "completed_at": "2026-07-09T12:00:00Z",
+          "app": {
+            "name": "GitHub Actions"
+          }
+        }
+      ]
+    }
+  },
+  "workflow_runs": [
+    {
+      "id": 99,
+      "name": "CI",
+      "display_title": "CI",
+      "conclusion": "failure",
+      "html_url": "https://github.com/lifesahaskell/rusty-gpt/actions/runs/99",
+      "head_branch": "main",
+      "head_sha": "def456",
+      "created_at": "2026-07-09T13:00:00Z",
+      "actor": {
+        "login": "octocat"
+      }
+    }
+  ],
+  "jobs_by_run_id": {
+    "99": {
+      "jobs": [
+        {
+          "name": "cargo fmt",
+          "conclusion": "failure",
+          "html_url": "https://github.com/lifesahaskell/rusty-gpt/actions/runs/99/job/2",
+          "completed_at": "2026-07-09T13:05:00Z"
+        }
+      ]
+    }
+  }
+}

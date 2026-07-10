@@ -1,0 +1,4 @@
+interface:
+  display_name: "CI Triage Agent"
+  short_description: "Monitor CI failures and route fixes or reports."
+  default_prompt: "Use $ci-triage-agent to inspect current PR and workflow failures, fix trivial CI issues when safe, and report the rest."
