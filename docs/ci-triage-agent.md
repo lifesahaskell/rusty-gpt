@@ -25,6 +25,12 @@ Keep the command narrow. A typical setup is a wrapper script that starts Codex
 or another coding agent with the brief path, lets it make a small mechanical
 change, and validates with the command listed in the brief.
 
+Any fixer launched by this hook must create an independently mergeable branch
+or PR. It should branch from the remote target branch, usually `origin/main`,
+and verify that `git log <target>..HEAD` plus
+`git diff --name-status <target>...HEAD` contain only the intended fix before
+pushing.
+
 When `CI_TRIAGE_AUTO_FIX_COMMAND` is not set, trivial failures are still logged
 as `trivial-fix-eligible` so another agent can pick them up.
 

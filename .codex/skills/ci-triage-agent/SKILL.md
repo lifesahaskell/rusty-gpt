@@ -61,6 +61,7 @@ When subagents are available, spawn exactly one focused subagent per trivial roo
 - The allowed file scope.
 - The validation command.
 - A requirement to avoid unrelated changes.
+- A requirement that any branch or PR is independently mergeable from the remote target branch, usually `origin/main`, with no stacked commits unless explicitly requested.
 
 Review the subagent result before reporting success. If subagents are unavailable, state that the issue is trivial-fix eligible and provide the same brief for a later agent.
 
@@ -91,3 +92,4 @@ Before finishing:
 - Confirm trivial fixes were validated with the targeted failing command or explain why validation could not run.
 - Confirm non-trivial failures have backlog-ready reports.
 - Confirm unrelated repository changes were not included in any generated fix.
+- Confirm any generated fix branch compares cleanly against the remote target branch and contains only the intended fix commits.

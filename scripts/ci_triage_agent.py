@@ -388,6 +388,8 @@ Validation command:
 Rules:
 - Make the smallest mechanical change.
 - Do not alter product behavior, APIs, schemas, deployment config, or broad tests.
+- Create an independently mergeable branch or PR from the remote target branch, usually origin/main.
+- Before pushing, verify git log <target>..HEAD and git diff --name-status <target>...HEAD contain only this fix.
 - Preserve unrelated worktree changes.
 - Stop and report instead of guessing if the failure is not mechanical.
 """
