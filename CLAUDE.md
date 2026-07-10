@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Single-binary Rust crate that trains and runs a GPT from scratch on top of the [Burn](https://burn.dev) 0.21 deep-learning framework. The Shakespeare-style corpus at `data/input.txt` is the default training input. Edition 2024. The smaller teaching variants (`trivial`, `single-attention`, `multi-attention`) use a char-level tokenizer; `MiniGpt` uses a BPE tokenizer loaded from `checkpoints/tokenizer.json`.
+Single-binary Rust crate that trains and runs a GPT from scratch on top of the [Burn](https://burn.dev) 0.21 deep-learning framework. The Shakespeare-style corpus at `data/input.txt` is the default training input. Edition 2024. The smaller teaching variants (`trivial`, `single-attention`, `multi-attention`) use a char-level tokenizer; `MiniGpt` and `MoeGpt` use a BPE tokenizer loaded from `checkpoints/tokenizer.json`.
 
 Published at https://github.com/lifesahaskell/rusty-gpt. See `README.md` for the user-facing quick start; this file is the architectural memo for Claude Code.
 
@@ -47,10 +47,10 @@ cargo run --release --features cuda -- --backend cuda --model minigpt
 # Train from a HuggingFace dataset URI (loader fetches + caches under data/huggingface-cache/)
 cargo run -- --input "hf://Salesforce/wikitext?config=wikitext-2-raw-v1&split=train&rows=1000"
 
-# Compare all four model variants on the same batch
+# Compare all five model variants on the same batch
 cargo run -- --model compare
 
-# Load a saved MiniGPT checkpoint and chat with it
+# Load a saved MiniGPT or MoeGPT checkpoint and chat with it
 cargo run -- --model minigpt --interactive-generate --checkpoint checkpoints/mini_gpt
 
 # Serve the GPT HTTP API on http://127.0.0.1:8787/api with the newest trained checkpoint
@@ -71,11 +71,11 @@ Defaults live in `src/runtime_config.rs`; validation rules in `Hyperparameters::
 |---|---|---|
 | `--backend` | `RUSTY_GPT_BACKEND` | `cpu` (default) \| `cuda` — `cuda` requires building with `--features cuda` |
 | `--input` | `RUSTY_GPT_INPUT` | path or `hf://…` URI, default `data/input.txt` |
-| `--model` | `RUSTY_GPT_MODEL` | `minigpt` (default, alias `mini-gpt`) \| `trivial` \| `single-attention` \| `multi-attention` \| `compare` |
+| `--model` | `RUSTY_GPT_MODEL` | `minigpt` (default, alias `mini-gpt`) \| `moe-gpt` (alias `moegpt`) \| `trivial` \| `single-attention` \| `multi-attention` \| `compare` |
 | `--checkpoint` | `RUSTY_GPT_MINIGPT_CHECKPOINT` | path without `.mpk`, default `checkpoints/mini_gpt` |
-| `--interactive-generate` | — | flag; requires `--backend cpu` and `--model minigpt` |
+| `--interactive-generate` | — | flag; requires `--backend cpu` and `--model minigpt` or `--model moe-gpt` |
 | `--serve` | — | flag; starts the Axum HTTP server instead of the demo/training run |
-| `--load-checkpoint` | — | flag; load MiniGPT weights from `--checkpoint` before serving / interactive |
+| `--load-checkpoint` | — | flag; load MiniGPT or MoeGPT weights from `--checkpoint` before serving / interactive |
 | `--load-latest-checkpoint` | — | flag; load the newest `*.mpk` in `checkpoints/` (mutually exclusive with `--load-checkpoint`) |
 | `--server-addr` | `RUSTY_GPT_SERVER_ADDR` | `host:port`, default `127.0.0.1:8787` |
 | `--max-prompt-bytes` | `RUSTY_GPT_MAX_PROMPT_BYTES` | int, default `8192`; generate prompt byte cap |
@@ -83,7 +83,7 @@ Defaults live in `src/runtime_config.rs`; validation rules in `Hyperparameters::
 | `--rate-limit-rps` | `RUSTY_GPT_RATE_LIMIT_RPS` | int, default `5`; `0` disables generate rate limiting |
 | `--rate-limit-burst` | `RUSTY_GPT_RATE_LIMIT_BURST` | int, default `10`; generate burst capacity |
 | `--log-format` | `RUSTY_GPT_LOG_FORMAT` | `plain` \| `json` — default depends on backend; controls `observability::EventLogger` output |
-| `--benchmark-generation` | — | flag; runs naive-vs-cached generation benchmarks (requires `--model minigpt` or `compare`) |
+| `--benchmark-generation` | — | flag; runs naive-vs-cached generation benchmarks (requires `--model minigpt`, `moe-gpt`, or `compare`) |
 | — | `RUSTY_GPT_BPE_TOKENIZER` | path, default `checkpoints/tokenizer.json` |
 | `--block-size` | `RUSTY_GPT_BLOCK_SIZE` | int, default `128`; must be > 0 |
 | `--batch-size` | `RUSTY_GPT_BATCH_SIZE` | int, default `32`; must be > 0 |
@@ -99,8 +99,11 @@ Defaults live in `src/runtime_config.rs`; validation rules in `Hyperparameters::
 | `--eval-interval` | `RUSTY_GPT_EVAL_INTERVAL` | int (0 ⇒ log only final step) |
 | `--generate-tokens` | `RUSTY_GPT_GENERATE_TOKENS` | int, must be > 0 |
 | `--grad-clip-norm` | `RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM` | f32, must be > 0 |
+| `--moe-experts` | `RUSTY_GPT_MOE_EXPERTS` | int, default `4`; must be > 0 |
+| `--moe-top-k` | `RUSTY_GPT_MOE_TOP_K` | int, default `2`; must be `>= 1` and `<= moe_experts` |
+| `--moe-aux-loss-weight` | `RUSTY_GPT_MOE_AUX_LOSS_WEIGHT` | f64, default `0.01`; must be >= 0 |
 | `--prefetch-batches` | `RUSTY_GPT_PREFETCH_BATCHES` | int, default `2` (CPU prefetch queue depth) |
-| `--checkpoint-interval` | `RUSTY_GPT_CHECKPOINT_INTERVAL` | int, default `0` (disabled); save `<checkpoint>.step-<N>.mpk` every N steps during MiniGPT training |
+| `--checkpoint-interval` | `RUSTY_GPT_CHECKPOINT_INTERVAL` | int, default `0` (disabled); save `<checkpoint>.step-<N>.mpk` every N steps during MiniGPT or MoeGPT training |
 | `--checkpoint-keep` | `RUSTY_GPT_CHECKPOINT_KEEP` | int, default `3`; retention window for periodic snapshots — older `.step-N.` files are pruned, the final save and any `.interrupted-step-*` save are never pruned |
 
 `Hyperparameters::from_env_and_overrides` (in `src/runtime_config.rs`) resolves env → CLI overrides → `validate()`, which enforces the positivity/divisibility rules and recomputes `head_dim = embed_dim / num_heads`. Invalid combinations (e.g. `embed_dim` not divisible by `num_heads`) fail at config-parse time.
@@ -129,7 +132,8 @@ src/
     input_source.rs             strict `InputSource::parse` for `--input`/`--corpus` (local path vs `hf://org/dataset[@rev]`); purely syntactic — no I/O. `validate_local_size` enforces `DEFAULT_MAX_LOCAL_INPUT_BYTES = 1 GiB` via `fs::metadata` only. Every consumer must branch on the parsed enum, not re-parse the raw string.
     huggingface.rs              fetches `hf://dataset?config=…&split=…` URIs via the HF datasets-server API; caches under `data/huggingface-cache/`
   model/
-    mod.rs                      four model variants + shared loss/log helpers; `MiniGptConfig`, `TrainingLogFormat`, `TrainingLogContext`
+    mod.rs                      five model variants + shared loss/log helpers; `MiniGptConfig`, `MoeGptConfig`, `TrainingLogContext`
+    moe.rs                      MoE router, expert feed-forward, and load-balancing loss
     generation.rs               `GenerationOptions` (temperature, top_k), `sample_from_logits`, `select_token_from_logits`
     training.rs                 per-variant `train(...)` impls (lifted out of `mod.rs`)
     persistence.rs              save/load wrappers around burn's NamedMpkFileRecorder (.mpk files) + the `.metadata.json` sidecar
@@ -155,14 +159,15 @@ checkpoints/                    gitignored .mpk model files + tokenizer.json (BP
 
 ### The model progression in `src/model/mod.rs`
 
-The file builds up a GPT one layer of complexity at a time, and the four `ModelChoice` variants are deliberate teaching steps:
+The file builds up a GPT one layer of complexity at a time, and the five trainable `ModelChoice` variants are deliberate teaching steps:
 
 1. **`TrivialModel`** — embedding → linear head. No attention.
 2. **`SingleAttentionModel`** — embedding → `SingleHeadAttention` (with causal mask) → linear head.
 3. **`MultiAttentionModel`** — embedding → `MultiHeadAttention` (fused QKV, causal mask) → linear head.
-4. **`MiniGpt`** — token + position embeddings → stack of pre-norm `Block`s (`LayerNorm → MultiHeadAttention → residual → LayerNorm → MLP → residual`) → final `LayerNorm` → linear LM head. Supports `generate()` / `generate_cached()` (greedy argmax, context cropped to `block_size`) and `forward_tokens_with_attention()` for attention introspection.
+4. **`MiniGpt`** — token + position embeddings → stack of pre-norm `Block`s (`LayerNorm → MultiHeadAttention → residual → LayerNorm → dense MLP → residual`) → final `LayerNorm` → linear LM head. Supports `generate()` / `generate_cached()` (greedy argmax, context cropped to `block_size`) and `forward_tokens_with_attention()` for attention introspection.
+5. **`MoeGpt`** — MiniGPT shape with each block's feed-forward slot replaced by `MoeFeedForward` (`Router` + expert MLP pool). Training adds `moe_aux_loss_weight * load_balancing_loss` to the language-model loss; HTTP generation returns optional `routing[]` data for the UI.
 
-`ModelChoice::Compare` expands to the full list and trains/evals all four in sequence — `unreachable!` arms in the match dispatch enforce that expansion happens upstream of forward/training dispatch.
+`ModelChoice::Compare` expands to the full list and trains/evals all five in sequence — `unreachable!` arms in the match dispatch enforce that expansion happens upstream of forward/training dispatch.
 
 ### Backend & autodiff plumbing
 
@@ -194,7 +199,7 @@ Each `train(...)` returns `TrainingOutcome<M> { model, metrics }` where `Trainin
 The tokenizer is chosen by model:
 
 - `RuntimeTokenizer::Char(CharTokenizer)` — used by `Trivial`, `SingleAttention`, `MultiAttention`. Built from the corpus via `CharTokenizer::from_text` (sorted-unique chars ⇒ id, so the same corpus always produces the same vocab).
-- `RuntimeTokenizer::Bpe(BpeTokenizer)` — used by `MiniGpt`. Loaded from `checkpoints/tokenizer.json` (or `RUSTY_GPT_BPE_TOKENIZER`) — **not derived from the corpus**. If the file is missing, `runtime_assets::load_minigpt_tokenizer` errors with the exact `cargo run --bin train-tokenizer ...` command to run.
+- `RuntimeTokenizer::Bpe(BpeTokenizer)` — used by `MiniGpt` and `MoeGpt`. Loaded from `checkpoints/tokenizer.json` (or `RUSTY_GPT_BPE_TOKENIZER`) — **not derived from the corpus**. If the file is missing, `runtime_assets::load_minigpt_tokenizer` errors with the exact `cargo run --bin train-tokenizer ...` command to run.
 
 Other invariants:
 - `CharTokenizer::encode` panics on unknown chars; **use `try_encode` for any user-supplied input** (the interactive loop and the HTTP `/generate` endpoint do this). The BPE path is byte-based and never panics.
@@ -208,11 +213,11 @@ Other invariants:
 
 `src/server/mod.rs` exposes an Axum `Router<SharedServerState<B>>` with `POST /generate`, `GET /info`, and `GET /health`. `runtime_orchestration::run_http_server` nests that router under `/api` (final routes: `/api/generate`, `/api/info`, `/api/health`), binds to `--server-addr` (default `127.0.0.1:8787`), and serves with `axum::serve`.
 
-`ServerState` holds a `MiniGpt`, a `RuntimeTokenizer`, a `B::Device`, an `EventLogger`, `ServerProvenance` (uptime + checkpoint source/basename/sha256 + tokenizer sha256, populated once at startup by `run_http_server`), generate request limits, and the in-process token bucket. The model can come from one of three places at startup: a fresh template (default), `--load-checkpoint <path>`, or `--load-latest-checkpoint` (newest `*.mpk` in `checkpoints/`). The two `--load-*` flags are mutually exclusive — `runtime_config.rs` enforces this at parse time.
+`ServerState` holds a `ServedModel` (`MiniGpt` or `MoeGpt`), a `RuntimeTokenizer`, a `B::Device`, an `EventLogger`, `ServerProvenance` (uptime + checkpoint source/basename/sha256 + tokenizer sha256, populated once at startup by `run_http_server`), generate request limits, and the in-process token bucket. The model can come from one of three places at startup: a fresh template (default), `--load-checkpoint <path>`, or `--load-latest-checkpoint` (newest `*.mpk` in `checkpoints/`). The two `--load-*` flags are mutually exclusive — `runtime_config.rs` enforces this at parse time.
 
 `GET /api/health` is the liveness probe: returns status, uptime, model shape, checkpoint source (`"none" | "explicit" | "latest"`), checkpoint+tokenizer sha256, and **only file basenames — never absolute paths** (information-disclosure boundary, enforced by `health_never_exposes_absolute_path` test). It is intentionally outside any future rate limiter so monitoring probes don't get 429'd.
 
-`GenerateResponse` includes per-layer/per-head attention matrices (`AttentionData { layer, head, weights }`) for visualization; the React UI in `mini-gpt-ui/` is the primary consumer.
+`GenerateResponse` includes per-layer/per-head attention matrices (`AttentionData { layer, head, weights }`) and, for MoeGPT, optional `routing[]` expert assignments for visualization; the React UI in `mini-gpt-ui/` is the primary consumer.
 
 `POST /api/generate` accepts an optional `top_k` alongside `prompt`, `max_tokens`, and `temperature`. API requests require `temperature > 0` (sampling); `top_k == 0` is rejected. Greedy decoding (`GenerationOptions::greedy()`, temperature 0) stays available internally for benchmarks/tests. Generation entry points have `_with_options` variants in `src/model/mod.rs`.
 
@@ -222,22 +227,22 @@ Other invariants:
 
 - `src/bin/train-tokenizer.rs` — `cargo run --bin train-tokenizer -- --corpus <path-or-hf-uri> --vocab-size <n> --output <path.json>`. `--corpus` accepts a local path or an `hf://` dataset URI (same loader as `--input`). Emits JSON progress events to stdout. Required to produce the BPE tokenizer MiniGPT depends on.
 - `src/bin/collect-source.rs` — `cargo run --bin collect-source -- --repo <path> [--output <path>]`. Concatenates source files from a repo into `data/<name>.txt` for use as a training corpus.
-- `scripts/run_training.sh`, `scripts/run_local.sh`, `scripts/run_e2e_tests.sh`, `scripts/build_release_candidate.sh` — convenience wrappers; see the README for details. `run_training.sh` is fully flag-driven: `--backend`, `--model`, `--checkpoint`, `--tokenizer`, `--train-tokenizer`, `--vocab-size`, `--cargo-profile`, `--train-steps`, `--eval-interval`, `--prefetch-batches`, `--log-format`, `--benchmark*`, `--artifacts-dir`. The old `RUSTY_GPT_*` env overrides are **deprecated** — still honored (CLI flags win) but each emits a deprecation warning; use the equivalent flag instead.
+- `scripts/run_training.sh`, `scripts/run_local.sh`, `scripts/run_e2e_tests.sh`, `scripts/build_release_candidate.sh` — convenience wrappers; see the README for details. `run_training.sh` is fully flag-driven: `--backend`, `--model`, `--checkpoint`, `--tokenizer`, `--train-tokenizer`, `--vocab-size`, `--cargo-profile`, `--train-steps`, `--eval-interval`, `--prefetch-batches`, `--log-format`, `--benchmark*`, `--artifacts-dir`.
 - `mini-gpt-ui/` — separate React frontend with its own README and toolchain. Calls the Rust server's `/api` routes. **Out of scope** for this memo; treat it as a black-box consumer.
 
 ## Gotchas
 
 - **Checkpoints**: Burn's `NamedMpkFileRecorder` appends `.mpk` automatically. Pass the path **without** the extension (e.g. `checkpoints/mini_gpt`); the actual file is `checkpoints/mini_gpt.mpk`. `--checkpoint` and `RUSTY_GPT_MINIGPT_CHECKPOINT` follow the same convention and are confined to `checkpoints/`; bare names such as `mini_gpt` resolve under that directory. The `checkpoints/` directory is gitignored.
-- **Checkpoint metadata sidecar**: MiniGPT saves also write `<checkpoint>.metadata.json` next to the `.mpk` weights (`src/model/persistence.rs`). It records model shape, tokenizer path + sha256, input source, training hyperparameters, final value loss/perplexity, and git commit. Two loaders exist: `load_model_with_metadata_validation` fails on model-shape mismatch but tolerates a missing sidecar (legacy `.mpk` files still load); `load_model_with_strict_metadata_validation` (the production path) additionally rejects a missing sidecar and any tokenizer-path/hash mismatch with a diff-style error.
-- **MiniGPT needs `checkpoints/tokenizer.json` to exist** — there is no auto-train fallback. If absent, `runtime_assets::load_minigpt_tokenizer` returns an error containing the exact `train-tokenizer` command to run. `RUSTY_GPT_BPE_TOKENIZER` overrides the path.
+- **Checkpoint metadata sidecar**: MiniGPT and MoeGPT saves also write `<checkpoint>.metadata.json` next to the `.mpk` weights (`src/model/persistence.rs`). It records model kind/shape, MoE expert shape when present, tokenizer path + sha256, input source, training hyperparameters, final value loss/perplexity, optional aux loss, and git commit. Two loaders exist: `load_model_with_metadata_validation` fails on model-shape mismatch but tolerates a missing sidecar (legacy `.mpk` files still load); `load_model_with_strict_metadata_validation` (the production path) additionally rejects a missing sidecar and any tokenizer-path/hash mismatch with a diff-style error.
+- **MiniGPT and MoeGPT need `checkpoints/tokenizer.json` to exist** — there is no auto-train fallback. If absent, `runtime_assets::load_minigpt_tokenizer` returns an error containing the exact `train-tokenizer` command to run. `RUSTY_GPT_BPE_TOKENIZER` overrides the path.
 - **Strict checkpoint loading rejects tokenizer-hash mismatches**: if you trained against tokenizer A and try to load that checkpoint against a differently-trained `tokenizer.json`, the strict loader bails with the expected vs. actual sha256. The lenient loader exists for tests/back-compat — don't use it in production codepaths.
 - **Server routes live under `/api`** — `src/server/mod.rs` defines `/generate`, `/info`, and `/health`, but `run_http_server` nests them under `/api`. `curl http://localhost:8787/generate` returns 404; the right paths are `/api/generate`, `/api/info`, `/api/health`.
 - **New API endpoints must opt into request body limits intentionally** — `POST /api/generate` attaches its body-size limit directly to that route so health/info are not constrained. Any new body-bearing `/api/*` endpoint should add an explicit route-local limit instead of relying on a global default.
-- **`--serve` only hosts MiniGPT** — the other three model variants are training-only and cannot be served. `--load-checkpoint` and `--load-latest-checkpoint` are mutually exclusive (parse-time error).
+- **`--serve` only hosts MiniGPT and MoeGPT** — the three char-level variants are training-only and cannot be served. `--load-checkpoint` and `--load-latest-checkpoint` are mutually exclusive (parse-time error).
 - **Checkpoint dir scan** — `--load-latest-checkpoint` reads from the hardcoded `checkpoints/` directory (`DEFAULT_CHECKPOINT_DIR` in `src/runtime_assets.rs`), regardless of `--checkpoint`. The `--checkpoint` flag only matters for explicit save/load paths.
-- **Interactive mode constraints**: `--interactive-generate` requires both `--backend cpu` and `--model minigpt`; any other combination errors out in `run_cpu_demo` / `main`.
+- **Interactive mode constraints**: `--interactive-generate` requires `--backend cpu` and `--model minigpt` or `--model moe-gpt`; any other combination errors out in `run_cpu_demo` / `main`.
 - **CPU default must stay CUDA-free**: `tests/default_runtime.rs` greps stderr/stdout for `libcuda` and fails if it appears. Keep `BackendChoice::Cpu` away from CUDA types.
-- **`compare` is a pseudo-variant**: it is expanded to the four real models via `ModelChoice::comparison_models()` before forward/training dispatch. The forward and training match statements on `ModelChoice::Compare` are `unreachable!()` and must stay that way.
+- **`compare` is a pseudo-variant**: it is expanded to the five real models via `ModelChoice::comparison_models()` before forward/training dispatch. The forward and training match statements on `ModelChoice::Compare` are `unreachable!()` and must stay that way.
 - **Env-mutating tests use `unsafe`**: Rust 2024 makes `env::set_var` / `env::remove_var` unsafe. Existing tests in `main.rs` wrap them in `unsafe { ... }` blocks with a SAFETY comment — follow the same pattern when adding more.
 - **Burn features**: `burn` is pulled in with `["train", "ndarray", "wgpu"]` in `Cargo.toml`. The `wgpu` feature isn't exercised at runtime but kept so the CPU build stays portable; `cuda` is the only opt-in feature.
 - **`data-secret/` is gitignored**: anything you drop there (e.g. `fafolang.txt`, `claude_src.txt`) won't be committed. Use it for corpora you don't want in the repo.

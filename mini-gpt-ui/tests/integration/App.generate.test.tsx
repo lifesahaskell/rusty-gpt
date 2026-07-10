@@ -28,13 +28,42 @@ const generateResponse = {
   ],
 }
 
+const moeGenerateResponse = {
+  ...generateResponse,
+  routing: [
+    {
+      layer: 0,
+      experts: [
+        [1, 3],
+        [2, 0],
+        [1, 2],
+      ],
+      weights: [
+        [0.7, 0.3],
+        [0.6, 0.4],
+        [0.8, 0.2],
+      ],
+    },
+  ],
+}
+
 const modelInfo = {
+  model_kind: 'minigpt',
   vocab_size: 2048,
   num_layers: 4,
   num_heads: 4,
   block_size: 128,
+  num_experts: 0,
+  moe_top_k: 0,
   tokenizer_vocab_size: 2048,
   model_tokenizer_vocab_match: true,
+}
+
+const moeModelInfo = {
+  ...modelInfo,
+  model_kind: 'moe-gpt',
+  num_experts: 4,
+  moe_top_k: 2,
 }
 
 describe('App generation flow', () => {
@@ -80,6 +109,26 @@ describe('App generation flow', () => {
 
     expect(screen.getByRole('combobox', { name: /layer \/ head/i })).toHaveValue('0')
     expect(screen.getByRole('img', { name: /attention weight heatmap/i })).toBeInTheDocument()
+  })
+
+  it('renders expert routing when the generation response includes MoE data', async () => {
+    const user = userEvent.setup()
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ json: vi.fn().mockResolvedValue(moeModelInfo) })
+      .mockResolvedValueOnce({ json: vi.fn().mockResolvedValue(moeGenerateResponse) })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<App />)
+
+    await screen.findByText('4 / top 2')
+    await user.click(screen.getByRole('button', { name: /generate/i }))
+    await screen.findByText('ROMEO: hi')
+    await user.click(screen.getByRole('button', { name: /^attention$/i }))
+
+    expect(screen.getByRole('heading', { name: /expert routing/i })).toBeInTheDocument()
+    expect(screen.getByRole('img', { name: /expert routing for layer 0/i })).toBeInTheDocument()
+    expect(screen.getByLabelText(/token 0 expert 1 weight 0.700/i)).toBeInTheDocument()
   })
 
   it('resets token and attention selection after a new generation request', async () => {

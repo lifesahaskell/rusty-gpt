@@ -6,8 +6,8 @@ use rusty_gpt::model::persistence::{
     sha256_file_hex,
 };
 use rusty_gpt::model::{
-    MiniGpt, MultiAttentionModel, SingleAttentionModel, TrainingLogContext, TrainingOutcome,
-    TrainingParams, TrivialModel,
+    MiniGpt, MoeGpt, MoeGptConfig, MultiAttentionModel, SingleAttentionModel, TrainingLogContext,
+    TrainingOutcome, TrainingParams, TrivialModel,
 };
 use rusty_gpt::observability::{EventLogger, RuntimeEvent};
 use rusty_gpt::runtime_signals::{INTERRUPTED_EXIT_CODE, install_training_signal_handler};
@@ -15,9 +15,11 @@ use rusty_gpt::utils::{BenchmarkConfig, benchmark_generation};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::runtime_assets::{load_minigpt_checkpoint, minigpt_tokenizer_path, tokenizer_for_model};
+use crate::runtime_assets::{
+    load_minigpt_checkpoint, load_moegpt_checkpoint, minigpt_tokenizer_path, tokenizer_for_model,
+};
 use crate::runtime_config::{Hyperparameters, ModelChoice};
 
 pub(crate) fn run_training_demo<B>(
@@ -32,8 +34,8 @@ where
     B: burn::tensor::backend::AutodiffBackend,
     B::FloatElem: Into<f64>,
 {
-    if options.benchmark_generation && !model_choice.includes_minigpt() {
-        bail!("generation benchmarks require --model minigpt or compare");
+    if options.benchmark_generation && !model_choice.includes_generation_model() {
+        bail!("generation benchmarks require --model minigpt, moe-gpt, or compare");
     }
 
     // Install the SIGINT/SIGTERM handler *only* on the training path so that
@@ -217,6 +219,7 @@ where
                 rusty_gpt::model::TrainingMetrics {
                     final_value_loss: 0.0,
                     final_perplexity: 0.0,
+                    final_aux_loss: None,
                 },
             )?;
             // Fresh run builds a template; `--resume-from` loads weights via
@@ -252,7 +255,7 @@ where
             let steps_completed = outcome.steps_completed;
             if !interrupted && run.benchmark_generation {
                 benchmark_generation(
-                    &outcome.model,
+                    &rusty_gpt::utils::GenerationModel::MiniGpt(&outcome.model),
                     run.device,
                     &run.benchmark_config,
                     &run.logger,
@@ -261,6 +264,74 @@ where
                 .context("failed to benchmark minigpt generation")?;
             }
             save_minigpt_checkpoint(outcome, run.checkpoint_path, &run)?;
+            if interrupted {
+                eprintln!(
+                    "training interrupted at step {steps_completed}; partial checkpoint saved. Exiting with code {INTERRUPTED_EXIT_CODE}."
+                );
+                std::process::exit(INTERRUPTED_EXIT_CODE);
+            }
+        }
+        ModelChoice::MoeGpt => {
+            run.logger.log(RuntimeEvent::TrainingStarted {
+                backend: run.backend_label.to_string(),
+                model: run.model_choice.label().to_string(),
+                vocab_size: run.vocab_size,
+                batch_size: run.hyperparameters.batch_size,
+                block_size: run.hyperparameters.block_size,
+                total_steps: run.hyperparameters.train_steps,
+            });
+            let started_at = Instant::now();
+            let interval = run.hyperparameters.checkpoint_interval;
+            let keep = run.hyperparameters.checkpoint_keep;
+            let checkpoint_path = run.checkpoint_path;
+            let logger = run.logger.clone();
+            let metadata_template = checkpoint_metadata(
+                &run,
+                rusty_gpt::model::TrainingMetrics {
+                    final_value_loss: 0.0,
+                    final_perplexity: 0.0,
+                    final_aux_loss: None,
+                },
+            )?;
+            let (initial_model, start_step) = resolve_moegpt_start_model::<B>(&run)?;
+            let train_params = params
+                .with_grad_clip_norm(run.hyperparameters.minigpt_grad_clip_norm)
+                .with_start_step(start_step);
+            let outcome = MoeGpt::<B>::train_prebuilt_with_periodic_save(
+                initial_model,
+                run.data_loader,
+                run.value_loader,
+                run.device,
+                train_params,
+                |model, step| {
+                    save_periodic_moegpt_checkpoint(
+                        model,
+                        checkpoint_path,
+                        step,
+                        interval,
+                        keep,
+                        &metadata_template,
+                        &logger,
+                    )
+                    .map_err(|err| err.to_string())
+                },
+            )
+            .map_err(anyhow::Error::msg)
+            .context("failed to train moe-gpt model")?;
+            log_training_completed(&run, started_at, outcome.metrics);
+            let interrupted = outcome.interrupted;
+            let steps_completed = outcome.steps_completed;
+            if !interrupted && run.benchmark_generation {
+                benchmark_generation(
+                    &rusty_gpt::utils::GenerationModel::MoeGpt(&outcome.model),
+                    run.device,
+                    &run.benchmark_config,
+                    &run.logger,
+                )
+                .map_err(anyhow::Error::msg)
+                .context("failed to benchmark moe-gpt generation")?;
+            }
+            save_moegpt_checkpoint(outcome, run.checkpoint_path, &run)?;
             if interrupted {
                 eprintln!(
                     "training interrupted at step {steps_completed}; partial checkpoint saved. Exiting with code {INTERRUPTED_EXIT_CODE}."
@@ -357,6 +428,54 @@ where
     Ok((model, completed_steps))
 }
 
+fn moegpt_config<B: burn::tensor::backend::AutodiffBackend>(
+    run: &TrainingRun<'_, B>,
+) -> MoeGptConfig {
+    MoeGptConfig {
+        base: rusty_gpt::model::MiniGptConfig {
+            vocab_size: run.vocab_size,
+            d_model: run.hyperparameters.embed_dim,
+            num_blocks: run.hyperparameters.num_layers,
+            max_position_embeddings: run.hyperparameters.block_size,
+            num_heads: run.hyperparameters.num_heads,
+        },
+        num_experts: run.hyperparameters.moe_experts,
+        top_k: run.hyperparameters.moe_top_k,
+        aux_loss_weight: run.hyperparameters.moe_aux_loss_weight,
+    }
+}
+
+fn resolve_moegpt_start_model<B>(run: &TrainingRun<'_, B>) -> Result<(MoeGpt<B>, usize)>
+where
+    B: burn::tensor::backend::AutodiffBackend,
+{
+    let make_template = || MoeGpt::<B>::new(moegpt_config(run), run.device);
+
+    let Some(resume_path) = run.resume_from else {
+        return Ok((make_template(), 0));
+    };
+    let load_path = resume_load_path(resume_path);
+    let metadata = load_checkpoint_metadata(&load_path)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot resume from {:?}: missing metadata sidecar",
+            load_path
+        )
+    })?;
+    let completed_steps = metadata.completed_steps;
+    let target = run.hyperparameters.train_steps;
+    if completed_steps >= target {
+        bail!(
+            "nothing to resume: checkpoint {:?} already completed {completed_steps} steps, which is >= --train-steps {target}.",
+            load_path
+        );
+    }
+
+    let model = load_moegpt_checkpoint(make_template(), &load_path, run.device, &run.logger)
+        .with_context(|| format!("failed to resume moe-gpt training from {:?}", load_path))?;
+
+    Ok((model, completed_steps))
+}
+
 /// Normalise a `--resume-from` checkpoint path so downstream loaders (which
 /// call `with_extension("mpk")`) resolve the real on-disk `.mpk` file even when
 /// the stem contains a dot, e.g. `mini_gpt.step-4` → `mini_gpt.step-4.mpk`.
@@ -397,6 +516,47 @@ fn save_minigpt_checkpoint<B: burn::tensor::backend::AutodiffBackend>(
         .with_context(|| format!("failed to save minigpt checkpoint to {:?}", save_path))?;
     let mut metadata = checkpoint_metadata(run, outcome.metrics)?;
     // Absolute steps completed — the value `--resume-from` reads to continue.
+    metadata.completed_steps = outcome.steps_completed;
+    if outcome.interrupted {
+        metadata.interrupted = true;
+        metadata.interrupted_at_step = Some(outcome.steps_completed);
+    }
+    save_checkpoint_metadata(&save_path, &metadata)
+        .with_context(|| format!("failed to save checkpoint metadata for {:?}", save_path))?;
+    let saved_mpk = save_path.with_extension("mpk").display().to_string();
+    run.logger.log(RuntimeEvent::CheckpointSaved {
+        path: saved_mpk.clone(),
+        elapsed_ms: started_at.elapsed().as_millis(),
+    });
+    if outcome.interrupted {
+        eprintln!("interrupted checkpoint saved at {saved_mpk}");
+    }
+
+    Ok(())
+}
+
+fn save_moegpt_checkpoint<B: burn::tensor::backend::AutodiffBackend>(
+    outcome: TrainingOutcome<MoeGpt<B>>,
+    checkpoint_path: &Path,
+    run: &TrainingRun<'_, B>,
+) -> Result<()> {
+    if let Some(parent) = checkpoint_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create checkpoint directory {:?}", parent))?;
+    }
+
+    let save_path = if outcome.interrupted {
+        interrupted_checkpoint_path(checkpoint_path, outcome.steps_completed)
+    } else {
+        checkpoint_path.to_path_buf()
+    };
+
+    let started_at = Instant::now();
+    save_model(outcome.model, &save_path)
+        .with_context(|| format!("failed to save moe-gpt checkpoint to {:?}", save_path))?;
+    let mut metadata = checkpoint_metadata(run, outcome.metrics)?;
     metadata.completed_steps = outcome.steps_completed;
     if outcome.interrupted {
         metadata.interrupted = true;
@@ -511,6 +671,54 @@ where
     Ok(())
 }
 
+fn save_periodic_moegpt_checkpoint<B>(
+    model: &MoeGpt<B>,
+    checkpoint_path: &Path,
+    step: usize,
+    interval: usize,
+    keep: usize,
+    metadata_template: &CheckpointMetadata,
+    logger: &EventLogger,
+) -> Result<()>
+where
+    B: burn::tensor::backend::AutodiffBackend,
+{
+    if let Some(parent) = checkpoint_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create checkpoint directory {:?}", parent))?;
+    }
+
+    let save_path = step_checkpoint_path(checkpoint_path, step);
+    let started_at = Instant::now();
+    save_model(model.clone(), &save_path).with_context(|| {
+        format!(
+            "failed to save periodic moe-gpt checkpoint to {:?}",
+            save_path
+        )
+    })?;
+
+    let mut metadata = metadata_template.clone();
+    metadata.step = Some(step);
+    metadata.interval = Some(interval);
+    metadata.completed_steps = step;
+    save_checkpoint_metadata(&save_path, &metadata).with_context(|| {
+        format!(
+            "failed to save periodic checkpoint metadata for {:?}",
+            save_path
+        )
+    })?;
+
+    logger.log(RuntimeEvent::CheckpointSaved {
+        path: save_path.display().to_string(),
+        elapsed_ms: started_at.elapsed().as_millis(),
+    });
+
+    prune_old_step_checkpoints(checkpoint_path, keep);
+    Ok(())
+}
+
 /// Scan the directory containing `checkpoint_base`, find all periodic
 /// `<base>.step-<N>.mpk` snapshots, keep the most recent `keep`, delete the
 /// rest along with their `.step-<N>.metadata.json` sidecars. Orphan
@@ -612,6 +820,13 @@ fn prune_old_step_checkpoints(checkpoint_base: &Path, keep: usize) {
     }
 }
 
+fn unix_timestamp_string() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
 fn checkpoint_metadata<B: burn::tensor::backend::AutodiffBackend>(
     run: &TrainingRun<'_, B>,
     metrics: rusty_gpt::model::TrainingMetrics,
@@ -619,15 +834,26 @@ fn checkpoint_metadata<B: burn::tensor::backend::AutodiffBackend>(
     let tokenizer_path = PathBuf::from(minigpt_tokenizer_path());
     Ok(CheckpointMetadata {
         version: 1,
-        created_at_utc: chrono::Utc::now().to_rfc3339(),
+        created_at_utc: unix_timestamp_string(),
         git_commit: current_git_commit(),
         input_source: run.input_source.to_string(),
         model_shape: CheckpointModelShape {
+            kind: Some(run.model_choice.label().to_string()),
             vocab_size: run.vocab_size,
             block_size: run.hyperparameters.block_size,
             embed_dim: run.hyperparameters.embed_dim,
             num_heads: run.hyperparameters.num_heads,
             num_layers: run.hyperparameters.num_layers,
+            num_experts: if run.model_choice == ModelChoice::MoeGpt {
+                run.hyperparameters.moe_experts
+            } else {
+                0
+            },
+            moe_top_k: if run.model_choice == ModelChoice::MoeGpt {
+                run.hyperparameters.moe_top_k
+            } else {
+                0
+            },
         },
         tokenizer: CheckpointTokenizer {
             path: tokenizer_path.display().to_string(),
@@ -644,10 +870,16 @@ fn checkpoint_metadata<B: burn::tensor::backend::AutodiffBackend>(
             eval_interval: run.hyperparameters.eval_interval,
             grad_clip_norm: run.hyperparameters.minigpt_grad_clip_norm,
             prefetch_batches: run.hyperparameters.prefetch_batches,
+            moe_aux_loss_weight: if run.model_choice == ModelChoice::MoeGpt {
+                run.hyperparameters.moe_aux_loss_weight
+            } else {
+                0.0
+            },
         },
         final_metrics: CheckpointTrainingMetrics {
             final_value_loss: metrics.final_value_loss,
             final_perplexity: metrics.final_perplexity,
+            final_aux_loss: metrics.final_aux_loss,
         },
         interrupted: false,
         interrupted_at_step: None,

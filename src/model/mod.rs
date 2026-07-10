@@ -12,8 +12,7 @@ pub mod training;
 pub use generation::GenerationOptions;
 pub use moe::{MoeFeedForward, MoeForwardAux, Router, RouterOutput, load_balancing_loss};
 pub use training::{
-    LearningRateSchedule, TrainingLogContext, TrainingLogFormat, TrainingMetrics, TrainingOutcome,
-    TrainingParams,
+    LearningRateSchedule, TrainingLogContext, TrainingMetrics, TrainingOutcome, TrainingParams,
 };
 #[cfg(test)]
 use training::{TrainingThroughput, should_log_training_step, training_progress_log_line};
@@ -25,6 +24,14 @@ pub struct MiniGptConfig {
     pub num_blocks: usize,
     pub max_position_embeddings: usize,
     pub num_heads: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MoeGptConfig {
+    pub base: MiniGptConfig,
+    pub num_experts: usize,
+    pub top_k: usize,
+    pub aux_loss_weight: f64,
 }
 
 pub struct LayerCache<B: Backend> {
@@ -418,20 +425,6 @@ impl<B: Backend> Mlp<B> {
     }
 }
 
-/// Pluggable feed-forward slot for a transformer [`Block`].
-///
-/// `Dense` is the original single-[`Mlp`] path; `Moe` swaps in a
-/// mixture-of-experts feed-forward. The enum is itself a Burn module — Burn
-/// 0.21 supports `#[derive(Module)]` on enums — so both variants participate in
-/// autodiff, device movement, and checkpoint records like any other module.
-///
-/// Checkpoint note: wrapping the feed-forward in this enum changes the record
-/// tree for the `mlp` field from a bare `Mlp` record to a tagged `FeedForward`
-/// enum record, so a `Dense` block serializes under a `Dense` variant tag.
-/// Burn's `NamedMpkFileRecorder` tolerates loading a pre-enum bare-`Mlp` record
-/// into the single-variant-shaped `Dense` slot (verified by the
-/// `legacy_dense_checkpoint_loads_into_feed_forward` test), so legacy dense
-/// checkpoints keep loading.
 #[derive(Module, Debug)]
 pub enum FeedForward<B: Backend> {
     Dense(Mlp<B>),
@@ -439,35 +432,45 @@ pub enum FeedForward<B: Backend> {
 }
 
 impl<B: Backend> FeedForward<B> {
-    /// Construct the default dense feed-forward (`d_ff = 4 * d_model`).
     pub fn dense(d_model: usize, device: &B::Device) -> Self {
-        FeedForward::Dense(Mlp::new(d_model, 4 * d_model, device))
+        Self::Dense(Mlp::new(d_model, 4 * d_model, device))
     }
 
-    /// Wrap an existing [`MoeFeedForward`] as the feed-forward slot.
-    pub fn moe(moe: MoeFeedForward<B>) -> Self {
-        FeedForward::Moe(moe)
+    pub fn moe(d_model: usize, num_experts: usize, top_k: usize, device: &B::Device) -> Self {
+        Self::Moe(MoeFeedForward::new(
+            d_model,
+            4 * d_model,
+            num_experts,
+            top_k,
+            device,
+        ))
     }
 
-    /// Run the feed-forward, discarding any auxiliary loss. Kept for
-    /// dense-only callers and inference paths that never need the aux value.
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         self.forward_with_aux(x).0
     }
 
-    /// Run the feed-forward and surface an optional auxiliary loss.
-    ///
-    /// `Dense` never produces an aux loss (`None`); `Moe` returns
-    /// `Some(load_balancing_loss)` so the training loop can fold it into the
-    /// total loss. This is the single feed-forward tail every [`Block`] forward
-    /// variant routes through.
-    pub fn forward_with_aux(&self, x: Tensor<B, 3>) -> (Tensor<B, 3>, Option<Tensor<B, 1>>) {
+    pub fn forward_with_aux(&self, x: Tensor<B, 3>) -> (Tensor<B, 3>, Option<MoeForwardAux<B>>) {
         match self {
-            FeedForward::Dense(mlp) => (mlp.forward(x), None),
-            FeedForward::Moe(moe) => {
+            Self::Dense(mlp) => (mlp.forward(x), None),
+            Self::Moe(moe) => {
                 let (output, aux) = moe.forward(x);
-                (output, Some(aux.load_balancing_loss()))
+                (output, Some(aux))
             }
+        }
+    }
+
+    pub fn num_experts(&self) -> usize {
+        match self {
+            Self::Dense(_) => 0,
+            Self::Moe(moe) => moe.num_experts(),
+        }
+    }
+
+    pub fn top_k(&self) -> usize {
+        match self {
+            Self::Dense(_) => 0,
+            Self::Moe(moe) => moe.top_k(),
         }
     }
 }
@@ -490,9 +493,6 @@ impl<B: Backend> Block<B> {
         }
     }
 
-    /// Construct a block with an explicit feed-forward slot (dense or MoE),
-    /// leaving [`Block::new`]'s dense default untouched. Lets a later MoeGpt
-    /// build blocks whose feed-forward is a [`MoeFeedForward`].
     pub fn new_with_feed_forward(
         d_model: usize,
         num_heads: usize,
@@ -507,11 +507,7 @@ impl<B: Backend> Block<B> {
         }
     }
 
-    /// Single feed-forward tail shared by every forward variant: apply `ln2`,
-    /// run the feed-forward, add the residual, and surface the optional aux
-    /// loss. All other variants call this and discard the aux value, so there
-    /// is exactly one place the feed-forward is applied.
-    fn feed_forward_residual(&self, x: Tensor<B, 3>) -> (Tensor<B, 3>, Option<Tensor<B, 1>>) {
+    fn feed_forward_residual(&self, x: Tensor<B, 3>) -> (Tensor<B, 3>, Option<MoeForwardAux<B>>) {
         let (ff_output, aux) = self.mlp.forward_with_aux(self.ln2.forward(x.clone()));
         (x + ff_output, aux)
     }
@@ -525,16 +521,11 @@ impl<B: Backend> Block<B> {
         self.forward_with_mask_and_aux(x, mask).0
     }
 
-    /// Masked forward that also returns the feed-forward auxiliary loss.
-    ///
-    /// The training path uses this so a `Moe` feed-forward can surface its
-    /// load-balancing loss; a `Dense` feed-forward returns `None` and output
-    /// identical to [`Block::forward_with_mask`].
     pub fn forward_with_mask_and_aux(
         &self,
         x: Tensor<B, 3>,
         mask: Tensor<B, 4, Bool>,
-    ) -> (Tensor<B, 3>, Option<Tensor<B, 1>>) {
+    ) -> (Tensor<B, 3>, Option<MoeForwardAux<B>>) {
         let x = x.clone() + self.attn.forward_with_mask(self.ln1.forward(x), mask);
         self.feed_forward_residual(x)
     }
@@ -542,8 +533,7 @@ impl<B: Backend> Block<B> {
     pub fn forward_with_weights(&self, x: Tensor<B, 3>) -> (Tensor<B, 3>, Tensor<B, 4>) {
         let (attn_output, attn_weights) =
             self.attn.forward_with_weights(self.ln1.forward(x.clone()));
-        let x = x + attn_output;
-        let (x, _aux) = self.feed_forward_residual(x);
+        let x = self.feed_forward_residual(x + attn_output).0;
         (x, attn_weights)
     }
 
@@ -555,9 +545,20 @@ impl<B: Backend> Block<B> {
         let (attn_output, attn_weights) = self
             .attn
             .forward_with_weights_and_mask(self.ln1.forward(x.clone()), mask);
-        let x = x + attn_output;
-        let (x, _aux) = self.feed_forward_residual(x);
+        let x = self.feed_forward_residual(x + attn_output).0;
         (x, attn_weights)
+    }
+
+    pub fn forward_with_weights_mask_and_aux(
+        &self,
+        x: Tensor<B, 3>,
+        mask: Tensor<B, 4, Bool>,
+    ) -> (Tensor<B, 3>, Tensor<B, 4>, Option<MoeForwardAux<B>>) {
+        let (attn_output, attn_weights) = self
+            .attn
+            .forward_with_weights_and_mask(self.ln1.forward(x.clone()), mask);
+        let (x, aux) = self.feed_forward_residual(x + attn_output);
+        (x, attn_weights, aux)
     }
 
     pub fn forward_with_attention(&self, x: Tensor<B, 3>) -> (Tensor<B, 3>, Tensor<B, 4>) {
@@ -572,13 +573,20 @@ impl<B: Backend> Block<B> {
         let (attn_output, cache) = self
             .attn
             .forward_with_cache(self.ln1.forward(x.clone()), cache);
-        let x = x + attn_output;
-        let (x, _aux) = self.feed_forward_residual(x);
+        let x = self.feed_forward_residual(x + attn_output).0;
         (x, cache)
     }
 
     pub fn num_heads(&self) -> usize {
         self.attn.num_heads
+    }
+
+    pub fn num_experts(&self) -> usize {
+        self.mlp.num_experts()
+    }
+
+    pub fn moe_top_k(&self) -> usize {
+        self.mlp.top_k()
     }
 }
 
@@ -880,6 +888,354 @@ impl<B: Backend> MiniGpt<B> {
     }
 }
 
+#[derive(Module, Debug)]
+pub struct MoeGpt<B: Backend> {
+    token_embed: Embedding<B>,
+    position_embed: Embedding<B>,
+    blocks: Vec<Block<B>>,
+    ln_final: LayerNorm<B>,
+    lm_head: Linear<B>,
+    vocab_size: usize,
+    max_position_embeddings: usize,
+    num_experts: usize,
+    top_k: usize,
+    aux_loss_weight: f64,
+}
+
+impl<B: Backend> MoeGpt<B> {
+    pub fn new(config: MoeGptConfig, device: &B::Device) -> Self {
+        let token_embed =
+            EmbeddingConfig::new(config.base.vocab_size, config.base.d_model).init(device);
+        let position_embed =
+            EmbeddingConfig::new(config.base.max_position_embeddings, config.base.d_model)
+                .init(device);
+        let blocks = (0..config.base.num_blocks)
+            .map(|_| {
+                Block::new_with_feed_forward(
+                    config.base.d_model,
+                    config.base.num_heads,
+                    FeedForward::moe(
+                        config.base.d_model,
+                        config.num_experts,
+                        config.top_k,
+                        device,
+                    ),
+                    device,
+                )
+            })
+            .collect();
+        let ln_final = LayerNormConfig::new(config.base.d_model).init(device);
+        let lm_head = LinearConfig::new(config.base.d_model, config.base.vocab_size).init(device);
+
+        Self {
+            token_embed,
+            position_embed,
+            blocks,
+            ln_final,
+            lm_head,
+            vocab_size: config.base.vocab_size,
+            max_position_embeddings: config.base.max_position_embeddings,
+            num_experts: config.num_experts,
+            top_k: config.top_k,
+            aux_loss_weight: config.aux_loss_weight,
+        }
+    }
+
+    pub fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    pub fn num_layers(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub fn num_heads(&self) -> usize {
+        self.blocks.first().map(Block::num_heads).unwrap_or(0)
+    }
+
+    pub fn d_model(&self) -> usize {
+        self.token_embed.weight.shape().dims::<2>()[1]
+    }
+
+    pub fn block_size(&self) -> usize {
+        self.max_position_embeddings
+    }
+
+    pub fn num_experts(&self) -> usize {
+        self.num_experts
+    }
+
+    pub fn moe_top_k(&self) -> usize {
+        self.top_k
+    }
+
+    pub fn aux_loss_weight(&self) -> f64 {
+        self.aux_loss_weight
+    }
+
+    pub fn forward_tokens(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+        self.forward_tokens_with_aux(tokens).0
+    }
+
+    pub fn forward_tokens_with_aux(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+    ) -> (Tensor<B, 3>, Vec<MoeForwardAux<B>>) {
+        let [_b, t] = tokens.dims();
+        let positions = Tensor::arange(0..t as i64, &tokens.device()).unsqueeze();
+        let tok = self.token_embed.forward(tokens);
+        let pos = self.position_embed.forward(positions);
+        self.forward_with_aux(tok + pos)
+    }
+
+    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        self.forward_with_aux(x).0
+    }
+
+    pub fn forward_with_aux(&self, mut x: Tensor<B, 3>) -> (Tensor<B, 3>, Vec<MoeForwardAux<B>>) {
+        let mut aux_losses = Vec::with_capacity(self.blocks.len());
+        if let Some(first_block) = self.blocks.first() {
+            let [batch_size, seq_len, _] = x.shape().dims();
+            let mask = MultiHeadAttention::<B>::causal_mask(
+                batch_size,
+                first_block.num_heads(),
+                seq_len,
+                &x.device(),
+            );
+            for block in &self.blocks {
+                let (next_x, aux) = block.forward_with_mask_and_aux(x, mask.clone());
+                x = next_x;
+                if let Some(aux) = aux {
+                    aux_losses.push(aux);
+                }
+            }
+        }
+
+        let x = self.ln_final.forward(x);
+        (self.lm_head.forward(x), aux_losses)
+    }
+
+    pub fn forward_tokens_with_attention(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+    ) -> (Tensor<B, 3>, Vec<Tensor<B, 4>>) {
+        self.forward_tokens_with_attention_and_routing(tokens)
+            .map_attention()
+    }
+
+    pub fn forward_tokens_with_attention_and_routing(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+    ) -> MoeAttentionRouting<B> {
+        let [_b, t] = tokens.dims();
+        let positions = Tensor::arange(0..t as i64, &tokens.device()).unsqueeze();
+        let tok = self.token_embed.forward(tokens);
+        let pos = self.position_embed.forward(positions);
+        self.forward_with_attention_and_routing(tok + pos)
+    }
+
+    pub fn forward_with_attention_and_routing(
+        &self,
+        mut x: Tensor<B, 3>,
+    ) -> MoeAttentionRouting<B> {
+        let mut attentions = Vec::with_capacity(self.blocks.len());
+        let mut routing = Vec::with_capacity(self.blocks.len());
+        if let Some(first_block) = self.blocks.first() {
+            let [batch_size, seq_len, _] = x.shape().dims();
+            let mask = MultiHeadAttention::<B>::causal_mask(
+                batch_size,
+                first_block.num_heads(),
+                seq_len,
+                &x.device(),
+            );
+            for block in &self.blocks {
+                let (next_x, attention, aux) =
+                    block.forward_with_weights_mask_and_aux(x, mask.clone());
+                x = next_x;
+                attentions.push(attention);
+                if let Some(aux) = aux {
+                    routing.push(aux);
+                }
+            }
+        }
+
+        let x = self.ln_final.forward(x);
+        MoeAttentionRouting {
+            logits: self.lm_head.forward(x),
+            attentions,
+            routing,
+        }
+    }
+
+    pub fn forward_with_cache(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        mut cache: KvCache<B>,
+    ) -> (Tensor<B, 3>, KvCache<B>) {
+        assert_eq!(
+            self.blocks.len(),
+            cache.layers.len(),
+            "KV cache must have one entry per transformer block"
+        );
+
+        let [_batch_size, seq_len] = tokens.dims();
+        let cache_len = cache
+            .layers
+            .first()
+            .and_then(|layer| layer.as_ref())
+            .map(|c| c.keys.dims()[2])
+            .unwrap_or(0);
+        let positions = Tensor::arange(
+            cache_len as i64..(cache_len + seq_len) as i64,
+            &tokens.device(),
+        )
+        .unsqueeze();
+        let tok = self.token_embed.forward(tokens);
+        let pos = self.position_embed.forward(positions);
+        let mut x = tok + pos;
+
+        for (i, block) in self.blocks.iter().enumerate() {
+            let layer_cache = cache.layers[i].take();
+            let (new_x, new_layer_cache) = block.forward_with_cache(x, layer_cache);
+            x = new_x;
+            cache.layers[i] = Some(new_layer_cache);
+        }
+
+        let x = self.ln_final.forward(x);
+        (self.lm_head.forward(x), cache)
+    }
+
+    pub fn generate(
+        &self,
+        prompt: &[usize],
+        max_new_tokens: usize,
+        device: &B::Device,
+    ) -> Result<Vec<usize>, String> {
+        self.generate_with_options(prompt, max_new_tokens, device, GenerationOptions::greedy())
+    }
+
+    pub fn generate_with_options(
+        &self,
+        prompt: &[usize],
+        max_new_tokens: usize,
+        device: &B::Device,
+        options: GenerationOptions,
+    ) -> Result<Vec<usize>, String> {
+        self.validate_generation_prompt(prompt)?;
+
+        let mut output = prompt.to_vec();
+        for _ in 0..max_new_tokens {
+            let context_start = output.len().saturating_sub(self.max_position_embeddings);
+            let context = &output[context_start..];
+            let input: Vec<i64> = context.iter().map(|&token| token as i64).collect();
+            let tokens = Tensor::from_data(TensorData::new(input, [1, context.len()]), device);
+            let logits = self.forward_tokens(tokens);
+            output.push(Self::select_last_token(logits, options));
+        }
+
+        Ok(output)
+    }
+
+    pub fn generate_cached_with_options(
+        &self,
+        prompt: Tensor<B, 2, Int>,
+        max_new: usize,
+        options: GenerationOptions,
+    ) -> Vec<usize> {
+        if max_new == 0 {
+            return Vec::new();
+        }
+
+        let device = prompt.device();
+        let mut cache = KvCache::empty(self.num_layers());
+        let (logits, new_cache) = self.forward_with_cache(prompt, cache);
+        cache = new_cache;
+        let mut next_token = Self::select_last_token(logits, options);
+        let mut generated = vec![next_token];
+
+        for _ in 1..max_new {
+            let next_input = Tensor::from_data([[next_token as i64]], &device);
+            let (logits, new_cache) = self.forward_with_cache(next_input, cache);
+            cache = new_cache;
+            next_token = Self::select_last_token(logits, options);
+            generated.push(next_token);
+        }
+
+        generated
+    }
+
+    pub fn generate_with_cache_options(
+        &self,
+        prompt: &[usize],
+        max_new_tokens: usize,
+        device: &B::Device,
+        options: GenerationOptions,
+    ) -> Result<Vec<usize>, String> {
+        self.validate_generation_prompt(prompt)?;
+
+        let mut output = prompt.to_vec();
+        let mut remaining = max_new_tokens;
+        while remaining > 0 {
+            let context_start = output.len().saturating_sub(self.max_position_embeddings);
+            let context = &output[context_start..];
+            let available_positions = self.max_position_embeddings.saturating_sub(context.len());
+            let chunk_len = remaining.min(available_positions.max(1));
+            let prompt_data: Vec<i64> = context.iter().map(|&token| token as i64).collect();
+            let prompt_tensor =
+                Tensor::from_data(TensorData::new(prompt_data, [1, context.len()]), device);
+            let generated = self.generate_cached_with_options(prompt_tensor, chunk_len, options);
+
+            remaining -= generated.len();
+            output.extend(generated);
+        }
+
+        Ok(output)
+    }
+
+    fn validate_generation_prompt(&self, prompt: &[usize]) -> Result<(), String> {
+        if prompt.is_empty() {
+            return Err("prompt must contain at least one token".to_string());
+        }
+        if let Some(token) = prompt.iter().find(|&&token| token >= self.vocab_size) {
+            return Err(format!(
+                "prompt token {token} is outside the model vocab size {}",
+                self.vocab_size
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn select_last_token(logits: Tensor<B, 3>, options: GenerationOptions) -> usize {
+        let [_batch_size, seq_len, vocab_size] = logits.shape().dims();
+        let logits = logits.into_data().to_vec::<f32>().unwrap();
+        let last_position_start = (seq_len - 1) * vocab_size;
+        let last_logits = &logits[last_position_start..last_position_start + vocab_size];
+
+        generation::select_token_from_logits(
+            last_logits,
+            options,
+            if options.temperature <= 0.0 {
+                0.0
+            } else {
+                rand::random()
+            },
+        )
+    }
+}
+
+pub struct MoeAttentionRouting<B: Backend> {
+    pub logits: Tensor<B, 3>,
+    pub attentions: Vec<Tensor<B, 4>>,
+    pub routing: Vec<MoeForwardAux<B>>,
+}
+
+impl<B: Backend> MoeAttentionRouting<B> {
+    fn map_attention(self) -> (Tensor<B, 3>, Vec<Tensor<B, 4>>) {
+        (self.logits, self.attentions)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -919,7 +1275,7 @@ mod tests {
             TrainingLogContext {
                 backend: "cuda",
                 model: "minigpt",
-                logger: EventLogger::stdout(TrainingLogFormat::Json),
+                logger: EventLogger::stdout(LogFormat::Json),
             },
             10,
             100,
@@ -1159,10 +1515,8 @@ mod tests {
         assert_eq!([8], block.ln2.beta.as_ref().unwrap().shape().dims());
         assert_eq!(2, block.attn.num_heads);
         assert_eq!(4, block.attn.head_dim);
-        // `Block::new` populates a `Dense` feed-forward preserving d_ff = 4 * d_model.
-        let mlp = match &block.mlp {
-            FeedForward::Dense(mlp) => mlp,
-            FeedForward::Moe(_) => panic!("Block::new should build a Dense feed-forward"),
+        let FeedForward::Dense(mlp) = &block.mlp else {
+            panic!("Block::new should build a dense feed-forward");
         };
         assert_eq!([8, 32], mlp.fc1.weight.shape().dims());
         assert_eq!([32, 8], mlp.fc2.weight.shape().dims());
@@ -1191,123 +1545,6 @@ mod tests {
 
         assert_eq!([2, 3, 8], output.shape().dims());
         assert_eq!([2, 2, 3, 3], attention.shape().dims());
-    }
-
-    #[test]
-    fn block_new_uses_dense_feed_forward_matching_direct_mlp() {
-        // S1-T1: a Block built via `Block::new` uses a `Dense` feed-forward and
-        // its `FeedForward` produces identical output to the same `Mlp` applied
-        // directly on the same input tensor.
-        type TestBackend = NdArray<f32, i64>;
-        let device = NdArrayDevice::Cpu;
-        let block = Block::<TestBackend>::new(8, 2, &device);
-        let input = Tensor::<TestBackend, 3>::from_data(
-            TensorData::new(
-                (0..2 * 3 * 8).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
-                [2, 3, 8],
-            ),
-            &device,
-        );
-
-        let mlp = match &block.mlp {
-            FeedForward::Dense(mlp) => mlp,
-            FeedForward::Moe(_) => panic!("Block::new should build a Dense feed-forward"),
-        };
-        let via_enum = block
-            .mlp
-            .forward(input.clone())
-            .into_data()
-            .to_vec::<f32>()
-            .unwrap();
-        let via_mlp = mlp.forward(input).into_data().to_vec::<f32>().unwrap();
-
-        assert_eq!(via_mlp, via_enum);
-    }
-
-    #[test]
-    fn dense_feed_forward_reports_no_aux_loss() {
-        // S1-T5: `FeedForward::forward_with_aux` returns `None` for `Dense`.
-        type TestBackend = NdArray<f32, i64>;
-        let device = NdArrayDevice::Cpu;
-        let ff = FeedForward::<TestBackend>::dense(8, &device);
-        let input = Tensor::<TestBackend, 3>::zeros([2, 3, 8], &device);
-
-        let (output, aux) = ff.forward_with_aux(input);
-
-        assert_eq!([2, 3, 8], output.shape().dims());
-        assert!(aux.is_none());
-    }
-
-    #[test]
-    fn block_forward_with_mask_and_aux_dense_matches_forward_with_mask() {
-        // S1-T5: dense `forward_with_mask_and_aux` returns `None` aux and output
-        // identical to `forward_with_mask`.
-        type TestBackend = NdArray<f32, i64>;
-        let device = NdArrayDevice::Cpu;
-        let block = Block::<TestBackend>::new(8, 2, &device);
-        let input = Tensor::<TestBackend, 3>::from_data(
-            TensorData::new(
-                (0..2 * 3 * 8).map(|i| (i as f32).sin()).collect::<Vec<_>>(),
-                [2, 3, 8],
-            ),
-            &device,
-        );
-        let mask = MultiHeadAttention::<TestBackend>::causal_mask(2, 2, 3, &device);
-
-        let plain = block
-            .forward_with_mask(input.clone(), mask.clone())
-            .into_data()
-            .to_vec::<f32>()
-            .unwrap();
-        let (with_aux, aux) = block.forward_with_mask_and_aux(input, mask);
-
-        assert!(aux.is_none());
-        assert_eq!(plain, with_aux.into_data().to_vec::<f32>().unwrap());
-    }
-
-    #[test]
-    fn block_with_moe_feed_forward_surfaces_load_balancing_loss() {
-        // S1-T5: a Moe feed-forward makes `forward_with_mask_and_aux` return
-        // `Some(aux)` matching `load_balancing_loss` on the router outputs for
-        // the same input.
-        type TestBackend = NdArray<f32, i64>;
-        let device = NdArrayDevice::Cpu;
-        let moe = moe::MoeFeedForward::<TestBackend>::new(8, 32, 4, 2, &device);
-        let block =
-            Block::<TestBackend>::new_with_feed_forward(8, 2, FeedForward::moe(moe), &device);
-        let input = Tensor::<TestBackend, 3>::from_data(
-            TensorData::new(
-                (0..2 * 3 * 8)
-                    .map(|i| (i as f32) * 0.02)
-                    .collect::<Vec<_>>(),
-                [2, 3, 8],
-            ),
-            &device,
-        );
-        let mask = MultiHeadAttention::<TestBackend>::causal_mask(2, 2, 3, &device);
-
-        let (_output, aux) = block.forward_with_mask_and_aux(input.clone(), mask.clone());
-        let aux = aux.expect("Moe feed-forward should surface an aux loss");
-
-        // Recompute the aux loss independently: replay attention + ln2 to feed
-        // the router the exact tensor the block's feed-forward saw.
-        let post_attn =
-            input.clone() + block.attn.forward_with_mask(block.ln1.forward(input), mask);
-        let ff_input = block.ln2.forward(post_attn);
-        let expected = match &block.mlp {
-            FeedForward::Moe(moe) => {
-                let (_out, aux) = moe.forward(ff_input);
-                aux.load_balancing_loss()
-            }
-            FeedForward::Dense(_) => panic!("expected a Moe feed-forward"),
-        };
-
-        let aux_val: f32 = aux.into_scalar();
-        let expected_val: f32 = expected.into_scalar();
-        assert!(
-            (aux_val - expected_val).abs() <= 1e-5,
-            "block aux {aux_val} should match direct load_balancing_loss {expected_val}"
-        );
     }
 
     #[test]

@@ -61,10 +61,13 @@ test('getModelInfo reads the server model metadata contract', async () => {
       ok: true,
       async json() {
         return {
+          model_kind: 'moe-gpt',
           vocab_size: 2048,
           num_layers: 4,
           num_heads: 4,
           block_size: 128,
+          num_experts: 4,
+          moe_top_k: 2,
           tokenizer_vocab_size: 2048,
           model_tokenizer_vocab_match: true,
         }
@@ -80,10 +83,13 @@ test('getModelInfo reads the server model metadata contract', async () => {
 
     assert.equal(receivedUrl, 'http://example.test/api/info')
     assert.deepEqual(result, {
+      model_kind: 'moe-gpt',
       vocab_size: 2048,
       num_layers: 4,
       num_heads: 4,
       block_size: 128,
+      num_experts: 4,
+      moe_top_k: 2,
       tokenizer_vocab_size: 2048,
       model_tokenizer_vocab_match: true,
     })

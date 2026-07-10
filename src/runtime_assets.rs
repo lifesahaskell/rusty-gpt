@@ -3,10 +3,10 @@ use anyhow::{Context, Result};
 use burn::tensor::backend::Backend;
 use rusty_gpt::loader::huggingface;
 use rusty_gpt::loader::{DEFAULT_MAX_LOCAL_INPUT_BYTES, InputSource};
-use rusty_gpt::model::MiniGpt;
 use rusty_gpt::model::persistence::{
     CheckpointModelShape, load_model_with_strict_metadata_validation,
 };
+use rusty_gpt::model::{MiniGpt, MoeGpt};
 use rusty_gpt::observability::{EventLogger, RuntimeEvent};
 use rusty_gpt::tokenizer::RuntimeTokenizer;
 use std::env;
@@ -26,11 +26,14 @@ pub(crate) fn load_minigpt_checkpoint<B: Backend>(
 ) -> Result<MiniGpt<B>> {
     let started_at = Instant::now();
     let expected_shape = CheckpointModelShape {
+        kind: Some("minigpt".to_string()),
         vocab_size: template.vocab_size(),
         block_size: template.block_size(),
         embed_dim: template.d_model(),
         num_heads: template.num_heads(),
         num_layers: template.num_layers(),
+        num_experts: 0,
+        moe_top_k: 0,
     };
     let tokenizer_path = minigpt_tokenizer_path();
     let model = load_model_with_strict_metadata_validation(
@@ -54,11 +57,50 @@ pub(crate) fn load_minigpt_checkpoint<B: Backend>(
     Ok(model)
 }
 
+pub(crate) fn load_moegpt_checkpoint<B: Backend>(
+    template: MoeGpt<B>,
+    checkpoint_path: &Path,
+    device: &B::Device,
+    logger: &EventLogger,
+) -> Result<MoeGpt<B>> {
+    let started_at = Instant::now();
+    let expected_shape = CheckpointModelShape {
+        kind: Some("moe-gpt".to_string()),
+        vocab_size: template.vocab_size(),
+        block_size: template.block_size(),
+        embed_dim: template.d_model(),
+        num_heads: template.num_heads(),
+        num_layers: template.num_layers(),
+        num_experts: template.num_experts(),
+        moe_top_k: template.moe_top_k(),
+    };
+    let tokenizer_path = minigpt_tokenizer_path();
+    let model = load_model_with_strict_metadata_validation(
+        template,
+        checkpoint_path,
+        &expected_shape,
+        Path::new(&tokenizer_path),
+        device,
+    )
+    .with_context(|| {
+        format!(
+            "failed to load moe-gpt checkpoint from {:?}",
+            checkpoint_path.with_extension("mpk")
+        )
+    })?;
+    logger.log(RuntimeEvent::CheckpointLoaded {
+        path: checkpoint_path.with_extension("mpk").display().to_string(),
+        elapsed_ms: started_at.elapsed().as_millis(),
+    });
+
+    Ok(model)
+}
+
 pub(crate) fn tokenizer_for_model(
     text: &str,
     model_choice: ModelChoice,
 ) -> Result<RuntimeTokenizer> {
-    if model_choice.includes_minigpt() {
+    if model_choice.uses_bpe_tokenizer() {
         load_minigpt_tokenizer()
     } else {
         Ok(RuntimeTokenizer::char_from_text(text))

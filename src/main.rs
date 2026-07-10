@@ -76,6 +76,7 @@ fn main() -> Result<()> {
                 &text,
                 hyperparameters,
                 ServerRuntimeOptions {
+                    model_choice: config.model,
                     server_addr: config.server_addr,
                     checkpoint_path: &config.checkpoint_path,
                     load_checkpoint_enabled: config.load_checkpoint,
@@ -91,6 +92,7 @@ fn main() -> Result<()> {
                 &text,
                 hyperparameters,
                 ServerRuntimeOptions {
+                    model_choice: config.model,
                     server_addr: config.server_addr,
                     checkpoint_path: &config.checkpoint_path,
                     load_checkpoint_enabled: config.load_checkpoint,
@@ -683,6 +685,63 @@ mod tests {
     }
 
     #[test]
+    fn moe_gpt_model_can_be_selected_from_args() {
+        let config = parse_runtime_config(
+            ["--model".to_string(), "moe-gpt".to_string()],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(ModelChoice::MoeGpt, config.model);
+    }
+
+    #[test]
+    fn moe_hyperparameters_can_be_selected_from_args() {
+        let config = parse_runtime_config(
+            [
+                "--model".to_string(),
+                "moe-gpt".to_string(),
+                "--moe-experts".to_string(),
+                "6".to_string(),
+                "--moe-top-k".to_string(),
+                "3".to_string(),
+                "--moe-aux-loss-weight".to_string(),
+                "0.05".to_string(),
+            ],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(6, config.hyperparameters.moe_experts);
+        assert_eq!(3, config.hyperparameters.moe_top_k);
+        assert_eq!(0.05, config.hyperparameters.moe_aux_loss_weight);
+    }
+
+    #[test]
+    fn moe_hyperparameters_reject_invalid_top_k() {
+        let err = parse_runtime_config(
+            [
+                "--model".to_string(),
+                "moe-gpt".to_string(),
+                "--moe-experts".to_string(),
+                "2".to_string(),
+                "--moe-top-k".to_string(),
+                "3".to_string(),
+            ],
+            None,
+            None,
+            None,
+        )
+        .expect_err("top-k larger than expert count should fail");
+
+        assert!(err.to_string().contains("moe_top_k must be <= moe_experts"));
+    }
+
+    #[test]
     fn interactive_generation_can_be_selected_from_args() {
         let config = parse_runtime_config(
             [
@@ -809,7 +868,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("generation benchmarks require --model minigpt or compare")
+                .contains("generation benchmarks require --model minigpt, moe-gpt, or compare")
         );
     }
 
@@ -829,7 +888,8 @@ mod tests {
                 ModelChoice::Trivial,
                 ModelChoice::SingleAttention,
                 ModelChoice::MultiAttention,
-                ModelChoice::MiniGpt
+                ModelChoice::MiniGpt,
+                ModelChoice::MoeGpt
             ],
             config.model.comparison_models()
         );

@@ -9,13 +9,13 @@ Every CLI flag and `RUSTY_GPT_*` environment variable accepted by the
 |---|---|---|---|
 | `--backend cpu\|cuda` | `RUSTY_GPT_BACKEND` | `cpu` | `cuda` is only available when the crate is built with `--features cuda` (requires the CUDA toolkit). |
 | `--input <path>` | `RUSTY_GPT_INPUT` | `data/input.txt` | Plain UTF-8 text. Also accepts `hf://` URIs (see [Hugging Face datasets](#hugging-face-datasets)). |
-| `--model <name>` | `RUSTY_GPT_MODEL` | `minigpt` | `trivial`, `single-attention`, `multi-attention`, `minigpt` (alias `mini-gpt`), `compare`. |
+| `--model <name>` | `RUSTY_GPT_MODEL` | `minigpt` | `trivial`, `single-attention`, `multi-attention`, `minigpt` (alias `mini-gpt`), `moe-gpt` (alias `moegpt`), `compare`. |
 | `--checkpoint <path>` | `RUSTY_GPT_MINIGPT_CHECKPOINT` | `checkpoints/mini_gpt` | Path without `.mpk` — Burn appends it. Explicit paths must resolve inside `checkpoints/`; bare names resolve there. |
 | `--log-format plain\|json` | `RUSTY_GPT_LOG_FORMAT` | backend default | CPU defaults to plain text; CUDA defaults to JSON Lines. |
-| — | `RUSTY_GPT_BPE_TOKENIZER` | `checkpoints/tokenizer.json` | BPE tokenizer JSON used by MiniGPT and `compare` runs. |
-| `--interactive-generate` | — | off | Requires `--backend cpu` and `--model minigpt`. |
+| — | `RUSTY_GPT_BPE_TOKENIZER` | `checkpoints/tokenizer.json` | BPE tokenizer JSON used by MiniGPT, MoeGPT, and `compare` runs. |
+| `--interactive-generate` | — | off | Requires `--backend cpu` and `--model minigpt` or `--model moe-gpt`. |
 | `--serve` | — | off | Starts the HTTP API under `/api`; supports `cpu` and compiled-in `cuda` backends. |
-| `--load-checkpoint` | — | off | With `--serve`, loads MiniGPT API weights from `--checkpoint`. The checkpoint must match the model shape and tokenizer vocabulary from `--input`. |
+| `--load-checkpoint` | — | off | With `--serve`, loads MiniGPT or MoeGPT API weights from `--checkpoint`. The checkpoint must match the model kind, shape, and tokenizer vocabulary. |
 | `--load-latest-checkpoint` | — | off | With `--serve`, loads the newest `.mpk` file in `checkpoints/`. |
 | `--server-addr <host:port>` | `RUSTY_GPT_SERVER_ADDR` | `127.0.0.1:8787` | Address used by `--serve`. |
 | `--max-prompt-bytes <n>` | `RUSTY_GPT_MAX_PROMPT_BYTES` | `8192` | `POST /api/generate` prompt byte cap. Must be > 0. |
@@ -33,6 +33,9 @@ Every CLI flag and `RUSTY_GPT_*` environment variable accepted by the
 | `--num-heads <n>` | `RUSTY_GPT_NUM_HEADS` | `4` | Attention heads. Must be > 0. |
 | `--num-layers <n>` | `RUSTY_GPT_NUM_LAYERS` | `4` | Transformer block count. Must be > 0. |
 | `--dropout <p>` | `RUSTY_GPT_DROPOUT` | `0.0` | Reserved model dropout setting. Must be `>= 0` and `< 1`. |
+| `--moe-experts <n>` | `RUSTY_GPT_MOE_EXPERTS` | `4` | Number of MoE experts per block for `--model moe-gpt`. Must be > 0. |
+| `--moe-top-k <n>` | `RUSTY_GPT_MOE_TOP_K` | `2` | Experts selected per token for `--model moe-gpt`. Must be >= 1 and <= `moe_experts`. |
+| `--moe-aux-loss-weight <n>` | `RUSTY_GPT_MOE_AUX_LOSS_WEIGHT` | `0.01` | Weight applied to the load-balancing auxiliary loss during MoeGPT training. Must be >= 0. |
 
 ## Training
 
@@ -119,10 +122,11 @@ done
 
 ### Checkpoint metadata sidecar
 
-MiniGPT saves write `<checkpoint>.metadata.json` next to the Burn `.mpk`
-weights. The sidecar records model shape, tokenizer path/hash, input source,
-training hyperparameters, final value loss, final perplexity, and git commit
-when available.
+MiniGPT and MoeGPT saves write `<checkpoint>.metadata.json` next to the Burn
+`.mpk` weights. The sidecar records model kind/shape, MoE expert shape when
+present, tokenizer path/hash, input source, training hyperparameters, final
+value loss, final perplexity, optional MoE aux loss, and git commit when
+available.
 
 - Legacy `.mpk` files without a sidecar still load unchecked.
 - Checkpoints with a sidecar fail fast if the requested model shape is
@@ -140,8 +144,8 @@ overrides them at runtime via a CLI flag or `RUSTY_GPT_*` env var (CLI wins).
 
 ### Tokenizer compatibility
 
-MiniGPT and `compare` runs load the BPE tokenizer from
+MiniGPT, MoeGPT, and `compare` runs load the BPE tokenizer from
 `checkpoints/tokenizer.json` unless `RUSTY_GPT_BPE_TOKENIZER` points
-elsewhere. Train or replace that file before training or loading a MiniGPT
-checkpoint if the corpus vocabulary changes — checkpoint tensor shapes must
-match the tokenizer vocabulary size.
+elsewhere. Train or replace that file before training or loading a MiniGPT or
+MoeGPT checkpoint if the corpus vocabulary changes — checkpoint tensor shapes
+must match the tokenizer vocabulary size.

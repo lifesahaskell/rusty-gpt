@@ -2,10 +2,11 @@
 
 A GPT trained from scratch in Rust on top of [Burn](https://burn.dev).
 
-The crate stacks four progressively richer models — embedding → single-head
-attention → multi-head attention → full transformer (MiniGPT) — so the
-codebase reads as a teaching arc. It ships an Axum HTTP API and a React UI
-for poking at attention matrices interactively.
+The crate stacks five progressively richer models — embedding → single-head
+attention → multi-head attention → full transformer (MiniGPT) → mixture-of-
+experts transformer (MoeGPT) — so the codebase reads as a teaching arc. It
+ships an Axum HTTP API and a React UI for poking at attention matrices and
+expert routing interactively.
 
 ## Quick start
 
@@ -24,6 +25,9 @@ cargo run --bin train-tokenizer -- --corpus data/input.txt \
 
 # Then train MiniGPT (defaults to 1000 steps on CPU; add --release for speed).
 cargo run --release
+
+# Train the MoE variant with four experts and top-2 routing.
+cargo run --release -- --model moe-gpt --moe-experts 4 --moe-top-k 2
 ```
 
 Open VS Code with the *Dev Containers* extension to pick between a CPU dev
@@ -31,7 +35,7 @@ environment and a CUDA one ([details](docs/development-runbook.md#container-base
 
 ## Highlights
 
-- **Four models, one file** — [src/model/mod.rs](src/model/mod.rs) builds up
+- **Five models, one file** — [src/model/mod.rs](src/model/mod.rs) builds up
   from a trivial embedding head to a full pre-norm transformer block, each
   variant runnable on the same training loop.
 - **Two backends from one binary** — CPU (`ndarray`) by default, CUDA opt-in
@@ -49,9 +53,9 @@ environment and a CUDA one ([details](docs/development-runbook.md#container-base
   (default 3) prunes older periodic snapshots. The final end-of-run save
   and any interrupted save are never pruned. Example:
   `cargo run --release --features cuda -- --backend cuda --model minigpt --train-steps 100000 --checkpoint-interval 1000`.
-- **Attention visualization** — `POST /api/generate` returns per-layer /
-  per-head attention weights alongside the generated tokens for the React
-  UI to render.
+- **Attention + routing visualization** — `POST /api/generate` returns
+  per-layer/per-head attention weights and, for MoeGPT, per-layer expert
+  routing alongside the generated tokens for the React UI to render.
 - **Experiment knobs** — `--lr-schedule constant|warmup-cosine|warmup-linear`
   and `--sampling-policy random-window|sequential|shuffled-chunks` support
   roadmap ablations without patching the training loop.
@@ -69,11 +73,12 @@ curl -X POST http://127.0.0.1:8787/api/generate \
     -d '{"prompt":"Once upon","max_tokens":80,"temperature":0.8,"top_k":40}'
 ```
 
-Response includes the generated text, per-token splits, and `attention[]`
-matrices keyed by `layer` and `head`. `GET /api/info` returns the loaded
-model's shape and tokenizer info. `GET /api/health` returns server uptime,
-model shape, and the checkpoint + tokenizer sha256 — designed for liveness
-probes and never exposes absolute filesystem paths.
+Response includes the generated text, per-token splits, `attention[]` matrices
+keyed by `layer` and `head`, and optional `routing[]` for `moe-gpt` models.
+`GET /api/info` returns the loaded model's kind, shape, MoE expert shape, and
+tokenizer info. `GET /api/health` returns server uptime, model shape, and the
+checkpoint + tokenizer sha256 — designed for liveness probes and never exposes
+absolute filesystem paths.
 
 `POST /api/generate` enforces request caps before tokenizer/model work:
 `--max-prompt-bytes` / `RUSTY_GPT_MAX_PROMPT_BYTES` defaults to `8192`,
@@ -88,7 +93,7 @@ It is also rate-limited by `--rate-limit-rps` / `RUSTY_GPT_RATE_LIMIT_RPS`
 src/
   tokenizer/    char + BPE tokenizers (Tokenizer trait, runtime dispatch)
   loader/       random-window batch sampler producing (x, y) shifted by 1
-  model/        the four models + persistence (.mpk + .metadata.json)
+  model/        the five models + persistence (.mpk + .metadata.json)
   server/       Axum router for /api/generate, /api/info, /api/health
   bin/          train-tokenizer, collect-source helper binaries
 

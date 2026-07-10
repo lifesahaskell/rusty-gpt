@@ -15,14 +15,118 @@ use burn::tensor::{Int, Tensor, TensorData};
 use serde::{Deserialize, Serialize};
 use tower_http::limit::RequestBodyLimitLayer;
 
-use crate::model::{GenerationOptions, MiniGpt};
+use crate::model::{GenerationOptions, MiniGpt, MoeForwardAux, MoeGpt};
 use crate::observability::{EventLogger, RuntimeEvent};
 use crate::tokenizer::RuntimeTokenizer;
 
 pub type SharedServerState<B> = Arc<ServerState<B>>;
 
+pub enum ServedModel<B: Backend> {
+    MiniGpt(MiniGpt<B>),
+    MoeGpt(MoeGpt<B>),
+}
+
+impl<B: Backend> From<MiniGpt<B>> for ServedModel<B> {
+    fn from(model: MiniGpt<B>) -> Self {
+        Self::MiniGpt(model)
+    }
+}
+
+impl<B: Backend> From<MoeGpt<B>> for ServedModel<B> {
+    fn from(model: MoeGpt<B>) -> Self {
+        Self::MoeGpt(model)
+    }
+}
+
+impl<B: Backend> ServedModel<B> {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::MiniGpt(_) => "minigpt",
+            Self::MoeGpt(_) => "moe-gpt",
+        }
+    }
+
+    fn vocab_size(&self) -> usize {
+        match self {
+            Self::MiniGpt(model) => model.vocab_size(),
+            Self::MoeGpt(model) => model.vocab_size(),
+        }
+    }
+
+    fn block_size(&self) -> usize {
+        match self {
+            Self::MiniGpt(model) => model.block_size(),
+            Self::MoeGpt(model) => model.block_size(),
+        }
+    }
+
+    fn num_layers(&self) -> usize {
+        match self {
+            Self::MiniGpt(model) => model.num_layers(),
+            Self::MoeGpt(model) => model.num_layers(),
+        }
+    }
+
+    fn num_heads(&self) -> usize {
+        match self {
+            Self::MiniGpt(model) => model.num_heads(),
+            Self::MoeGpt(model) => model.num_heads(),
+        }
+    }
+
+    fn d_model(&self) -> usize {
+        match self {
+            Self::MiniGpt(model) => model.d_model(),
+            Self::MoeGpt(model) => model.d_model(),
+        }
+    }
+
+    fn num_experts(&self) -> usize {
+        match self {
+            Self::MiniGpt(_) => 0,
+            Self::MoeGpt(model) => model.num_experts(),
+        }
+    }
+
+    fn moe_top_k(&self) -> usize {
+        match self {
+            Self::MiniGpt(_) => 0,
+            Self::MoeGpt(model) => model.moe_top_k(),
+        }
+    }
+
+    pub fn generate(
+        &self,
+        prompt: &[usize],
+        max_tokens: usize,
+        device: &B::Device,
+    ) -> Result<Vec<usize>, String> {
+        match self {
+            Self::MiniGpt(model) => model.generate(prompt, max_tokens, device),
+            Self::MoeGpt(model) => model.generate(prompt, max_tokens, device),
+        }
+    }
+
+    fn generate_with_cache_options(
+        &self,
+        prompt: &[usize],
+        max_tokens: usize,
+        device: &B::Device,
+        options: GenerationOptions,
+    ) -> Result<Vec<usize>, String> {
+        match self {
+            Self::MiniGpt(model) => {
+                model.generate_with_cache_options(prompt, max_tokens, device, options)
+            }
+            Self::MoeGpt(model) => {
+                model.generate_with_cache_options(prompt, max_tokens, device, options)
+            }
+        }
+    }
+}
+
 pub struct ServerState<B: Backend> {
-    model: MiniGpt<B>,
+    model: ServedModel<B>,
     tokenizer: RuntimeTokenizer,
     device: B::Device,
     logger: EventLogger,
@@ -158,13 +262,16 @@ impl CheckpointSource {
 }
 
 impl<B: Backend> ServerState<B> {
-    pub fn new(
-        model: MiniGpt<B>,
+    pub fn new<M>(
+        model: M,
         tokenizer: RuntimeTokenizer,
         device: B::Device,
         logger: EventLogger,
         provenance: ServerProvenance,
-    ) -> Self {
+    ) -> Self
+    where
+        M: Into<ServedModel<B>>,
+    {
         Self::new_with_limits(
             model,
             tokenizer,
@@ -175,16 +282,19 @@ impl<B: Backend> ServerState<B> {
         )
     }
 
-    pub fn new_with_limits(
-        model: MiniGpt<B>,
+    pub fn new_with_limits<M>(
+        model: M,
         tokenizer: RuntimeTokenizer,
         device: B::Device,
         logger: EventLogger,
         provenance: ServerProvenance,
         limits: ServerLimits,
-    ) -> Self {
+    ) -> Self
+    where
+        M: Into<ServedModel<B>>,
+    {
         Self {
-            model,
+            model: model.into(),
             tokenizer,
             device,
             logger,
@@ -209,14 +319,6 @@ impl<B: Backend> ServerState<B> {
     pub fn model_tokenizer_vocab_match(&self) -> bool {
         self.model.vocab_size() == self.tokenizer.vocab_size()
     }
-}
-
-pub fn router<B>() -> Router<SharedServerState<B>>
-where
-    B: Backend + Send + Sync + 'static,
-    B::Device: Send + Sync + 'static,
-{
-    router_with_limits(ServerLimits::default())
 }
 
 pub fn router_with_limits<B>(limits: ServerLimits) -> Router<SharedServerState<B>>
@@ -247,6 +349,8 @@ pub struct GenerateResponse {
     pub generated: String,
     pub tokens: Vec<String>,
     pub attention: Vec<AttentionData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing: Option<Vec<RoutingData>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -257,11 +361,21 @@ pub struct AttentionData {
 }
 
 #[derive(Debug, Serialize)]
+pub struct RoutingData {
+    pub layer: usize,
+    pub experts: Vec<Vec<usize>>,
+    pub weights: Vec<Vec<f64>>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct InfoResponse {
+    pub model_kind: &'static str,
     pub vocab_size: usize,
     pub num_layers: usize,
     pub num_heads: usize,
     pub block_size: usize,
+    pub num_experts: usize,
+    pub moe_top_k: usize,
     pub tokenizer_vocab_size: usize,
     pub model_tokenizer_vocab_match: bool,
 }
@@ -365,7 +479,7 @@ where
         )
         .map_err(|err| logged_bad_request(&state.logger, err, started_at))?;
     let attention_tokens = context_window(&generated_tokens, state.model.block_size());
-    let attention = attention_for_tokens(&state, attention_tokens)?;
+    let (attention, routing) = attention_for_tokens(&state, attention_tokens)?;
     let generated = state.tokenizer.decode(&generated_tokens);
     let tokens = generated_tokens
         .iter()
@@ -382,6 +496,7 @@ where
         generated,
         tokens,
         attention,
+        routing,
     }))
 }
 
@@ -532,10 +647,13 @@ where
     B: Backend,
 {
     Json(InfoResponse {
+        model_kind: state.model.kind(),
         vocab_size: state.model.vocab_size(),
         num_layers: state.model.num_layers(),
         num_heads: state.model.num_heads(),
         block_size: state.model.block_size(),
+        num_experts: state.model.num_experts(),
+        moe_top_k: state.model.moe_top_k(),
         tokenizer_vocab_size: state.tokenizer.vocab_size(),
         model_tokenizer_vocab_match: state.model_tokenizer_vocab_match(),
     })
@@ -564,6 +682,8 @@ pub struct HealthModel {
     pub num_layers: usize,
     pub block_size: usize,
     pub vocab_size: usize,
+    pub num_experts: usize,
+    pub moe_top_k: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -583,12 +703,14 @@ where
         status: "ok",
         uptime_seconds: provenance.started_at.elapsed().as_secs(),
         model: HealthModel {
-            kind: "minigpt",
+            kind: state.model.kind(),
             embed_dim: state.model.d_model(),
             num_heads: state.model.num_heads(),
             num_layers: state.model.num_layers(),
             block_size: state.model.block_size(),
             vocab_size: state.model.vocab_size(),
+            num_experts: state.model.num_experts(),
+            moe_top_k: state.model.moe_top_k(),
         },
         checkpoint: HealthCheckpoint {
             loaded: provenance.checkpoint_source != CheckpointSource::None,
@@ -611,11 +733,20 @@ fn context_window(tokens: &[usize], block_size: usize) -> &[usize] {
 fn attention_for_tokens<B: Backend>(
     state: &ServerState<B>,
     tokens: &[usize],
-) -> Result<Vec<AttentionData>, GenerateError> {
+) -> Result<(Vec<AttentionData>, Option<Vec<RoutingData>>), GenerateError> {
     let input: Vec<i64> = tokens.iter().map(|&token| token as i64).collect();
     let token_tensor: Tensor<B, 2, Int> =
         Tensor::from_data(TensorData::new(input, [1, tokens.len()]), &state.device);
-    let (_logits, attentions) = state.model.forward_tokens_with_attention(token_tensor);
+    let (attentions, routing) = match &state.model {
+        ServedModel::MiniGpt(model) => {
+            let (_logits, attentions) = model.forward_tokens_with_attention(token_tensor);
+            (attentions, None)
+        }
+        ServedModel::MoeGpt(model) => {
+            let output = model.forward_tokens_with_attention_and_routing(token_tensor);
+            (output.attentions, Some(output.routing))
+        }
+    };
 
     let mut attention_data = Vec::new();
     for (layer, attention) in attentions.into_iter().enumerate() {
@@ -649,7 +780,64 @@ fn attention_for_tokens<B: Backend>(
         }
     }
 
-    Ok(attention_data)
+    let routing_data = routing
+        .map(|routing| serialize_routing(routing))
+        .transpose()?;
+
+    Ok((attention_data, routing_data))
+}
+
+fn serialize_routing<B: Backend>(
+    routing: Vec<MoeForwardAux<B>>,
+) -> Result<Vec<RoutingData>, GenerateError> {
+    let mut data = Vec::with_capacity(routing.len());
+    for (layer, aux) in routing.into_iter().enumerate() {
+        let [batch_size, seq_len, top_k] = aux.top_k_indices.shape().dims();
+        if batch_size != 1 {
+            return Err(GenerateError::Internal(format!(
+                "expected routing batch size 1, got {batch_size}"
+            )));
+        }
+        let indices = aux
+            .top_k_indices
+            .into_data()
+            .to_vec::<i64>()
+            .map_err(|err| {
+                GenerateError::Internal(format!("failed to serialize routing indices: {err}"))
+            })?;
+        let weights = aux
+            .top_k_weights
+            .into_data()
+            .to_vec::<f32>()
+            .map_err(|err| {
+                GenerateError::Internal(format!("failed to serialize routing weights: {err}"))
+            })?;
+        let mut expert_rows = Vec::with_capacity(seq_len);
+        let mut weight_rows = Vec::with_capacity(seq_len);
+        for token in 0..seq_len {
+            let start = token * top_k;
+            let end = start + top_k;
+            expert_rows.push(
+                indices[start..end]
+                    .iter()
+                    .map(|&idx| idx as usize)
+                    .collect(),
+            );
+            weight_rows.push(
+                weights[start..end]
+                    .iter()
+                    .map(|&weight| weight as f64)
+                    .collect(),
+            );
+        }
+        data.push(RoutingData {
+            layer,
+            experts: expert_rows,
+            weights: weight_rows,
+        });
+    }
+
+    Ok(data)
 }
 
 #[cfg(test)]
@@ -1112,8 +1300,9 @@ mod tests {
             ServerProvenance::fresh(),
         );
 
-        let attention = attention_for_tokens(&state, &[0, 1, 2]).unwrap();
+        let (attention, routing) = attention_for_tokens(&state, &[0, 1, 2]).unwrap();
 
+        assert!(routing.is_none());
         assert_eq!(4, attention.len());
         assert_eq!(0, attention[0].layer);
         assert_eq!(0, attention[0].head);

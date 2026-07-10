@@ -6,13 +6,21 @@ export type GenerateResponse = {
     head: number
     weights: number[][]
   }>
+  routing?: Array<{
+    layer: number
+    experts: number[][]
+    weights: number[][]
+  }>
 }
 
 export type ModelInfo = {
+  model_kind: string
   vocab_size: number
   num_layers: number
   num_heads: number
   block_size: number
+  num_experts: number
+  moe_top_k: number
   tokenizer_vocab_size: number
   model_tokenizer_vocab_match: boolean
 }
@@ -98,7 +106,9 @@ function isGenerateResponse(value: unknown): value is GenerateResponse {
     Array.isArray(value.tokens) &&
     value.tokens.every((token) => typeof token === 'string') &&
     Array.isArray(value.attention) &&
-    value.attention.every(isAttentionData)
+    value.attention.every(isAttentionData) &&
+    (value.routing === undefined ||
+      (Array.isArray(value.routing) && value.routing.every(isRoutingData)))
   )
 }
 
@@ -117,16 +127,37 @@ function isAttentionData(value: unknown): value is GenerateResponse['attention']
   )
 }
 
+function isRoutingData(value: unknown): value is NonNullable<GenerateResponse['routing']>[number] {
+  if (!isRecord(value)) {
+    return false
+  }
+
+  return (
+    Number.isInteger(value.layer) &&
+    Array.isArray(value.experts) &&
+    value.experts.every(
+      (row) => Array.isArray(row) && row.every((expert) => Number.isInteger(expert)),
+    ) &&
+    Array.isArray(value.weights) &&
+    value.weights.every(
+      (row) => Array.isArray(row) && row.every((weight) => typeof weight === 'number'),
+    )
+  )
+}
+
 function isModelInfo(value: unknown): value is ModelInfo {
   if (!isRecord(value)) {
     return false
   }
 
   return (
+    typeof value.model_kind === 'string' &&
     Number.isInteger(value.vocab_size) &&
     Number.isInteger(value.num_layers) &&
     Number.isInteger(value.num_heads) &&
     Number.isInteger(value.block_size) &&
+    Number.isInteger(value.num_experts) &&
+    Number.isInteger(value.moe_top_k) &&
     Number.isInteger(value.tokenizer_vocab_size) &&
     typeof value.model_tokenizer_vocab_match === 'boolean'
   )
