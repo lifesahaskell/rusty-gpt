@@ -16,7 +16,8 @@ Run all commands from the crate root.
 # Build / lint / format (CPU build; cuda is opt-in via --features cuda)
 cargo build
 cargo build --release
-cargo clippy --all-targets          # has known pre-existing warnings, see Gotchas
+cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --features cuda -- -D warnings
 cargo fmt --all -- --check
 cargo check --features cuda         # verify the cuda gate still compiles
 
@@ -136,7 +137,7 @@ mini-gpt-ui/                    separate React frontend that calls the /api serv
 data/input.txt                  ~1 MB Shakespeare-style training corpus (committed)
 data-secret/                    gitignored corpora directory (e.g. fafolang.txt, claude_src.txt)
 checkpoints/                    gitignored .mpk model files + tokenizer.json (BPE artifact for MiniGPT)
-.github/workflows/ci.yml        GitHub Actions: cargo fmt --check, cargo clippy, cargo test on push/PR
+.github/workflows/ci.yml        GitHub Actions: cargo fmt --check, strict CPU/CUDA cargo clippy, cargo test on push/PR
 .gitignore                      excludes /target/, /checkpoints/, /data-secret/
 ```
 
@@ -228,4 +229,3 @@ Other invariants:
 - **Env-mutating tests use `unsafe`**: Rust 2024 makes `env::set_var` / `env::remove_var` unsafe. Existing tests in `main.rs` wrap them in `unsafe { ... }` blocks with a SAFETY comment — follow the same pattern when adding more.
 - **Burn features**: `burn` is pulled in with `["train", "ndarray", "wgpu"]` in `Cargo.toml`. The `wgpu` feature isn't exercised at runtime but kept so the CPU build stays portable; `cuda` is the only opt-in feature.
 - **`data-secret/` is gitignored**: anything you drop there (e.g. `fafolang.txt`, `claude_src.txt`) won't be committed. Use it for corpora you don't want in the repo.
-- **Clippy has known pre-existing warnings**: `cargo clippy --all-targets` currently reports a handful of style lints in `src/model/mod.rs` (too-many-args, complex-type, etc.). The CI workflow runs clippy without `-D warnings` for that reason. If you tighten CI, fix those lints first.
