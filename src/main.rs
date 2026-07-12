@@ -152,6 +152,19 @@ mod tests {
     use super::*;
     use crate::runtime_config::{Hyperparameters, ModelChoice};
     use burn::backend::Autodiff;
+    use std::sync::Mutex;
+
+    // ponytail: cargo test runs in parallel within one process, so tests that
+    // mutate real process env vars (RUSTY_GPT_*) race each other. Serialize
+    // them on this lock instead of adding a test harness; add more tests here
+    // if a future one starts touching process env.
+    static ENV_MUTATION_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn backend_defaults_to_cpu() {
@@ -281,6 +294,7 @@ mod tests {
 
     #[test]
     fn hyperparameters_can_override_training_settings_from_env() {
+        let _guard = lock_env();
         // SAFETY: This unit test mutates process environment while not relying on
         // other environment-sensitive code in parallel.
         unsafe {
@@ -370,6 +384,7 @@ mod tests {
 
     #[test]
     fn hyperparameters_reject_non_positive_minigpt_gradient_clip_norm() {
+        let _guard = lock_env();
         // SAFETY: This unit test mutates process environment while not relying on
         // other environment-sensitive code in parallel.
         unsafe {
@@ -445,6 +460,7 @@ mod tests {
         };
         let text = "abcdefghijklmnopqrstuvwxyz ".repeat(8);
 
+        let _guard = lock_env();
         // SAFETY: This test mutates process environment before running any
         // threaded code and restores it before returning.
         unsafe {
