@@ -10,7 +10,8 @@ data/huggingface-cache/
 .idea/
 .log/
 .agents/
-.claude/
+.claude/*
+!.claude/skills/
 data-secret/
 data/*.txt
 data/*.json
