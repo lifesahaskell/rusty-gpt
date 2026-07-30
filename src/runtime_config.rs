@@ -1,5 +1,7 @@
 use crate::runtime_assets::DEFAULT_CHECKPOINT_DIR;
 use anyhow::{Context, Result, bail};
+use clap::Parser;
+use clap::error::ErrorKind;
 use rusty_gpt::loader::InputSource;
 use rusty_gpt::loader::data::SamplingPolicy;
 use rusty_gpt::model::LearningRateSchedule;
@@ -581,6 +583,158 @@ where
     )
 }
 
+/// Command-line surface. Every field is `Option`/`bool` with no clap default,
+/// because defaults are resolved *downstream* in the CLI → env → default chain
+/// that `RuntimeConfig` and `Hyperparameters` already implement. A clap
+/// `default_value` here would make "not passed" indistinguishable from
+/// "passed the default", and silently beat the `RUSTY_GPT_*` env vars.
+///
+/// Env vars are deliberately **not** wired through clap's `env` feature. They
+/// are read into [`RuntimeEnv`] instead so tests can inject them as a value
+/// rather than mutating the process environment — see the `ENV_MUTATION_LOCK`
+/// note in `main.rs`. Env names appear in the help text only.
+#[derive(Parser, Debug)]
+#[command(
+    name = "rusty-gpt",
+    version,
+    // Without this, clap reads `--dropout -0.5` as the unknown flag `-0` and
+    // rejects it before `Hyperparameters::validate` ever sees the value. The
+    // domain errors ("dropout must be >= 0 and < 1", "learning rate must be
+    // greater than zero") are the ones users need, so negative numbers have to
+    // parse as values.
+    allow_negative_numbers = true,
+    about = "Train and serve a GPT from scratch on the Burn framework",
+    long_about = "Every flag below has a RUSTY_GPT_* environment variable counterpart \
+                  (named in each flag's help). Both forms work; the flag wins when both are set. \
+                  See docs/configuration.md for the authoritative reference."
+)]
+struct Cli {
+    /// Compute backend: cpu or cuda [env: RUSTY_GPT_BACKEND] [default: cpu]
+    #[arg(long)]
+    backend: Option<String>,
+    /// Corpus path or hf:// dataset URI [env: RUSTY_GPT_INPUT] [default: data/input.txt]
+    #[arg(long)]
+    input: Option<String>,
+    /// trivial, single-attention, multi-attention, minigpt, moe-gpt, compare [env: RUSTY_GPT_MODEL]
+    #[arg(long)]
+    model: Option<String>,
+    /// Checkpoint path without .mpk, confined to checkpoints/ [env: RUSTY_GPT_MINIGPT_CHECKPOINT]
+    #[arg(long)]
+    checkpoint: Option<String>,
+    /// Resume training from this checkpoint; requires minigpt or moe-gpt [env: RUSTY_GPT_RESUME_FROM]
+    #[arg(long)]
+    resume_from: Option<String>,
+    /// HTTP server bind address [env: RUSTY_GPT_SERVER_ADDR] [default: 127.0.0.1:8787]
+    #[arg(long)]
+    server_addr: Option<String>,
+    /// plain or json; defaults to plain on cpu, json on cuda [env: RUSTY_GPT_LOG_FORMAT]
+    #[arg(long)]
+    log_format: Option<String>,
+
+    /// POST /api/generate prompt byte cap [env: RUSTY_GPT_MAX_PROMPT_BYTES] [default: 8192]
+    #[arg(long)]
+    max_prompt_bytes: Option<usize>,
+    /// POST /api/generate max_tokens cap [env: RUSTY_GPT_MAX_OUTPUT_TOKENS] [default: 512]
+    #[arg(long)]
+    max_output_tokens: Option<usize>,
+    /// Generate refill rate; 0 disables rate limiting [env: RUSTY_GPT_RATE_LIMIT_RPS] [default: 5]
+    #[arg(long)]
+    rate_limit_rps: Option<usize>,
+    /// Generate burst capacity [env: RUSTY_GPT_RATE_LIMIT_BURST] [default: 10]
+    #[arg(long)]
+    rate_limit_burst: Option<usize>,
+
+    /// Comma-separated prompt lengths [env: RUSTY_GPT_BENCHMARK_PROMPT_LENS]
+    #[arg(long)]
+    benchmark_prompt_lens: Option<String>,
+    /// Comma-separated generation lengths [env: RUSTY_GPT_BENCHMARK_GEN_LENS]
+    #[arg(long)]
+    benchmark_gen_lens: Option<String>,
+    /// Warmup iterations before timing [env: RUSTY_GPT_BENCHMARK_WARMUPS]
+    #[arg(long)]
+    benchmark_warmups: Option<String>,
+    /// Timed iterations per case [env: RUSTY_GPT_BENCHMARK_ITERATIONS]
+    #[arg(long)]
+    benchmark_iterations: Option<String>,
+
+    /// Context length [env: RUSTY_GPT_BLOCK_SIZE] [default: 128]
+    #[arg(long)]
+    block_size: Option<usize>,
+    /// Training batch size [env: RUSTY_GPT_BATCH_SIZE] [default: 32]
+    #[arg(long)]
+    batch_size: Option<usize>,
+    /// Model width; must divide by num-heads [env: RUSTY_GPT_EMBED_DIM] [default: 128]
+    #[arg(long)]
+    embed_dim: Option<usize>,
+    /// Attention heads [env: RUSTY_GPT_NUM_HEADS] [default: 4]
+    #[arg(long)]
+    num_heads: Option<usize>,
+    /// Transformer block count [env: RUSTY_GPT_NUM_LAYERS] [default: 4]
+    #[arg(long)]
+    num_layers: Option<usize>,
+    /// Dropout probability, >= 0 and < 1 [env: RUSTY_GPT_DROPOUT]
+    #[arg(long)]
+    dropout: Option<f64>,
+    /// Base optimizer learning rate [env: RUSTY_GPT_LEARNING_RATE] [default: 1e-4]
+    #[arg(long)]
+    learning_rate: Option<f64>,
+    /// constant, warmup-cosine, or warmup-linear [env: RUSTY_GPT_LR_SCHEDULE]
+    #[arg(long)]
+    lr_schedule: Option<String>,
+    /// Warmup length; must be <= train-steps [env: RUSTY_GPT_LR_WARMUP_STEPS]
+    #[arg(long)]
+    lr_warmup_steps: Option<usize>,
+    /// random-window, sequential, or shuffled-chunks [env: RUSTY_GPT_SAMPLING_POLICY]
+    #[arg(long)]
+    sampling_policy: Option<String>,
+    /// Training steps [env: RUSTY_GPT_TRAIN_STEPS] [default: 1000]
+    #[arg(long)]
+    train_steps: Option<usize>,
+    /// Eval cadence; 0 logs only the final step [env: RUSTY_GPT_EVAL_INTERVAL] [default: 100]
+    #[arg(long)]
+    eval_interval: Option<usize>,
+    /// Interactive generation token count [env: RUSTY_GPT_GENERATE_TOKENS] [default: 80]
+    #[arg(long)]
+    generate_tokens: Option<usize>,
+    /// Gradient clipping norm [env: RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM] [default: 1.0]
+    #[arg(long)]
+    grad_clip_norm: Option<f32>,
+    /// MoE experts per block [env: RUSTY_GPT_MOE_EXPERTS] [default: 4]
+    #[arg(long)]
+    moe_experts: Option<usize>,
+    /// Experts selected per token [env: RUSTY_GPT_MOE_TOP_K] [default: 2]
+    #[arg(long)]
+    moe_top_k: Option<usize>,
+    /// Load-balancing aux loss weight [env: RUSTY_GPT_MOE_AUX_LOSS_WEIGHT] [default: 0.01]
+    #[arg(long)]
+    moe_aux_loss_weight: Option<f64>,
+    /// CPU batch prefetch depth [env: RUSTY_GPT_PREFETCH_BATCHES] [default: 2]
+    #[arg(long)]
+    prefetch_batches: Option<usize>,
+    /// Save a snapshot every N steps; 0 disables [env: RUSTY_GPT_CHECKPOINT_INTERVAL] [default: 0]
+    #[arg(long)]
+    checkpoint_interval: Option<usize>,
+    /// Periodic snapshot retention window [env: RUSTY_GPT_CHECKPOINT_KEEP] [default: 3]
+    #[arg(long)]
+    checkpoint_keep: Option<usize>,
+
+    /// Chat with a loaded checkpoint; requires --backend cpu
+    #[arg(long)]
+    interactive_generate: bool,
+    /// Run naive-vs-cached generation benchmarks
+    #[arg(long)]
+    benchmark_generation: bool,
+    /// Load weights from --checkpoint before serving
+    #[arg(long)]
+    load_checkpoint: bool,
+    /// Load the newest .mpk in checkpoints/ before serving
+    #[arg(long)]
+    load_latest_checkpoint: bool,
+    /// Start the HTTP API instead of the demo/training run
+    #[arg(long)]
+    serve: bool,
+}
+
 pub(crate) fn parse_runtime_config_with_checkpoint<I, S>(
     args: I,
     env: RuntimeEnv,
@@ -589,255 +743,82 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let args: Vec<String> = args
-        .into_iter()
-        .map(|arg| arg.as_ref().to_string())
-        .collect();
-    let mut arg_backend = None;
-    let mut arg_input = None;
-    let mut arg_model = None;
-    let mut arg_checkpoint = None;
-    let mut arg_resume_from = None;
-    let mut arg_server_addr = None;
-    let mut arg_max_prompt_bytes = None;
-    let mut arg_max_output_tokens = None;
-    let mut arg_rate_limit_rps = None;
-    let mut arg_rate_limit_burst = None;
-    let mut arg_log_format = None;
-    let mut arg_benchmark_prompt_lens = None;
-    let mut arg_benchmark_gen_lens = None;
-    let mut arg_benchmark_warmups = None;
-    let mut arg_benchmark_iterations = None;
-    let mut hyperparameter_overrides = HyperparameterOverrides::default();
-    let mut interactive = false;
-    let mut benchmark_generation = false;
-    let mut load_checkpoint = false;
-    let mut load_latest_checkpoint = false;
-    let mut serve = false;
-    let mut index = 0;
-
-    while index < args.len() {
-        match args[index].as_str() {
-            "--backend" => {
-                let value = args
-                    .get(index + 1)
-                    .context("--backend requires a value: cpu or cuda")?;
-                arg_backend = Some(value.as_str());
-                index += 2;
-            }
-            "--input" => {
-                let value = args
-                    .get(index + 1)
-                    .context("--input requires a path to a text file")?;
-                arg_input = Some(value.as_str());
-                index += 2;
-            }
-            "--model" => {
-                let value = args
-                    .get(index + 1)
-                    .context("--model requires a value: trivial, single-attention, multi-attention, minigpt, or compare")?;
-                arg_model = Some(value.as_str());
-                index += 2;
-            }
-            "--checkpoint" => {
-                let value = args
-                    .get(index + 1)
-                    .context("--checkpoint requires a value: path to a saved .mpk checkpoint without the extension")?;
-                arg_checkpoint = Some(value.as_str());
-                index += 2;
-            }
-            "--resume-from" => {
-                let value = args
-                    .get(index + 1)
-                    .context("--resume-from requires a value: path to a saved .mpk checkpoint without the extension")?;
-                arg_resume_from = Some(value.as_str());
-                index += 2;
-            }
-            "--server-addr" => {
-                let value = args
-                    .get(index + 1)
-                    .context("--server-addr requires a value like 127.0.0.1:8787")?;
-                arg_server_addr = Some(value.as_str());
-                index += 2;
-            }
-            "--max-prompt-bytes" => {
-                arg_max_prompt_bytes = Some(parse_arg_value(&args, index, "--max-prompt-bytes")?);
-                index += 2;
-            }
-            "--max-output-tokens" => {
-                arg_max_output_tokens = Some(parse_arg_value(&args, index, "--max-output-tokens")?);
-                index += 2;
-            }
-            "--rate-limit-rps" => {
-                arg_rate_limit_rps = Some(parse_arg_value(&args, index, "--rate-limit-rps")?);
-                index += 2;
-            }
-            "--rate-limit-burst" => {
-                arg_rate_limit_burst = Some(parse_arg_value(&args, index, "--rate-limit-burst")?);
-                index += 2;
-            }
-            "--log-format" => {
-                let value = args
-                    .get(index + 1)
-                    .context("--log-format requires a value: plain or json")?;
-                arg_log_format = Some(value.as_str());
-                index += 2;
-            }
-            "--benchmark-prompt-lens" => {
-                let value = args
-                    .get(index + 1)
-                    .context("--benchmark-prompt-lens requires a comma-separated list")?;
-                arg_benchmark_prompt_lens = Some(value.as_str());
-                index += 2;
-            }
-            "--benchmark-gen-lens" => {
-                let value = args
-                    .get(index + 1)
-                    .context("--benchmark-gen-lens requires a comma-separated list")?;
-                arg_benchmark_gen_lens = Some(value.as_str());
-                index += 2;
-            }
-            "--benchmark-warmups" => {
-                let value = args
-                    .get(index + 1)
-                    .context("--benchmark-warmups requires an integer")?;
-                arg_benchmark_warmups = Some(value.as_str());
-                index += 2;
-            }
-            "--benchmark-iterations" => {
-                let value = args
-                    .get(index + 1)
-                    .context("--benchmark-iterations requires an integer")?;
-                arg_benchmark_iterations = Some(value.as_str());
-                index += 2;
-            }
-            "--block-size" => {
-                hyperparameter_overrides.block_size =
-                    Some(parse_arg_value(&args, index, "--block-size")?);
-                index += 2;
-            }
-            "--batch-size" => {
-                hyperparameter_overrides.batch_size =
-                    Some(parse_arg_value(&args, index, "--batch-size")?);
-                index += 2;
-            }
-            "--embed-dim" => {
-                hyperparameter_overrides.embed_dim =
-                    Some(parse_arg_value(&args, index, "--embed-dim")?);
-                index += 2;
-            }
-            "--num-heads" => {
-                hyperparameter_overrides.num_heads =
-                    Some(parse_arg_value(&args, index, "--num-heads")?);
-                index += 2;
-            }
-            "--num-layers" => {
-                hyperparameter_overrides.num_layers =
-                    Some(parse_arg_value(&args, index, "--num-layers")?);
-                index += 2;
-            }
-            "--dropout" => {
-                hyperparameter_overrides.dropout =
-                    Some(parse_arg_value(&args, index, "--dropout")?);
-                index += 2;
-            }
-            "--learning-rate" => {
-                hyperparameter_overrides.learning_rate =
-                    Some(parse_arg_value(&args, index, "--learning-rate")?);
-                index += 2;
-            }
-            "--lr-schedule" => {
-                let value = args.get(index + 1).context(
-                    "--lr-schedule requires a value: constant, warmup-cosine, or warmup-linear",
-                )?;
-                hyperparameter_overrides.learning_rate_schedule = Some(parse_lr_schedule(value)?);
-                index += 2;
-            }
-            "--lr-warmup-steps" => {
-                hyperparameter_overrides.lr_warmup_steps =
-                    Some(parse_arg_value(&args, index, "--lr-warmup-steps")?);
-                index += 2;
-            }
-            "--sampling-policy" => {
-                let value = args.get(index + 1).context(
-                    "--sampling-policy requires a value: random-window, sequential, or shuffled-chunks",
-                )?;
-                hyperparameter_overrides.sampling_policy = Some(parse_sampling_policy(value)?);
-                index += 2;
-            }
-            "--train-steps" => {
-                hyperparameter_overrides.train_steps =
-                    Some(parse_arg_value(&args, index, "--train-steps")?);
-                index += 2;
-            }
-            "--eval-interval" => {
-                hyperparameter_overrides.eval_interval =
-                    Some(parse_arg_value(&args, index, "--eval-interval")?);
-                index += 2;
-            }
-            "--generate-tokens" => {
-                hyperparameter_overrides.generate_tokens =
-                    Some(parse_arg_value(&args, index, "--generate-tokens")?);
-                index += 2;
-            }
-            "--grad-clip-norm" => {
-                hyperparameter_overrides.minigpt_grad_clip_norm =
-                    Some(parse_arg_value(&args, index, "--grad-clip-norm")?);
-                index += 2;
-            }
-            "--moe-experts" => {
-                hyperparameter_overrides.moe_experts =
-                    Some(parse_arg_value(&args, index, "--moe-experts")?);
-                index += 2;
-            }
-            "--moe-top-k" => {
-                hyperparameter_overrides.moe_top_k =
-                    Some(parse_arg_value(&args, index, "--moe-top-k")?);
-                index += 2;
-            }
-            "--moe-aux-loss-weight" => {
-                hyperparameter_overrides.moe_aux_loss_weight =
-                    Some(parse_arg_value(&args, index, "--moe-aux-loss-weight")?);
-                index += 2;
-            }
-            "--prefetch-batches" => {
-                hyperparameter_overrides.prefetch_batches =
-                    Some(parse_arg_value(&args, index, "--prefetch-batches")?);
-                index += 2;
-            }
-            "--checkpoint-interval" => {
-                hyperparameter_overrides.checkpoint_interval =
-                    Some(parse_arg_value(&args, index, "--checkpoint-interval")?);
-                index += 2;
-            }
-            "--checkpoint-keep" => {
-                hyperparameter_overrides.checkpoint_keep =
-                    Some(parse_arg_value(&args, index, "--checkpoint-keep")?);
-                index += 2;
-            }
-            "--interactive-generate" => {
-                interactive = true;
-                index += 1;
-            }
-            "--benchmark-generation" => {
-                benchmark_generation = true;
-                index += 1;
-            }
-            "--load-checkpoint" => {
-                load_checkpoint = true;
-                index += 1;
-            }
-            "--load-latest-checkpoint" => {
-                load_latest_checkpoint = true;
-                index += 1;
-            }
-            "--serve" => {
-                serve = true;
-                index += 1;
-            }
-            other => bail!("unsupported argument: {other}"),
+    // clap expects argv[0]; every caller passes bare flags (main.rs uses
+    // `env::args().skip(1)`), so synthesize the program name here.
+    let cli = match Cli::try_parse_from(
+        std::iter::once("rusty-gpt".to_string())
+            .chain(args.into_iter().map(|arg| arg.as_ref().to_string())),
+    ) {
+        Ok(cli) => cli,
+        // `try_parse_from` reports `--help` and `--version` as errors. They are
+        // not: they belong on stdout with exit code 0, which `Error::exit` does.
+        // Everything else becomes an ordinary anyhow error so the existing
+        // message assertions and `main`'s error path keep working.
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
+            err.exit()
         }
-    }
+        Err(err) => return Err(err.into()),
+    };
+
+    let arg_backend = cli.backend.as_deref();
+    let arg_input = cli.input.as_deref();
+    let arg_model = cli.model.as_deref();
+    let arg_checkpoint = cli.checkpoint.as_deref();
+    let arg_resume_from = cli.resume_from.as_deref();
+    let arg_server_addr = cli.server_addr.as_deref();
+    let arg_log_format = cli.log_format.as_deref();
+    let arg_max_prompt_bytes = cli.max_prompt_bytes;
+    let arg_max_output_tokens = cli.max_output_tokens;
+    let arg_rate_limit_rps = cli.rate_limit_rps;
+    let arg_rate_limit_burst = cli.rate_limit_burst;
+    let arg_benchmark_prompt_lens = cli.benchmark_prompt_lens.as_deref();
+    let arg_benchmark_gen_lens = cli.benchmark_gen_lens.as_deref();
+    let arg_benchmark_warmups = cli.benchmark_warmups.as_deref();
+    let arg_benchmark_iterations = cli.benchmark_iterations.as_deref();
+    let interactive = cli.interactive_generate;
+    let benchmark_generation = cli.benchmark_generation;
+    let load_checkpoint = cli.load_checkpoint;
+    let load_latest_checkpoint = cli.load_latest_checkpoint;
+    let serve = cli.serve;
+
+    // `--lr-schedule` and `--sampling-policy` keep their hand-written parsers
+    // rather than a clap `value_parser`, so their error text stays identical
+    // and `LearningRateSchedule`/`SamplingPolicy` need no clap derive.
+    let hyperparameter_overrides = HyperparameterOverrides {
+        block_size: cli.block_size,
+        batch_size: cli.batch_size,
+        embed_dim: cli.embed_dim,
+        num_heads: cli.num_heads,
+        num_layers: cli.num_layers,
+        dropout: cli.dropout,
+        learning_rate: cli.learning_rate,
+        learning_rate_schedule: cli
+            .lr_schedule
+            .as_deref()
+            .map(parse_lr_schedule)
+            .transpose()?,
+        lr_warmup_steps: cli.lr_warmup_steps,
+        sampling_policy: cli
+            .sampling_policy
+            .as_deref()
+            .map(parse_sampling_policy)
+            .transpose()?,
+        train_steps: cli.train_steps,
+        eval_interval: cli.eval_interval,
+        generate_tokens: cli.generate_tokens,
+        minigpt_grad_clip_norm: cli.grad_clip_norm,
+        moe_experts: cli.moe_experts,
+        moe_top_k: cli.moe_top_k,
+        moe_aux_loss_weight: cli.moe_aux_loss_weight,
+        prefetch_batches: cli.prefetch_batches,
+        checkpoint_interval: cli.checkpoint_interval,
+        checkpoint_keep: cli.checkpoint_keep,
+    };
 
     if load_checkpoint && load_latest_checkpoint {
         bail!("--load-checkpoint and --load-latest-checkpoint are mutually exclusive");
@@ -1041,19 +1022,6 @@ fn default_log_format(backend: BackendChoice) -> LogFormat {
         #[cfg(feature = "cuda")]
         BackendChoice::Cuda => LogFormat::Json,
     }
-}
-
-fn parse_arg_value<T>(args: &[String], index: usize, name: &str) -> Result<T>
-where
-    T: std::str::FromStr,
-    T::Err: std::error::Error + Send + Sync + 'static,
-{
-    let value = args
-        .get(index + 1)
-        .with_context(|| format!("{name} requires a value"))?;
-    value
-        .parse()
-        .with_context(|| format!("invalid {name} value: {value}"))
 }
 
 fn parse_backend_name(name: &str) -> Result<BackendChoice> {
@@ -1422,9 +1390,12 @@ mod tests {
 
         expect_parse_error(
             &["--block-size", "many"],
-            "invalid --block-size value: many",
+            "invalid value 'many' for '--block-size",
         );
-        expect_parse_error(&["--dropout", "often"], "invalid --dropout value: often");
+        expect_parse_error(
+            &["--dropout", "often"],
+            "invalid value 'often' for '--dropout",
+        );
     }
 
     #[test]
@@ -1452,37 +1423,23 @@ mod tests {
 
     #[test]
     fn rejects_missing_parser_owned_flag_values() {
-        let cases = [
-            (&["--server-addr"][..], "--server-addr requires a value"),
-            (&["--log-format"][..], "--log-format requires a value"),
-            (
-                &["--benchmark-prompt-lens"][..],
-                "--benchmark-prompt-lens requires a comma-separated list",
-            ),
-            (
-                &["--benchmark-gen-lens"][..],
-                "--benchmark-gen-lens requires a comma-separated list",
-            ),
-            (
-                &["--benchmark-warmups"][..],
-                "--benchmark-warmups requires an integer",
-            ),
-            (
-                &["--benchmark-iterations"][..],
-                "--benchmark-iterations requires an integer",
-            ),
-            (&["--block-size"][..], "--block-size requires a value"),
-            (&["--dropout"][..], "--dropout requires a value"),
-            (&["--learning-rate"][..], "--learning-rate requires a value"),
-            (&["--lr-schedule"][..], "--lr-schedule requires a value"),
-            (
-                &["--sampling-policy"][..],
-                "--sampling-policy requires a value",
-            ),
-        ];
-
-        for (args, expected) in cases {
-            expect_parse_error(args, expected);
+        // clap owns missing-value errors now. The behaviour under test is
+        // unchanged - a flag given without its value is rejected, naming the
+        // flag - only the wording moved from hand-written text to clap's.
+        for flag in [
+            "--server-addr",
+            "--log-format",
+            "--benchmark-prompt-lens",
+            "--benchmark-gen-lens",
+            "--benchmark-warmups",
+            "--benchmark-iterations",
+            "--block-size",
+            "--dropout",
+            "--learning-rate",
+            "--lr-schedule",
+            "--sampling-policy",
+        ] {
+            expect_parse_error(&[flag], &format!("a value is required for '{flag}"));
         }
     }
 
@@ -1516,15 +1473,15 @@ mod tests {
             ),
             (
                 &["--block-size", "many"][..],
-                "invalid --block-size value: many",
+                "invalid value 'many' for '--block-size",
             ),
             (
                 &["--num-heads", "many"][..],
-                "invalid --num-heads value: many",
+                "invalid value 'many' for '--num-heads",
             ),
             (
                 &["--dropout", "often"][..],
-                "invalid --dropout value: often",
+                "invalid value 'often' for '--dropout",
             ),
             (
                 &["--lr-schedule", "banana"][..],

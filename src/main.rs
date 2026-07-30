@@ -616,7 +616,10 @@ mod tests {
         )
         .expect_err("missing checkpoint value should fail");
 
-        assert!(err.to_string().contains("--checkpoint requires a value"));
+        assert!(
+            err.to_string()
+                .contains("a value is required for '--checkpoint")
+        );
     }
 
     #[test]
@@ -624,7 +627,10 @@ mod tests {
         let err = parse_runtime_config(["--backend".to_string()], None, None, None)
             .expect_err("missing backend value should fail");
 
-        assert!(err.to_string().contains("--backend requires a value"));
+        assert!(
+            err.to_string()
+                .contains("a value is required for '--backend")
+        );
     }
 
     #[test]
@@ -632,7 +638,7 @@ mod tests {
         let err = parse_runtime_config(["--input".to_string()], None, None, None)
             .expect_err("missing input value should fail");
 
-        assert!(err.to_string().contains("--input requires a path"));
+        assert!(err.to_string().contains("a value is required for '--input"));
     }
 
     #[test]
@@ -938,7 +944,7 @@ mod tests {
         let err = parse_runtime_config(["--model".to_string()], None, None, None)
             .expect_err("missing model value should fail");
 
-        assert!(err.to_string().contains("--model requires a value"));
+        assert!(err.to_string().contains("a value is required for '--model"));
     }
 
     #[test]
