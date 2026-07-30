@@ -434,26 +434,23 @@ def ensure_labels(repo: str, labels: list[str], *, dry_run: bool) -> None:
     for label in sorted(set(labels)):
         if dry_run:
             continue
-        completed = run(
+        # `gh label create --force` creates the label or updates it if it already exists,
+        # exiting 0 either way. `gh api POST .../labels` returns 422 on a duplicate and
+        # reports it as a bare "Validation Failed (HTTP 422)" with no machine-readable
+        # reason, which is not safely distinguishable from a real validation error.
+        run(
             [
                 "gh",
-                "api",
-                "-X",
-                "POST",
-                f"repos/{repo}/labels",
-                "-f",
-                f"name={label}",
-                "-f",
-                f"color={colors.get(label, 'ededed')}",
-            ],
-            check=False,
+                "label",
+                "create",
+                label,
+                "--repo",
+                repo,
+                "--color",
+                colors.get(label, "ededed"),
+                "--force",
+            ]
         )
-        if completed.returncode == 0:
-            continue
-        already_exists = "already_exists" in completed.stderr or "already exists" in completed.stderr
-        validation_failed = "Validation Failed" in completed.stderr and label in completed.stderr
-        if not (already_exists or validation_failed):
-            raise RuntimeError(completed.stderr)
 
 
 def upsert_issue(repo: str, finding: Finding, report_path: Path, *, dry_run: bool) -> None:
