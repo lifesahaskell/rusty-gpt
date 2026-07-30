@@ -9,7 +9,7 @@ default = []
 cuda = ["burn/cuda"]
 
 [dependencies]
-burn = { version = "0.21", features = ["train", "ndarray", "wgpu"] }
+burn = { version = "0.21", features = ["train", "ndarray"] }
 burn-ndarray = "0.21"
 rand = "0.10.1"
 anyhow = "1"
