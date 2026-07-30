@@ -11,6 +11,7 @@ Every CLI flag and `RUSTY_GPT_*` environment variable accepted by the
 | `--input <path>` | `RUSTY_GPT_INPUT` | `data/input.txt` | Plain UTF-8 text. Also accepts `hf://` URIs (see [Hugging Face datasets](#hugging-face-datasets)). |
 | `--model <name>` | `RUSTY_GPT_MODEL` | `minigpt` | `trivial`, `single-attention`, `multi-attention`, `minigpt` (alias `mini-gpt`), `moe-gpt` (alias `moegpt`), `compare`. |
 | `--checkpoint <path>` | `RUSTY_GPT_MINIGPT_CHECKPOINT` | `checkpoints/mini_gpt` | Path without `.mpk` — Burn appends it. Explicit paths must resolve inside `checkpoints/`; bare names resolve there. |
+| `--resume-from <path>` | `RUSTY_GPT_RESUME_FROM` | unset | Resume training from a saved checkpoint. Path without `.mpk`, confined to `checkpoints/` on the same rules as `--checkpoint`. Requires `--model minigpt` or `--model moe-gpt`; any other model is rejected at parse time. |
 | `--log-format plain\|json` | `RUSTY_GPT_LOG_FORMAT` | backend default | CPU defaults to plain text; CUDA defaults to JSON Lines. |
 | — | `RUSTY_GPT_BPE_TOKENIZER` | `checkpoints/tokenizer.json` | BPE tokenizer JSON used by MiniGPT, MoeGPT, and `compare` runs. |
 | `--interactive-generate` | — | off | Requires `--backend cpu` and `--model minigpt` or `--model moe-gpt`. |
@@ -50,6 +51,8 @@ Every CLI flag and `RUSTY_GPT_*` environment variable accepted by the
 | `--prefetch-batches <n>` | `RUSTY_GPT_PREFETCH_BATCHES` | `2` | Number of prepared CPU batches queued ahead of training. |
 | `--generate-tokens <n>` | `RUSTY_GPT_GENERATE_TOKENS` | `80` | Interactive generation token count. |
 | `--grad-clip-norm <n>` | `RUSTY_GPT_MINIGPT_GRAD_CLIP_NORM` | `1.0` | Must be > 0. |
+| `--checkpoint-interval <n>` | `RUSTY_GPT_CHECKPOINT_INTERVAL` | `0` | Save `<checkpoint>.step-<N>.mpk` every N steps of MiniGPT or MoeGPT training. `0` disables periodic saves. |
+| `--checkpoint-keep <k>` | `RUSTY_GPT_CHECKPOINT_KEEP` | `3` | Retention window for periodic snapshots — older `.step-N.` files are pruned. The final end-of-run save and any `.interrupted-step-*` save are never pruned. Must be > 0 when `checkpoint_interval` is non-zero. |
 
 ## Hugging Face dataset loader
 
