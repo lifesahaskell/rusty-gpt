@@ -434,26 +434,23 @@ def ensure_labels(repo: str, labels: list[str], *, dry_run: bool) -> None:
     for label in sorted(set(labels)):
         if dry_run:
             continue
-        completed = run(
+        # `gh label create --force` creates the label or updates it if it already exists,
+        # exiting 0 either way. `gh api POST .../labels` returns 422 on a duplicate and
+        # reports it as a bare "Validation Failed (HTTP 422)" with no machine-readable
+        # reason, which is not safely distinguishable from a real validation error.
+        run(
             [
                 "gh",
-                "api",
-                "-X",
-                "POST",
-                f"repos/{repo}/labels",
-                "-f",
-                f"name={label}",
-                "-f",
-                f"color={colors.get(label, 'ededed')}",
-            ],
-            check=False,
+                "label",
+                "create",
+                label,
+                "--repo",
+                repo,
+                "--color",
+                colors.get(label, "ededed"),
+                "--force",
+            ]
         )
-        if completed.returncode == 0:
-            continue
-        already_exists = "already_exists" in completed.stderr or "already exists" in completed.stderr
-        validation_failed = "Validation Failed" in completed.stderr and label in completed.stderr
-        if not (already_exists or validation_failed):
-            raise RuntimeError(completed.stderr)
 
 
 def upsert_issue(repo: str, finding: Finding, report_path: Path, *, dry_run: bool) -> None:
@@ -462,9 +459,24 @@ def upsert_issue(repo: str, finding: Finding, report_path: Path, *, dry_run: boo
         print(f"dry-run: would upsert issue: {title}")
         return
 
-    query = f"repo:{repo} is:issue is:open {finding.id}"
-    search = gh_json(["api", "search/issues", "-f", f"q={query}"]) or {}
-    items = search.get("items", [])
+    # The REST endpoint `search/issues` was removed and now 404s; `gh issue list --search`
+    # is repo-scoped, matches title and body, and does not consume the search rate limit.
+    items = gh_json(
+        [
+            "issue",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "open",
+            "--search",
+            finding.id,
+            "--json",
+            "number",
+            "--limit",
+            "1",
+        ]
+    ) or []
     labels = ",".join(finding.labels)
     if items:
         number = str(items[0]["number"])

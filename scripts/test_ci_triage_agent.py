@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
@@ -13,6 +14,15 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "ci_triage_agent.py"
 FIXTURE = REPO_ROOT / "tests" / "fixtures" / "ci_triage_sample.json"
+
+
+def load_agent_module():
+    spec = importlib.util.spec_from_file_location("ci_triage_agent", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    # Must be registered before exec: @dataclass resolves cls.__module__ via sys.modules.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def run_agent(input_json: Path, artifact_dir: Path) -> subprocess.CompletedProcess[str]:
@@ -74,6 +84,73 @@ class CiTriageAgentTest(unittest.TestCase):
             self.assertIn("0 broken CI finding(s)", completed.stdout)
             self.assertEqual(json.loads((artifact_dir / "findings.json").read_text()), [])
             self.assertIn("No broken CI findings", (artifact_dir / "summary.md").read_text())
+
+
+class EnsureLabelsTest(unittest.TestCase):
+    """Labels already exist after the first run, so provisioning must be idempotent.
+
+    Regression guard: the previous implementation POSTed to the labels API and tried to
+    tolerate duplicates by string-matching stderr. `gh api` reports a duplicate as a bare
+    "Validation Failed (HTTP 422)", the match never fired, and every scheduled run raised.
+    """
+
+    def setUp(self) -> None:
+        self.agent = load_agent_module()
+        self.calls: list[list[str]] = []
+        self.agent.run = lambda argv, **kwargs: self.calls.append(argv)
+
+    def test_uses_forced_label_create_so_duplicates_are_not_errors(self) -> None:
+        self.agent.ensure_labels("o/r", ["ci-triage", "ci-severity/low"], dry_run=False)
+
+        self.assertEqual(len(self.calls), 2)
+        for argv in self.calls:
+            self.assertEqual(argv[:3], ["gh", "label", "create"])
+            self.assertIn("--force", argv)
+            self.assertEqual(argv[argv.index("--repo") + 1], "o/r")
+        self.assertEqual([argv[3] for argv in self.calls], ["ci-severity/low", "ci-triage"])
+
+    def test_dry_run_touches_github_not_at_all(self) -> None:
+        self.agent.ensure_labels("o/r", ["ci-triage"], dry_run=True)
+        self.assertEqual(self.calls, [])
+
+
+class UpsertIssueSearchTest(unittest.TestCase):
+    """The REST endpoint `search/issues` was removed and now returns 404.
+
+    Regression guard: this path was unreachable while ensure_labels raised first, so the
+    404 only surfaced once label provisioning was fixed.
+    """
+
+    def setUp(self) -> None:
+        self.agent = load_agent_module()
+        self.json_calls: list[list[str]] = []
+        self.run_calls: list[list[str]] = []
+        self.agent.gh_json = lambda argv: self.json_calls.append(argv) or []
+        self.agent.run = lambda argv, **kwargs: self.run_calls.append(argv)
+
+    def test_searches_via_issue_list_not_the_removed_search_api(self) -> None:
+        finding = self.agent.Finding(
+            id="run-1-cargo-fmt",
+            source="workflow-run",
+            title="CI: cargo fmt",
+            severity="high",
+            severity_reason="default-branch workflow is broken",
+            workflow="CI",
+            job="cargo fmt",
+            conclusion="failure",
+            url="https://example.invalid/run/1",
+            labels=["ci-triage"],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "r.md"
+            report.write_text("report")
+            self.agent.upsert_issue("o/r", finding, report, dry_run=False)
+
+        self.assertEqual(len(self.json_calls), 1)
+        argv = self.json_calls[0]
+        self.assertEqual(argv[:2], ["issue", "list"])
+        self.assertNotIn("search/issues", argv)
+        self.assertEqual(argv[argv.index("--search") + 1], "run-1-cargo-fmt")
 
 
 if __name__ == "__main__":
