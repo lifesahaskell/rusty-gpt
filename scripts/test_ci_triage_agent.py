@@ -153,5 +153,47 @@ class UpsertIssueSearchTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--search") + 1], "run-1-cargo-fmt")
 
 
+class RunFindingIdStabilityTest(unittest.TestCase):
+    """The finding id is the dedupe key upsert_issue searches on, so the same
+    broken job re-running must produce the same id or every run files a new
+    issue."""
+
+    def setUp(self) -> None:
+        self.agent = load_agent_module()
+
+    def run_obj(self, run_id: int) -> dict:
+        return {
+            "id": run_id,
+            "name": "CI",
+            "head_branch": "main",
+            "head_sha": f"sha{run_id}",
+            "conclusion": "failure",
+            "html_url": f"https://example.invalid/run/{run_id}",
+        }
+
+    def finding_id_for(self, run_id: int) -> str:
+        finding = self.agent.finding_from_run(
+            default_branch="main",
+            run_obj=self.run_obj(run_id),
+            job={"name": "cargo fmt", "conclusion": "failure"},
+        )
+        self.assertIsNotNone(finding)
+        return finding.id
+
+    def test_same_job_on_same_branch_keeps_one_id_across_runs(self) -> None:
+        self.assertEqual(self.finding_id_for(111), self.finding_id_for(222))
+
+    def test_id_does_not_embed_the_run_id(self) -> None:
+        self.assertNotIn("111", self.finding_id_for(111))
+
+    def test_different_jobs_stay_separate(self) -> None:
+        other = self.agent.finding_from_run(
+            default_branch="main",
+            run_obj=self.run_obj(111),
+            job={"name": "cargo clippy", "conclusion": "failure"},
+        )
+        self.assertNotEqual(self.finding_id_for(111), other.id)
+
+
 if __name__ == "__main__":
     unittest.main()
