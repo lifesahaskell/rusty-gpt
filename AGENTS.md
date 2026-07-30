@@ -5,7 +5,7 @@ This file gives AI coding agents concise, repo-specific guidance for working in 
 
 ## What this repo is
 - Single-binary Rust crate implementing GPT model training and inference on top of the Burn framework.
-- Supports four model variants: `trivial`, `single-attention`, `multi-attention`, and `minigpt`.
+- Supports five model variants: `trivial`, `single-attention`, `multi-attention`, `minigpt`, and `moe-gpt`.
 - Includes CLI runtime, tokenizer training, corpus collection, HTTP server, and a separate React UI in `mini-gpt-ui/`.
 
 ## Primary files to inspect
@@ -16,7 +16,7 @@ This file gives AI coding agents concise, repo-specific guidance for working in 
 - `src/runtime_orchestration.rs` and `src/runtime_training.rs` — demo / training / server / interactive dispatch.
 - `src/runtime_assets.rs` — corpus, tokenizer, and checkpoint resolution (including `hf://` URIs via `loader::huggingface`).
 - `src/model/mod.rs` (+ `generation.rs`, `training.rs`, `persistence.rs`) — model progression, sampling, training loops, and checkpoint I/O.
-- `src/server/mod.rs` — API routes: `POST /generate` and `GET /info`, nested under `/api` by `runtime_orchestration`.
+- `src/server/mod.rs` — API routes: `POST /generate`, `GET /info`, and `GET /health`, nested under `/api` by `runtime_orchestration`.
 - `src/tokenizer/` — char-level tokenizer and BPE tokenizer trainer/load logic.
 - `src/observability.rs` — `EventLogger`, `RuntimeEvent`, `LogFormat`; structured stdout events.
 - `tests/default_runtime.rs` — ensures default CPU execution does not load CUDA.
@@ -26,7 +26,7 @@ Run from the repo root.
 
 - `cargo build`
 - `cargo test`
-- `cargo clippy --all-targets`
+- `cargo clippy --all-targets -- -D warnings` — CI runs this plus `cargo clippy --all-targets --features cuda -- -D warnings`. Without `-D warnings` you will pass locally and fail CI.
 - `cargo fmt --all -- --check`
 - `cargo run` for the default CPU demo (defaults to `--model minigpt`, which requires `checkpoints/tokenizer.json` — see the constraints below)
 - `./scripts/run_e2e_tests.sh` for the full-stack UI/API test
@@ -37,7 +37,7 @@ Run from the repo root.
 - Checkpoint loads in production go through `load_model_with_strict_metadata_validation`, which rejects a missing `.metadata.json` sidecar or a tokenizer-hash mismatch. Tests use the lenient `load_model_with_metadata_validation` variant.
 - `--checkpoint` paths are passed without the `.mpk` extension.
 - `--load-checkpoint` and `--load-latest-checkpoint` are mutually exclusive.
-- `--interactive-generate` only works with `--backend cpu` and `--model minigpt`.
+- `--interactive-generate` only works with `--backend cpu` and `--model minigpt` or `--model moe-gpt`.
 - `--input` and `train-tokenizer --corpus` both accept `hf://dataset?config=…&split=…` URIs; fetched rows cache under `data/huggingface-cache/`.
 - `--log-format plain|json` (env `RUSTY_GPT_LOG_FORMAT`) switches observability output for every entry point.
 - `tests/default_runtime.rs` asserts that the CPU default path must not reference CUDA or `libcuda`.
