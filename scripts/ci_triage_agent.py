@@ -459,9 +459,24 @@ def upsert_issue(repo: str, finding: Finding, report_path: Path, *, dry_run: boo
         print(f"dry-run: would upsert issue: {title}")
         return
 
-    query = f"repo:{repo} is:issue is:open {finding.id}"
-    search = gh_json(["api", "search/issues", "-f", f"q={query}"]) or {}
-    items = search.get("items", [])
+    # The REST endpoint `search/issues` was removed and now 404s; `gh issue list --search`
+    # is repo-scoped, matches title and body, and does not consume the search rate limit.
+    items = gh_json(
+        [
+            "issue",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "open",
+            "--search",
+            finding.id,
+            "--json",
+            "number",
+            "--limit",
+            "1",
+        ]
+    ) or []
     labels = ",".join(finding.labels)
     if items:
         number = str(items[0]["number"])

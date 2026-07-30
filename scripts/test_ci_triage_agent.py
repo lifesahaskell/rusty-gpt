@@ -114,5 +114,44 @@ class EnsureLabelsTest(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
 
+class UpsertIssueSearchTest(unittest.TestCase):
+    """The REST endpoint `search/issues` was removed and now returns 404.
+
+    Regression guard: this path was unreachable while ensure_labels raised first, so the
+    404 only surfaced once label provisioning was fixed.
+    """
+
+    def setUp(self) -> None:
+        self.agent = load_agent_module()
+        self.json_calls: list[list[str]] = []
+        self.run_calls: list[list[str]] = []
+        self.agent.gh_json = lambda argv: self.json_calls.append(argv) or []
+        self.agent.run = lambda argv, **kwargs: self.run_calls.append(argv)
+
+    def test_searches_via_issue_list_not_the_removed_search_api(self) -> None:
+        finding = self.agent.Finding(
+            id="run-1-cargo-fmt",
+            source="workflow-run",
+            title="CI: cargo fmt",
+            severity="high",
+            severity_reason="default-branch workflow is broken",
+            workflow="CI",
+            job="cargo fmt",
+            conclusion="failure",
+            url="https://example.invalid/run/1",
+            labels=["ci-triage"],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "r.md"
+            report.write_text("report")
+            self.agent.upsert_issue("o/r", finding, report, dry_run=False)
+
+        self.assertEqual(len(self.json_calls), 1)
+        argv = self.json_calls[0]
+        self.assertEqual(argv[:2], ["issue", "list"])
+        self.assertNotIn("search/issues", argv)
+        self.assertEqual(argv[argv.index("--search") + 1], "run-1-cargo-fmt")
+
+
 if __name__ == "__main__":
     unittest.main()
