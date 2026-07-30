@@ -222,7 +222,13 @@ def finding_from_run(
         labels.append("trivial-fix-eligible")
 
     return Finding(
-        id=slug(f"run-{run_obj.get('id')}-{job_name}"),
+        # Deliberately excludes the workflow run id. `upsert_issue` dedupes by
+        # searching open issues for this id, so keying on a per-run value meant
+        # the search could never hit and every failing run opened a fresh issue.
+        # Branch + workflow + job is stable across re-runs of the same problem,
+        # so repeat failures append a comment to one issue instead. The run's
+        # own url/sha/timestamp still land in the report body.
+        id=slug(f"run-{branch or 'nobranch'}-{workflow}-{job_name}"),
         source="workflow-run",
         title=f"{workflow}: {job_name}",
         severity=severity,
