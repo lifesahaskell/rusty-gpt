@@ -74,3 +74,39 @@ pub(super) fn select_token_from_logits(
 ) -> usize {
     sample_from_logits(logits, options.temperature, options.top_k, random_unit)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sampling_options_reject_invalid_values() {
+        assert!(GenerationOptions::sampling(0.0, None).is_err());
+        assert!(GenerationOptions::sampling(1.0, Some(0)).is_err());
+        assert_eq!(
+            GenerationOptions {
+                temperature: 1.0,
+                top_k: Some(3),
+            },
+            GenerationOptions::sampling(1.0, Some(3)).unwrap()
+        );
+    }
+
+    #[test]
+    fn top_k_sampling_restricts_candidates() {
+        let logits = [10.0, 9.0, 1.0, 0.0];
+
+        for random_unit in [0.0, 0.25, 0.75, 0.99] {
+            let token = sample_from_logits(&logits, 1.0, Some(2), random_unit);
+
+            assert!(token < 2, "top-k sampling selected token {token}");
+        }
+    }
+
+    #[test]
+    fn zero_temperature_sampling_is_greedy() {
+        let logits = [1.0, 5.0, 3.0];
+
+        assert_eq!(1, sample_from_logits(&logits, 0.0, Some(1), 0.99));
+    }
+}

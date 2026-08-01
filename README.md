@@ -35,7 +35,7 @@ environment and a CUDA one ([details](docs/development-runbook.md#container-base
 
 ## Highlights
 
-- **Five models, one file** — [src/model/mod.rs](src/model/mod.rs) builds up
+- **Five models, one progression** — [src/model/definitions.rs](src/model/definitions.rs) builds up
   from a trivial embedding head to a full pre-norm transformer block, each
   variant runnable on the same training loop.
 - **Two backends from one binary** — CPU (`ndarray`) by default, CUDA opt-in

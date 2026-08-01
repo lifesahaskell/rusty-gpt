@@ -779,9 +779,11 @@ fn no_periodic_save<M>(_model: &M, _step: usize) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::loader::data::DataLoader;
+    use crate::observability::{EventLogger, LogFormat};
     use burn::backend::Autodiff;
     use burn::backend::ndarray::{NdArray, NdArrayDevice};
     use std::cell::RefCell;
+    use std::sync::{Arc, Mutex};
 
     type TestBackend = Autodiff<NdArray<f32, i64>>;
 
@@ -823,5 +825,95 @@ mod tests {
         // with a prior run: step 3 fires (multiple of interval 1, non-final);
         // step 4 is the final and is suppressed. Numbering never restarts at 0.
         assert_eq!(vec![3], *periodic_steps.borrow());
+    }
+    #[test]
+    fn training_step_logging_uses_interval_and_always_logs_final_step() {
+        assert!(should_log_training_step(0, 25, 10));
+        assert!(should_log_training_step(10, 25, 10));
+        assert!(should_log_training_step(24, 25, 10));
+        assert!(!should_log_training_step(9, 25, 10));
+    }
+
+    #[test]
+    fn training_step_logging_logs_every_step_when_total_fits_interval() {
+        assert!(should_log_training_step(0, 3, 10));
+        assert!(should_log_training_step(1, 3, 10));
+        assert!(should_log_training_step(2, 3, 10));
+    }
+
+    #[test]
+    fn training_step_logging_zero_interval_only_logs_final_step() {
+        assert!(!should_log_training_step(0, 3, 0));
+        assert!(!should_log_training_step(1, 3, 0));
+        assert!(should_log_training_step(2, 3, 0));
+    }
+
+    #[test]
+    fn training_progress_json_log_line_includes_backend_and_losses() {
+        type TestBackend = NdArray<f32, i64>;
+        let line = training_progress_log_line::<TestBackend>(
+            TrainingLogContext {
+                backend: "cuda",
+                model: "minigpt",
+                logger: EventLogger::stdout(LogFormat::Json),
+            },
+            10,
+            100,
+            1.25,
+            2.5,
+            TrainingThroughput::from_progress(11, 32, 128, 250),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!("training_progress", parsed["event"]);
+        assert_eq!("cuda", parsed["backend"]);
+        assert_eq!("minigpt", parsed["model"]);
+        assert_eq!(10, parsed["step"]);
+        assert_eq!(100, parsed["total_steps"]);
+        assert_eq!(1.25, parsed["training_loss"]);
+        assert_eq!(2.5, parsed["value_loss"]);
+        assert_eq!(250, parsed["elapsed_ms"]);
+        assert!(parsed["tokens_per_second"].as_f64().unwrap() > 0.0);
+        assert!(parsed["steps_per_second"].as_f64().unwrap() > 0.0);
+        assert!(parsed["step_ms_mean"].as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn training_run_emits_final_progress_event() {
+        type TestBackend = Autodiff<NdArray<f32, i64>>;
+        let device = NdArrayDevice::Cpu;
+        let loader = DataLoader {
+            tokens: vec![0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4],
+            block_size: 2,
+            batch_size: 2,
+        };
+        let value_loader = loader.clone();
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&lines);
+        let logger = EventLogger::with_sink(LogFormat::Json, move |line| {
+            captured.lock().unwrap().push(line);
+        });
+        let params = TrainingParams::new(
+            1e-4,
+            3,
+            2,
+            TrainingLogContext {
+                backend: "cpu",
+                model: "trivial",
+                logger,
+            },
+        );
+
+        TrivialModel::<TestBackend>::train(&loader, &value_loader, &device, 7, 8, params).unwrap();
+
+        let lines = lines.lock().unwrap();
+        let final_progress: serde_json::Value =
+            serde_json::from_str(lines.last().expect("expected progress event")).unwrap();
+        assert_eq!("training_progress", final_progress["event"]);
+        assert_eq!(2, final_progress["step"]);
+        assert_eq!(3, final_progress["total_steps"]);
+        assert!(final_progress["tokens_per_second"].as_f64().unwrap() > 0.0);
+        assert!(final_progress["steps_per_second"].as_f64().unwrap() > 0.0);
+        assert!(final_progress["step_ms_mean"].as_f64().unwrap() > 0.0);
     }
 }
