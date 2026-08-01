@@ -3,7 +3,7 @@
 - **Value:** product
 - **Size:** S (~1 day)
 - **Suggested agent:** fullstack-react-rust-engineer
-- **Depends on:** T1, T2
+- **Depends on:** T1 only (not T2 — this needs T1's run-tracking and the `request_interrupt` fn T1 exposes, not the status endpoint. Can run in parallel with T2 once T1 merges.)
 - **Blocks:** T4
 
 ## Goal
@@ -21,7 +21,8 @@ Give the UI's stop button (T4) something to call. Stopping a run should behave l
 
 ## Implementation notes
 
-- Reuse the stop-flag mechanism already proven in `runtime_signals` for SIGINT — a shared `AtomicBool` (or equivalent) the training loop checks at step boundaries. `DELETE` sets it directly instead of a signal handler setting it; the training loop's response is identical either way.
+- Reuse the exact stop-flag mechanism already proven in `runtime_signals` for SIGINT: `runtime_signals::INTERRUPT_REQUESTED`, checked by the training loop at every step boundary. `DELETE` calls `runtime_signals::request_interrupt()` (the `pub fn` T1 promotes from the current `#[cfg(test)] _test_request_interrupt`) instead of a signal handler setting it; the training loop's response is identical either way.
+- **This flag is a process-global static, not scoped per-run.** That's only safe because T1 enforces one run at a time *and* resets the flag at the start of every run (`runtime_signals::reset_interrupt()`, see T1's acceptance criteria). Do not implement T3 without confirming T1's reset call actually landed — if it didn't, this endpoint will work exactly once per server process and then silently break every future run. Add the two-runs integration test described in T1 here too if T1 didn't already cover it: stop run A, start run B, confirm B completes.
 - This is the one new design decision this sprint beyond what Sprint 03 scoped: **stop is graceful-by-checkpoint, not graceful-by-cancellation-token-with-partial-state**. Keep it that way — a step-boundary stop is simple, testable, and consistent with how the CLI already behaves under Ctrl-C.
 
 ## Definition of done

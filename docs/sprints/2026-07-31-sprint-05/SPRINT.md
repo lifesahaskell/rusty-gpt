@@ -18,7 +18,7 @@ A user can trigger a MiniGPT training run from the UI (or `curl`), watch step/lo
 
 | ID | Title | Value | Size | Suggested agent |
 |---|---|---|---|---|
-| [T1](T1-api-train-endpoint.md) | `POST /api/train` triggers async MiniGPT training, returns run ID | product | L | fullstack-react-rust-engineer |
+| [T1](T1-api-train-endpoint.md) | `POST /api/train` triggers async MiniGPT training, returns run ID | product | XL | fullstack-react-rust-engineer |
 | [T2](T2-api-train-status.md) | `GET /api/train/{run_id}/status` reports step, loss, ETA | product | M | fullstack-react-rust-engineer |
 | [T3](T3-api-train-stop.md) | `DELETE /api/train/{run_id}` stops an active run, checkpoints in place | product | S | fullstack-react-rust-engineer |
 | [T4](T4-ui-live-training.md) | Replace the dead `TrainingDashboard.tsx` stub with a live training panel wired to T1–T3 | product | L | fullstack-react-rust-engineer |
@@ -26,14 +26,17 @@ A user can trigger a MiniGPT training run from the UI (or `curl`), watch step/lo
 
 ## Dependencies
 
-- **T1 → T2 → T3 → T4** is a hard chain. T4 cannot be reviewed against a fake backend — it needs all three routes live.
-- **T5** is independent and can run the entire sprint in parallel, but it touches `src/model/mod.rs`, the same file T1's training-task wiring will read from (`MiniGpt`, `TrainingOutcome`). Land T5 first or rebase T1 on top of it — don't let both sit open against the same file for two weeks.
+A pre-sprint design review (see Risks) found the dependency chain was tighter than it needed to be. Corrected shape, in waves:
+
+- **Wave 1 (parallel):** T1 and T5. T5 touches `src/model/mod.rs`'s internal file layout but its own acceptance criteria require public re-export paths (`crate::model::MiniGpt` etc.) to keep resolving unchanged — T1 only consumes those public paths, so the two don't actually conflict as long as T5 honors its own "no public API changes" bar. Land T5 first if there's any doubt; rebase T1 on top rather than let both sit open against the same file for two weeks.
+- **Wave 2 (parallel, after T1 merges):** T2 and T3. Both depend only on T1 (run-tracking + the `EventLogger` status mechanism + the `request_interrupt`/`reset_interrupt` pair T1 exposes) — **not on each other**. The original plan chained them (T1 → T2 → T3) for no real reason; running them in parallel shortens the critical path by a full task.
+- **Wave 3 (after T2 and T3 both merge):** T4. It needs all three real endpoints — reviewing UI work against a spec instead of running code just means re-deriving the same schema questions twice.
 - T1 reuses the SIGINT-safe checkpoint-save path from `runtime_signals` (S1-T2) and the periodic-checkpoint retention from S1-T3. Nothing new to build there, just call the existing machinery from the background task instead of the CLI path.
 
 ## Risks
 
-- **T1 is the whole sprint's critical path.** It was already scoped in Sprint 03's T1 doc (concurrency-of-one via `Arc<Mutex<Option<TrainingRun>>>`, `run_id` via `uuid::Uuid::new_v4()`, manifest under `checkpoints/runs/`, `/api/generate` returns 503 while training is active). Nothing about the design has aged — reuse it rather than re-deriving. The only new decision is T3's stop semantics (see T3).
-- **Training mutates `ServerState.model`; generation reads it.** Sprint 03's chosen approach — train a cloned model, swap atomically on completion, `/api/generate` returns 503 mid-run — still stands. Don't hold a lock across the training loop.
+- **T1 is the whole sprint's critical path, and it's bigger than Sprint 03 scoped it.** Sprint 03's T1 doc assumed "clone the current serving model and train the clone" — that path doesn't exist in this codebase; training only ever starts fresh-from-config or resumed-from-checkpoint-*file* (`MiniGpt::train_prebuilt_with_periodic_save`). It also assumed `ServerState.model` could just be swapped — today it's a bare field read at ~15 call sites with no lock, so making it swappable is its own chunk of work, not a side effect. T1's doc has been updated to spell both of these out; treat its size as XL, not L.
+- **The stop mechanism is a process-global flag with no production reset path.** `runtime_signals::INTERRUPT_REQUESTED` is safe for the CLI only because the process exits after one run. The server doesn't exit between runs. If T1 doesn't reset the flag at the start of every run, the first `DELETE` (T3) permanently breaks every training run after it until the server restarts — silently. T1 and T3's docs now both call this out explicitly; don't let either land without the reset call and the two-runs regression test.
 - **`TrainingDashboard.tsx` isn't a blank slate — it's actively wrong.** It has file-drop state, a status string, and zero API calls. T4 should gut the file-drop UI (there is no corpus-upload endpoint and adding one is out of scope) rather than bolt live-progress polling on top of it.
 - **This sprint does not add auth.** `/api/train` is exposed the same way `/api/generate` is today — fine for localhost, not fine if `rusty-gpt` ever gets deployed past that. Carry this forward as a standing parking-lot item until it's actually addressed.
 
