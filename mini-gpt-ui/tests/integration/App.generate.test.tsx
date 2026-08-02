@@ -180,7 +180,7 @@ describe('App generation flow', () => {
 
     await user.click(screen.getByRole('tab', { name: /training/i }))
     expect(screen.getByRole('heading', { name: /training dashboard/i })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /start training/i })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /start training/i })).toBeEnabled()
     expect(screen.queryByRole('heading', { name: /generation/i })).not.toBeInTheDocument()
   })
 

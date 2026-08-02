@@ -100,7 +100,7 @@
 }
 
 .training-header button,
-.training-file-list button {
+.training-summary button {
   border: 1px solid var(--border);
   border-radius: 7px;
   color: var(--text-h);
@@ -114,97 +114,97 @@
   white-space: nowrap;
 }
 
-.training-header button:disabled {
+.training-header button:disabled,
+.training-summary button:disabled {
   cursor: not-allowed;
   opacity: 0.55;
 }
 
-.training-dropzone {
+.training-form {
   display: grid;
-  gap: 6px;
-  place-items: center;
-  min-height: 150px;
-  box-sizing: border-box;
-  padding: 28px;
-  border: 2px dashed var(--border);
-  border-radius: 8px;
-  color: var(--text-h);
-  background: var(--social-bg);
-  text-align: center;
-  cursor: pointer;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
 }
 
-.training-dropzone.is-dragging {
-  border-color: var(--accent);
-  background: var(--accent-bg);
-}
-
-.training-dropzone span {
-  font-size: 20px;
-  font-weight: 600;
-}
-
-.training-dropzone small {
+.training-form label {
+  display: grid;
+  gap: 4px;
   color: var(--text);
+  font-size: 14px;
 }
 
-.training-dropzone input {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-  white-space: nowrap;
+.training-form input {
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text-h);
+  background: var(--bg);
+  font: inherit;
+}
+
+.training-form input:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.training-run {
+  display: grid;
+  gap: 12px;
 }
 
 .training-summary {
   display: flex;
   justify-content: space-between;
   gap: 16px;
+  align-items: center;
   color: var(--text);
   font-size: 14px;
 }
 
-.training-file-list {
-  display: grid;
-  gap: 8px;
-  padding: 0;
-  margin: 0;
-  list-style: none;
+.training-summary button {
+  padding: 6px 12px;
 }
 
-.training-file-list li {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  align-items: center;
+.training-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.training-metrics div {
+  min-width: 0;
   padding: 10px 12px;
   border: 1px solid var(--border);
   border-radius: 8px;
 }
 
-.training-file-list li div {
-  display: grid;
-  min-width: 0;
-}
-
-.training-file-list strong,
-.training-file-list span {
-  overflow-wrap: anywhere;
-}
-
-.training-file-list strong {
-  color: var(--text-h);
-  font-size: 15px;
-}
-
-.training-file-list span {
+.training-metrics dt {
   color: var(--text);
   font-size: 13px;
 }
 
-.training-file-list button {
-  padding: 6px 10px;
+.training-metrics dd {
+  margin: 0;
+  color: var(--text-h);
+  font-size: 15px;
+  overflow-wrap: anywhere;
+}
+
+.loss-chart {
+  width: 100%;
+  height: 140px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--social-bg);
+}
+
+.loss-chart-empty,
+.training-notice {
+  margin: 0;
+  color: var(--text);
+  font-size: 14px;
 }
 
 .workspace-tabs {
@@ -543,7 +543,9 @@
   }
 
   .model-info dl,
-  .generation-options {
+  .generation-options,
+  .training-form,
+  .training-metrics {
     grid-template-columns: 1fr;
   }
 
