@@ -403,6 +403,9 @@ where
             post(training::train::<B>)
                 .layer(RequestBodyLimitLayer::new(TRAIN_REQUEST_BODY_LIMIT_BYTES)),
         )
+        // Read-only, and polled once a second by the UI — kept off the
+        // generate rate limiter for the same reason /health is.
+        .route("/train/{run_id}/status", get(training::status::<B>))
         // Stopping is a signal, not a payload: no body, so no body limit.
         .route("/train/{run_id}", delete(training::stop_train::<B>))
         .route("/info", get(info::<B>))

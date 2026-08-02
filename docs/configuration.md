@@ -194,16 +194,18 @@ update:
   "total_steps": 1000,
   "training_loss": 2.14,
   "value_loss": 2.31,
+  "steps_per_second": 5.6,
   "checkpoints": ["mini_gpt.step-100.mpk"],
   "error": null
 }
 ```
 
-`status` is one of `running | completed | interrupted | failed`.
+`status` is one of `running | completed | interrupted | failed`. A run stopped
+programmatically lands in `interrupted` too — there is no separate `stopped`.
 `checkpoints` lists basenames only, in the order they were written — this API
 never discloses absolute paths, same boundary `/api/health` enforces.
-`error` is present only when `status` is `failed`. There is no status endpoint
-yet (tracked as S5-T2); read the manifest file directly until it lands.
+`error` is present only when `status` is `failed`. `steps_per_second` is the
+throughput from the last progress event.
 
 Starting the first training run installs the same SIGINT/SIGTERM handler the
 CLI training path uses — a deliberate, one-way exception to "never install
@@ -213,6 +215,47 @@ stops training gracefully (partial checkpoint saved, manifest marked
 force-exits. A completed run's weights replace the served model in place —
 `/api/generate`, `/api/info`, and `/api/health` see the new weights on their
 next request, and the model is never swapped mid-training.
+
+### `GET /api/train/{run_id}/status`
+
+Polling endpoint for a run started by `POST /api/train`. The response is that
+run's manifest verbatim — same field names, same `status` values, same
+basename-only `checkpoints` — plus one derived field:
+
+```json
+{
+  "run_id": "...",
+  "status": "running",
+  "request": { "train_steps": 1000, "...": "..." },
+  "started_at_unix": 1750000000,
+  "ended_at_unix": null,
+  "steps_completed": 340,
+  "total_steps": 1000,
+  "training_loss": 2.14,
+  "value_loss": 2.31,
+  "steps_per_second": 5.6,
+  "checkpoints": ["mini_gpt.step-100.mpk"],
+  "eta_seconds": 118
+}
+```
+
+`eta_seconds` is `round((total_steps - steps_completed) / steps_per_second)`,
+where `steps_per_second` is the throughput the training loop itself reported
+in its last `training_progress` event — not re-measured here, so the API and
+the logs cannot disagree. It is `null` when the run is no longer `running`
+(nothing left to wait for) or before the first progress event has produced a
+rate.
+
+Any run id is readable, not just the active one: the server keeps the most
+recent run in memory and falls back to `checkpoints/runs/run-<uuid>.json` for
+older ones. An id with no live run and no manifest returns `404`
+`{"error":"run_not_found","run_id":"..."}`, as does any id that is not a
+UUID — the id becomes part of a filename, so it is validated before it
+reaches the filesystem.
+
+This route is exempt from the generate rate limiter, like `/api/info` and
+`/api/health`, so a UI polling every second does not spend the generate
+budget.
 
 ### `DELETE /api/train/{run_id}`
 
