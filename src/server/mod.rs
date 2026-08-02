@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{
     Extension, Json, Router,
     extract::{ConnectInfo, State},
@@ -403,6 +403,8 @@ where
             post(training::train::<B>)
                 .layer(RequestBodyLimitLayer::new(TRAIN_REQUEST_BODY_LIMIT_BYTES)),
         )
+        // Stopping is a signal, not a payload: no body, so no body limit.
+        .route("/train/{run_id}", delete(training::stop_train::<B>))
         .route("/info", get(info::<B>))
         // NOTE: S2-T1 (rate limit) must exempt this route — monitoring probes hit it.
         .route("/health", get(health::<B>))
