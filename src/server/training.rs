@@ -1,5 +1,6 @@
-//! `POST /api/train` — kick off a MiniGPT training run in the background — and
-//! `GET /api/train/{run_id}/status`, the polling endpoint that reads it back.
+//! `POST /api/train` — kick off a MiniGPT training run in the background;
+//! `GET /api/train/{run_id}/status` — the polling endpoint that reads it back;
+//! `DELETE /api/train/{run_id}` — stop it at the next step boundary.
 //!
 //! The HTTP layer owns run bookkeeping only: admission control (one run at a
 //! time), the run manifest on disk, and the shared status other handlers read.
@@ -234,19 +235,21 @@ impl RunHandle {
 
     /// Mutate the current record and write the manifest back to disk.
     /// Manifest write failures are reported but never abort a run in flight.
+    ///
+    /// The write stays inside the critical section on purpose: anyone who
+    /// observes a status through [`RunHandle::snapshot`] must find a manifest
+    /// on disk that agrees with it. Writing after the guard drops lets a
+    /// reader see `completed` in memory and then read a truncated file.
     fn update(&self, mutate: impl FnOnce(&mut TrainRunRecord)) {
-        let snapshot = {
-            let mut guard = self.lock();
-            let Some(record) = guard.as_mut() else {
-                return;
-            };
-            mutate(record);
-            record.clone()
+        let mut guard = self.lock();
+        let Some(record) = guard.as_mut() else {
+            return;
         };
-        if let Err(err) = write_manifest(&self.runs_dir, &snapshot) {
+        mutate(record);
+        if let Err(err) = write_manifest(&self.runs_dir, record) {
             eprintln!(
                 "training run {}: failed to update manifest: {err}",
-                snapshot.run_id
+                record.run_id
             );
         }
     }
@@ -391,6 +394,40 @@ where
         eta_seconds: eta_seconds(&record),
         record,
     }))
+}
+
+/// `DELETE /api/train/{run_id}` — stop the active run at its next step
+/// boundary, exactly as a SIGINT would: the loop finishes the step it is on,
+/// saves an `.interrupted-step-<N>` checkpoint, and the run lands on
+/// [`TrainRunStatus::Interrupted`]. There is no separate "stopped" state — a
+/// programmatic stop and a signal are the same thing to the training loop.
+///
+/// Anything that is not the currently running run — unknown ID, an ID that
+/// belongs to an earlier run, or the active run after it already finished —
+/// is a `404`. Stopping is idempotent for free: the run stays `running` until
+/// the background task reaches its next boundary, so a repeat `DELETE` in
+/// that window re-sets an already-set flag and answers `202` again.
+///
+/// SECURITY: unauthenticated, like the rest of `/api/train`. The `run_id`
+/// match is not authorization — it only keeps a stale client from stopping a
+/// run it never started.
+pub(super) async fn stop_train<B>(
+    State(state): State<SharedServerState<B>>,
+    PathParam(run_id): PathParam<String>,
+) -> StatusCode
+where
+    B: Backend,
+{
+    let stoppable = state
+        .training
+        .current()
+        .is_some_and(|record| record.run_id == run_id && record.is_running());
+    if !stoppable {
+        return StatusCode::NOT_FOUND;
+    }
+
+    runtime_signals::request_interrupt();
+    StatusCode::ACCEPTED
 }
 
 fn run_training<B>(

@@ -1,5 +1,5 @@
-//! `POST /api/train` behaviour, driven through the real router with a fake
-//! training runner.
+//! `POST /api/train` and `DELETE /api/train/{run_id}` behaviour, driven
+//! through the real router with a fake training runner.
 //!
 //! These live in their own test binary on purpose: they set the
 //! process-global `runtime_signals` interrupt flag, which would race the
@@ -51,6 +51,15 @@ impl TrainingRunner<TestBackend> for FakeRunner {
         let mut steps_completed = 0;
         for step in 0..request.train_steps {
             if runtime_signals::interrupt_requested() {
+                // The real runner redirects an interrupted save through
+                // `interrupted_checkpoint_path`, so the fake emits the same
+                // event the HTTP layer folds into the run manifest.
+                logger.log(RuntimeEvent::CheckpointSaved {
+                    path: format!(
+                        "/srv/rusty-gpt/checkpoints/mini_gpt.interrupted-step-{steps_completed}.mpk"
+                    ),
+                    elapsed_ms: 1,
+                });
                 return Ok(TrainingRunOutcome {
                     model: MiniGpt::<TestBackend>::new(7, 8, 1, 6, 2, &self.device).into(),
                     steps_completed,
@@ -155,6 +164,18 @@ fn slow_runner(runs_started: Arc<AtomicUsize>) -> FakeRunner {
     }
 }
 
+/// One step every 250ms. Wide enough that a second `DELETE` issued right after
+/// the first still lands before the loop reaches its next step boundary — the
+/// window in which idempotency has to hold.
+fn stalling_runner(runs_started: Arc<AtomicUsize>) -> FakeRunner {
+    FakeRunner {
+        device: NdArrayDevice::Cpu,
+        step_delay: Duration::from_millis(250),
+        trained_vocab_size: 5,
+        runs_started,
+    }
+}
+
 fn train_body(train_steps: usize) -> serde_json::Value {
     serde_json::json!({
         "train_steps": train_steps,
@@ -187,6 +208,25 @@ async fn post_json(
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, body, headers)
+}
+
+async fn delete_run(
+    state: Arc<ServerState<TestBackend>>,
+    limits: ServerLimits,
+    uri: &str,
+) -> StatusCode {
+    router_with_limits::<TestBackend>(limits)
+        .with_state(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
 }
 
 async fn get_json(
@@ -625,6 +665,143 @@ async fn status_of_an_unknown_run_is_not_found() {
 
     assert_eq!(0, starts.load(Ordering::SeqCst));
     assert!(!dir.exists(), "reading status creates nothing");
+}
+
+#[tokio::test]
+async fn stopping_the_active_run_interrupts_it_and_records_the_partial_checkpoint() {
+    let _guard = RUN_LOCK.lock().await;
+    let dir = runs_dir("stop");
+    let limits = ServerLimits::default();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let state = state_with_runner(limits, dir.clone(), slow_runner(Arc::clone(&starts)));
+
+    let (status, body, _) =
+        post_json(Arc::clone(&state), limits, "/train", train_body(1_000)).await;
+    assert_eq!(StatusCode::ACCEPTED, status);
+    let run_id = body["run_id"].as_str().unwrap().to_string();
+    wait_for(&state, "the run to make progress", |record| {
+        record.steps_completed >= 1
+    })
+    .await;
+
+    assert_eq!(
+        StatusCode::ACCEPTED,
+        delete_run(Arc::clone(&state), limits, &format!("/train/{run_id}")).await
+    );
+
+    let record = wait_for(&state, "the run to stop", is_terminal).await;
+    assert_eq!(TrainRunStatus::Interrupted, record.status);
+    assert_eq!(run_id, record.run_id);
+    assert!(
+        record.steps_completed < 1_000,
+        "a stopped run must not reach its step target"
+    );
+
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.join(format!("run-{run_id}.json"))).expect("manifest must exist"),
+    )
+    .unwrap();
+    assert_eq!("interrupted", manifest["status"]);
+    assert!(manifest["ended_at_unix"].as_u64().unwrap() > 0);
+    let checkpoint = manifest["checkpoints"][0]
+        .as_str()
+        .expect("a stopped run records its partial checkpoint");
+    assert!(
+        checkpoint.starts_with("mini_gpt.interrupted-step-") && checkpoint.ends_with(".mpk"),
+        "expected an interrupted-step checkpoint basename, got {checkpoint}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn stop_is_404_for_any_run_id_that_is_not_the_active_run() {
+    let _guard = RUN_LOCK.lock().await;
+    let dir = runs_dir("stop-404");
+    let limits = ServerLimits::default();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let state = state_with_runner(limits, dir.clone(), slow_runner(Arc::clone(&starts)));
+
+    // Nothing has ever run on this server.
+    assert_eq!(
+        StatusCode::NOT_FOUND,
+        delete_run(Arc::clone(&state), limits, "/train/never-started").await
+    );
+
+    let (status, body, _) =
+        post_json(Arc::clone(&state), limits, "/train", train_body(1_000)).await;
+    assert_eq!(StatusCode::ACCEPTED, status);
+    let run_id = body["run_id"].as_str().unwrap().to_string();
+    wait_for(&state, "the run to make progress", |record| {
+        record.steps_completed >= 1
+    })
+    .await;
+
+    // A stale client holding some other run's ID must not be able to stop
+    // this one.
+    assert_eq!(
+        StatusCode::NOT_FOUND,
+        delete_run(Arc::clone(&state), limits, "/train/some-other-run").await
+    );
+    assert!(
+        !runtime_signals::interrupt_requested(),
+        "a rejected stop must not touch the interrupt flag"
+    );
+    assert_eq!(
+        TrainRunStatus::Running,
+        state.training_run().unwrap().status
+    );
+
+    assert_eq!(
+        StatusCode::ACCEPTED,
+        delete_run(Arc::clone(&state), limits, &format!("/train/{run_id}")).await
+    );
+    wait_for(&state, "the run to stop", is_terminal).await;
+
+    // Right ID, but the run is over.
+    assert_eq!(
+        StatusCode::NOT_FOUND,
+        delete_run(Arc::clone(&state), limits, &format!("/train/{run_id}")).await
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn stopping_an_already_stopping_run_is_accepted_again() {
+    let _guard = RUN_LOCK.lock().await;
+    let dir = runs_dir("stop-twice");
+    let limits = ServerLimits::default();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let state = state_with_runner(limits, dir.clone(), stalling_runner(Arc::clone(&starts)));
+
+    let (status, body, _) =
+        post_json(Arc::clone(&state), limits, "/train", train_body(1_000)).await;
+    assert_eq!(StatusCode::ACCEPTED, status);
+    let run_id = body["run_id"].as_str().unwrap().to_string();
+    wait_for(&state, "the run to make progress", |record| {
+        record.steps_completed >= 1
+    })
+    .await;
+    let uri = format!("/train/{run_id}");
+
+    // The run only reaches `interrupted` at its next step boundary, so the
+    // second stop lands while it is still `running` — the client does not have
+    // to track whether its first request was the one that took effect.
+    assert_eq!(
+        StatusCode::ACCEPTED,
+        delete_run(Arc::clone(&state), limits, &uri).await
+    );
+    assert_eq!(
+        StatusCode::ACCEPTED,
+        delete_run(Arc::clone(&state), limits, &uri).await
+    );
+
+    let record = wait_for(&state, "the run to stop", is_terminal).await;
+    assert_eq!(TrainRunStatus::Interrupted, record.status);
+    assert_eq!(1, starts.load(Ordering::SeqCst), "no run may be restarted");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]

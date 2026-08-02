@@ -205,8 +205,7 @@ programmatically lands in `interrupted` too — there is no separate `stopped`.
 `checkpoints` lists basenames only, in the order they were written — this API
 never discloses absolute paths, same boundary `/api/health` enforces.
 `error` is present only when `status` is `failed`. `steps_per_second` is the
-throughput from the last progress event. There is no stop endpoint yet
-(tracked as S5-T3).
+throughput from the last progress event.
 
 Starting the first training run installs the same SIGINT/SIGTERM handler the
 CLI training path uses — a deliberate, one-way exception to "never install
@@ -257,6 +256,38 @@ reaches the filesystem.
 This route is exempt from the generate rate limiter, like `/api/info` and
 `/api/health`, so a UI polling every second does not spend the generate
 budget.
+
+### `DELETE /api/train/{run_id}`
+
+Stops the active training run. Takes no request body.
+
+```bash
+curl -i -sS -X DELETE http://127.0.0.1:8787/api/train/<run_id>
+```
+
+The stop is graceful, not a kill: it sets the same interrupt flag a SIGINT
+does, so the run finishes the step it is on, saves
+`<checkpoint>.interrupted-step-<N>.mpk` plus its metadata sidecar
+(`interrupted: true`), and lands on `status: "interrupted"` in the manifest.
+There is no separate `stopped` status — a programmatic stop and a signal are
+indistinguishable to the training loop by design. That partial checkpoint is
+never pruned by `--checkpoint-keep`, and a stopped run's weights are **not**
+swapped into the served model; resume from the partial checkpoint with
+`resume_from` on the next `POST /api/train`.
+
+- `202 Accepted`, empty body, when the run was accepted for stopping. The
+  response means "the stop was requested", not "the run has stopped" — the run
+  reaches `interrupted` at its next step boundary. Poll the manifest to
+  observe the transition.
+- `404 Not Found` when `run_id` is not the currently running run: unknown ID,
+  an earlier run's ID, or the active run's ID after it already finished,
+  failed, or stopped.
+- Repeating the `DELETE` while the run is still stopping returns `202` again,
+  so a client never has to track whether its first request landed.
+
+SECURITY: unauthenticated, like `POST /api/train`. Matching the `run_id` is
+not authorization — it only stops a stale client from killing a run it never
+started.
 
 ### Checkpoint metadata sidecar
 
