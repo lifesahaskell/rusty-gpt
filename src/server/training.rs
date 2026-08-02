@@ -1,4 +1,5 @@
-//! `POST /api/train` — kick off a MiniGPT training run in the background.
+//! `POST /api/train` — kick off a MiniGPT training run in the background — and
+//! `GET /api/train/{run_id}/status`, the polling endpoint that reads it back.
 //!
 //! The HTTP layer owns run bookkeeping only: admission control (one run at a
 //! time), the run manifest on disk, and the shared status other handlers read.
@@ -22,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Path as PathParam, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use burn::tensor::backend::Backend;
@@ -64,6 +65,19 @@ pub struct TrainAccepted {
     pub run_id: String,
 }
 
+/// Body of `GET /api/train/{run_id}/status`: the run manifest verbatim, plus
+/// the one field that is a function of it rather than stored in it. Flattened
+/// on purpose — the manifest field names are already the contract, and a
+/// second set of wire names for the same data would only drift.
+#[derive(Debug, Serialize)]
+pub struct TrainStatusResponse {
+    #[serde(flatten)]
+    pub record: TrainRunRecord,
+    /// Seconds of work left at the last reported throughput. `null` unless the
+    /// run is still going and has reported at least one progress event.
+    pub eta_seconds: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrainRunStatus {
@@ -92,6 +106,12 @@ pub struct TrainRunRecord {
     pub total_steps: usize,
     pub training_loss: Option<f64>,
     pub value_loss: Option<f64>,
+    /// Throughput as of the last `training_progress` event — the single source
+    /// the status endpoint's `eta_seconds` is derived from, so the API and the
+    /// logs can never disagree about how fast a run is going. `default` so
+    /// manifests written before this field existed still deserialize.
+    #[serde(default)]
+    pub steps_per_second: Option<f64>,
     /// Every checkpoint the run wrote, in the order the `checkpoint_saved`
     /// events arrived: periodic `.step-N.mpk` snapshots first, then the final
     /// (or `.interrupted-step-N.mpk`) save.
@@ -113,6 +133,7 @@ impl TrainRunRecord {
             steps_completed: 0,
             training_loss: None,
             value_loss: None,
+            steps_per_second: None,
             checkpoints: Vec::new(),
             error: None,
         }
@@ -241,6 +262,36 @@ fn write_manifest(runs_dir: &Path, record: &TrainRunRecord) -> std::io::Result<(
     std::fs::write(manifest_path(runs_dir, &record.run_id), body)
 }
 
+/// `Ok(None)` means no such run; a manifest that exists but cannot be read is
+/// a server fault, not a 404 — during an incident "no such run" for a run
+/// whose file is plainly on disk is the wrong thing to tell an operator.
+fn read_manifest(runs_dir: &Path, run_id: &str) -> Result<Option<TrainRunRecord>, TrainError> {
+    let body = match std::fs::read(manifest_path(runs_dir, run_id)) {
+        Ok(body) => body,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(TrainError::Internal(format!(
+                "failed to read run manifest: {err}"
+            )));
+        }
+    };
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|err| TrainError::Internal(format!("run manifest could not be parsed: {err}")))
+}
+
+/// Work left over throughput, both as the training loop last reported them.
+/// `None` once the run is terminal (nothing left to wait for) or before the
+/// first progress event has given us a rate.
+fn eta_seconds(record: &TrainRunRecord) -> Option<u64> {
+    if !record.is_running() {
+        return None;
+    }
+    let steps_per_second = record.steps_per_second.filter(|rate| *rate > 0.0)?;
+    let remaining = record.total_steps.saturating_sub(record.steps_completed);
+    Some((remaining as f64 / steps_per_second).round() as u64)
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -301,6 +352,45 @@ where
     });
 
     Ok((StatusCode::ACCEPTED, Json(TrainAccepted { run_id })))
+}
+
+/// `GET /api/train/{run_id}/status`.
+///
+/// The in-memory slot only ever holds the most recently started run, so an
+/// older run's status comes from the manifest [`train`] already writes on
+/// every progress update — same data, no second source of truth.
+///
+/// Not rate limited: the limiter is invoked from inside `POST /api/generate`
+/// rather than as middleware, so a read-only route is exempt by construction.
+/// A UI polling this every second must not burn the generate budget.
+pub(super) async fn status<B>(
+    State(state): State<SharedServerState<B>>,
+    PathParam(run_id): PathParam<String>,
+) -> Result<Json<TrainStatusResponse>, TrainError>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    // Run ids are UUIDs this server minted, and this one is about to become
+    // part of a filename. Rejecting anything else settles the traversal
+    // question up front instead of relying on the `run-` prefix to blunt it.
+    if uuid::Uuid::parse_str(&run_id).is_err() {
+        return Err(TrainError::RunNotFound { run_id });
+    }
+
+    let handle = &state.training.handle;
+    let live = handle.snapshot().filter(|record| record.run_id == run_id);
+    let record = match live {
+        Some(record) => Some(record),
+        None => read_manifest(&handle.runs_dir, &run_id)?,
+    };
+    let Some(record) = record else {
+        return Err(TrainError::RunNotFound { run_id });
+    };
+
+    Ok(Json(TrainStatusResponse {
+        eta_seconds: eta_seconds(&record),
+        record,
+    }))
 }
 
 fn run_training<B>(
@@ -375,6 +465,7 @@ fn apply_event_line(handle: &RunHandle, line: &str) {
             }
             record.training_loss = event["training_loss"].as_f64();
             record.value_loss = event["value_loss"].as_f64();
+            record.steps_per_second = event["steps_per_second"].as_f64();
         }),
         Some("training_completed") => handle.update(|record| {
             if let Some(total) = event["total_steps"].as_u64() {
@@ -435,6 +526,9 @@ enum TrainErrorBody {
     RunInProgress {
         run_id: String,
     },
+    RunNotFound {
+        run_id: String,
+    },
     TrainingUnavailable {
         message: String,
     },
@@ -457,6 +551,10 @@ pub enum TrainError {
     RunInProgress {
         run_id: String,
     },
+    /// No live run and no manifest for this id.
+    RunNotFound {
+        run_id: String,
+    },
     /// The server was started without a training runner (e.g. `--serve
     /// --model moe-gpt`).
     TrainingUnavailable,
@@ -470,6 +568,7 @@ impl TrainError {
                 StatusCode::BAD_REQUEST
             }
             Self::RunInProgress { .. } => StatusCode::CONFLICT,
+            Self::RunNotFound { .. } => StatusCode::NOT_FOUND,
             Self::TrainingUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -492,6 +591,7 @@ impl TrainError {
                 requested,
             },
             Self::RunInProgress { run_id } => TrainErrorBody::RunInProgress { run_id },
+            Self::RunNotFound { run_id } => TrainErrorBody::RunNotFound { run_id },
             Self::TrainingUnavailable => TrainErrorBody::TrainingUnavailable {
                 message: "training is not enabled on this server".to_string(),
             },
@@ -612,7 +712,7 @@ mod tests {
 
         apply_event_line(
             &handle,
-            r#"{"event":"training_progress","step":4,"total_steps":10,"training_loss":2.5,"value_loss":3.5}"#,
+            r#"{"event":"training_progress","step":4,"total_steps":10,"training_loss":2.5,"value_loss":3.5,"steps_per_second":2.0}"#,
         );
         apply_event_line(
             &handle,
@@ -625,6 +725,7 @@ mod tests {
         assert_eq!(10, record.total_steps);
         assert_eq!(Some(2.5), record.training_loss);
         assert_eq!(Some(3.5), record.value_loss);
+        assert_eq!(Some(2.0), record.steps_per_second);
         assert_eq!(
             vec!["mini_gpt.step-5.mpk"],
             record.checkpoints,
@@ -632,5 +733,89 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&handle.runs_dir);
+    }
+
+    fn running_record(steps_completed: usize, steps_per_second: Option<f64>) -> TrainRunRecord {
+        TrainRunRecord {
+            steps_completed,
+            steps_per_second,
+            ..TrainRunRecord::started("abc".to_string(), request())
+        }
+    }
+
+    #[test]
+    fn eta_is_remaining_steps_over_reported_throughput() {
+        // 10 total, 4 done, 2 steps/s => 3s left.
+        assert_eq!(Some(3), eta_seconds(&running_record(4, Some(2.0))));
+    }
+
+    #[test]
+    fn eta_is_absent_without_usable_throughput() {
+        assert_eq!(None, eta_seconds(&running_record(4, None)));
+        assert_eq!(
+            None,
+            eta_seconds(&running_record(4, Some(0.0))),
+            "a zero rate would divide to infinity"
+        );
+    }
+
+    #[test]
+    fn eta_is_absent_once_the_run_is_terminal() {
+        for status in [
+            TrainRunStatus::Completed,
+            TrainRunStatus::Interrupted,
+            TrainRunStatus::Failed,
+        ] {
+            let record = TrainRunRecord {
+                status,
+                ..running_record(4, Some(2.0))
+            };
+            assert_eq!(None, eta_seconds(&record), "{status:?} has nothing left");
+        }
+    }
+
+    #[test]
+    fn status_response_carries_manifest_field_names_plus_eta() {
+        let response = TrainStatusResponse {
+            eta_seconds: Some(3),
+            record: running_record(4, Some(2.0)),
+        };
+
+        let body = serde_json::to_value(&response).unwrap();
+
+        assert_eq!("abc", body["run_id"]);
+        assert_eq!("running", body["status"]);
+        assert_eq!(4, body["steps_completed"]);
+        assert_eq!(10, body["total_steps"]);
+        assert_eq!(2.0, body["steps_per_second"]);
+        assert_eq!(3, body["eta_seconds"]);
+        assert_eq!(10, body["request"]["train_steps"]);
+    }
+
+    #[test]
+    fn manifests_written_before_steps_per_second_existed_still_load() {
+        let legacy = r#"{
+            "run_id":"abc","status":"completed",
+            "request":{"train_steps":10,"learning_rate":0.0001,"checkpoint_interval":5,"eval_interval":5},
+            "started_at_unix":1,"ended_at_unix":2,"steps_completed":10,"total_steps":10,
+            "training_loss":2.5,"value_loss":3.5,"checkpoints":[]
+        }"#;
+
+        let record: TrainRunRecord = serde_json::from_str(legacy).unwrap();
+
+        assert_eq!(None, record.steps_per_second);
+    }
+
+    #[test]
+    fn missing_manifest_is_not_found_rather_than_an_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "rusty-gpt-run-missing-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+
+        let found = read_manifest(&dir, "does-not-exist").expect("a missing file is not a fault");
+
+        assert!(found.is_none());
     }
 }

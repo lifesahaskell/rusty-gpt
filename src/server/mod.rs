@@ -403,6 +403,9 @@ where
             post(training::train::<B>)
                 .layer(RequestBodyLimitLayer::new(TRAIN_REQUEST_BODY_LIMIT_BYTES)),
         )
+        // Read-only, and polled once a second by the UI — kept off the
+        // generate rate limiter for the same reason /health is.
+        .route("/train/{run_id}/status", get(training::status::<B>))
         .route("/info", get(info::<B>))
         // NOTE: S2-T1 (rate limit) must exempt this route — monitoring probes hit it.
         .route("/health", get(health::<B>))

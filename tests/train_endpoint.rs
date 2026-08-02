@@ -193,7 +193,7 @@ async fn get_json(
     state: Arc<ServerState<TestBackend>>,
     limits: ServerLimits,
     uri: &str,
-) -> serde_json::Value {
+) -> (StatusCode, serde_json::Value) {
     let response = router_with_limits::<TestBackend>(limits)
         .with_state(state)
         .oneshot(
@@ -205,8 +205,47 @@ async fn get_json(
         )
         .await
         .unwrap();
+    let status = response.status();
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    serde_json::from_slice(&bytes).unwrap()
+    // An unmatched route answers 404 with an empty body, which is not JSON.
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+async fn get_status(
+    state: &Arc<ServerState<TestBackend>>,
+    limits: ServerLimits,
+    run_id: &str,
+) -> (StatusCode, serde_json::Value) {
+    get_json(
+        Arc::clone(state),
+        limits,
+        &format!("/train/{run_id}/status"),
+    )
+    .await
+}
+
+/// Poll the status endpoint itself — over HTTP, the way a UI does — until the
+/// run reports `want`.
+async fn poll_status_until(
+    state: &Arc<ServerState<TestBackend>>,
+    limits: ServerLimits,
+    run_id: &str,
+    want: &str,
+) -> serde_json::Value {
+    let mut last = serde_json::Value::Null;
+    for _ in 0..600 {
+        let (status, body) = get_status(state, limits, run_id).await;
+        assert_eq!(StatusCode::OK, status, "status endpoint must stay readable");
+        if body["status"] == want {
+            return body;
+        }
+        last = body;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for status {want}; last body: {last}");
 }
 
 /// Poll the shared run status until `predicate` holds. Fails the test rather
@@ -404,7 +443,7 @@ async fn completed_run_writes_its_manifest_and_swaps_the_served_model() {
     assert!(manifest.get("error").is_none(), "no error key on success");
 
     // The freshly trained model is now the served one.
-    let info = get_json(Arc::clone(&state), limits, "/info").await;
+    let (_, info) = get_json(Arc::clone(&state), limits, "/info").await;
     assert_eq!(5, info["vocab_size"]);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -447,6 +486,145 @@ async fn train_rejects_requests_above_the_configured_caps() {
     assert_eq!(0, starts.load(Ordering::SeqCst), "no run may start");
     assert!(state.training_run().is_none());
     assert!(!dir.exists(), "rejected requests write no manifest");
+}
+
+#[tokio::test]
+async fn status_polls_a_run_through_to_completion() {
+    let _guard = RUN_LOCK.lock().await;
+    let dir = runs_dir("status-completed");
+    let limits = ServerLimits::default();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let state = state_with_runner(limits, dir.clone(), fast_runner(Arc::clone(&starts)));
+
+    let (status, body, _) = post_json(Arc::clone(&state), limits, "/train", train_body(2)).await;
+    assert_eq!(StatusCode::ACCEPTED, status);
+    let run_id = body["run_id"].as_str().unwrap().to_string();
+
+    let final_status = poll_status_until(&state, limits, &run_id, "completed").await;
+
+    assert_eq!(run_id, final_status["run_id"]);
+    assert_eq!(2, final_status["steps_completed"]);
+    assert_eq!(2, final_status["total_steps"]);
+    assert_eq!(3.0, final_status["value_loss"], "final metrics populate");
+    assert_eq!(2.0, final_status["training_loss"]);
+    assert!(final_status["ended_at_unix"].as_u64().unwrap() > 0);
+    assert!(
+        final_status["eta_seconds"].is_null(),
+        "a finished run has nothing left to wait for"
+    );
+    assert_eq!(
+        serde_json::json!(["mini_gpt.mpk"]),
+        final_status["checkpoints"],
+        "basenames only — the status endpoint discloses no paths"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn status_of_a_running_run_reports_eta_from_reported_throughput() {
+    let _guard = RUN_LOCK.lock().await;
+    let dir = runs_dir("status-eta");
+    let limits = ServerLimits::default();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let state = state_with_runner(limits, dir.clone(), slow_runner(Arc::clone(&starts)));
+
+    let (status, body, _) =
+        post_json(Arc::clone(&state), limits, "/train", train_body(1_000)).await;
+    assert_eq!(StatusCode::ACCEPTED, status);
+    let run_id = body["run_id"].as_str().unwrap().to_string();
+
+    wait_for(&state, "the run to report progress", |record| {
+        record.steps_completed >= 1
+    })
+    .await;
+    let (status, running) = get_status(&state, limits, &run_id).await;
+
+    assert_eq!(StatusCode::OK, status);
+    assert_eq!("running", running["status"]);
+    // The fake runner reports 1 step/s, so the ETA is just the steps left.
+    let steps_completed = running["steps_completed"].as_u64().unwrap();
+    assert_eq!(1.0, running["steps_per_second"]);
+    assert_eq!(1_000 - steps_completed, running["eta_seconds"]);
+
+    runtime_signals::request_interrupt();
+    wait_for(&state, "the run to stop", is_terminal).await;
+    let (_, stopped) = get_status(&state, limits, &run_id).await;
+    assert_eq!("interrupted", stopped["status"]);
+    assert!(stopped["eta_seconds"].is_null());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn status_of_an_older_run_is_served_from_its_manifest() {
+    let _guard = RUN_LOCK.lock().await;
+    let dir = runs_dir("status-older");
+    let limits = ServerLimits::default();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let state = state_with_runner(limits, dir.clone(), fast_runner(Arc::clone(&starts)));
+
+    let (_, body, _) = post_json(Arc::clone(&state), limits, "/train", train_body(2)).await;
+    let first_run_id = body["run_id"].as_str().unwrap().to_string();
+    poll_status_until(&state, limits, &first_run_id, "completed").await;
+
+    // The in-memory slot holds one run; starting a second one overwrites it.
+    let (_, body, _) = post_json(Arc::clone(&state), limits, "/train", train_body(3)).await;
+    let second_run_id = body["run_id"].as_str().unwrap().to_string();
+    assert_ne!(first_run_id, second_run_id);
+    poll_status_until(&state, limits, &second_run_id, "completed").await;
+    assert_eq!(
+        second_run_id,
+        state.training_run().unwrap().run_id,
+        "the live slot has moved on to the second run"
+    );
+
+    let (status, older) = get_status(&state, limits, &first_run_id).await;
+
+    assert_eq!(StatusCode::OK, status, "an older run is still readable");
+    assert_eq!(first_run_id, older["run_id"]);
+    assert_eq!("completed", older["status"]);
+    assert_eq!(2, older["steps_completed"], "the first run's own progress");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn status_of_an_unknown_run_is_not_found() {
+    let _guard = RUN_LOCK.lock().await;
+    let dir = runs_dir("status-404");
+    let limits = ServerLimits::default();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let state = state_with_runner(limits, dir.clone(), fast_runner(Arc::clone(&starts)));
+
+    let missing = "6f1b6e6a-0000-4000-8000-000000000000";
+    let (status, body) = get_status(&state, limits, missing).await;
+
+    assert_eq!(StatusCode::NOT_FOUND, status);
+    assert_eq!(
+        serde_json::json!({"error":"run_not_found","run_id":missing}),
+        body
+    );
+
+    // The id becomes part of a filename, and axum percent-decodes path params
+    // — `%2f` really does arrive as a `/`. Anything that is not a run id this
+    // server minted is refused before it reaches the filesystem.
+    for (hostile, decoded) in [
+        ("not-a-uuid", "not-a-uuid"),
+        ("..%2f..%2fetc%2fpasswd", "../../etc/passwd"),
+        ("%2e%2e%2fsecrets", "../secrets"),
+    ] {
+        let (status, body) = get_status(&state, limits, hostile).await;
+        assert_eq!(StatusCode::NOT_FOUND, status, "rejected: {hostile}");
+        assert_eq!(
+            serde_json::json!({"error":"run_not_found","run_id":decoded}),
+            body,
+            "the handler rejected it, not the router: {hostile}"
+        );
+    }
+
+    assert_eq!(0, starts.load(Ordering::SeqCst));
+    assert!(!dir.exists(), "reading status creates nothing");
 }
 
 #[tokio::test]
