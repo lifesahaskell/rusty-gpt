@@ -23,6 +23,8 @@ Every CLI flag and `RUSTY_GPT_*` environment variable accepted by the
 | `--max-output-tokens <n>` | `RUSTY_GPT_MAX_OUTPUT_TOKENS` | `512` | `POST /api/generate` `max_tokens` cap. Must be > 0. |
 | `--rate-limit-rps <n>` | `RUSTY_GPT_RATE_LIMIT_RPS` | `5` | In-process generate request refill rate. `0` disables rate limiting. |
 | `--rate-limit-burst <n>` | `RUSTY_GPT_RATE_LIMIT_BURST` | `10` | In-process generate request burst. Must be > 0 unless rate limiting is disabled. |
+| `--max-train-steps <n>` | `RUSTY_GPT_MAX_TRAIN_STEPS` | `100000` | `POST /api/train` `train_steps` cap. Must be > 0. |
+| `--max-train-learning-rate <n>` | `RUSTY_GPT_MAX_TRAIN_LEARNING_RATE` | `1.0` | `POST /api/train` `learning_rate` cap. Must be a finite number > 0. |
 
 ## Model shape
 
@@ -122,6 +124,96 @@ for i in 1 2 3; do
     -d '{"prompt":"Once","max_tokens":1,"temperature":1.0}'
 done
 ```
+
+### `POST /api/train`
+
+Starts a background MiniGPT training run and returns immediately with a run
+ID. Only enabled when the server is serving MiniGPT (`--model minigpt`);
+serving MoeGPT wires the route but every request answers `503`
+`training_unavailable`, since only MiniGPT has a training path today.
+
+SECURITY: this route has no authentication. Anyone who can reach it can spend
+the box's whole GPU/CPU budget and overwrite the serving checkpoint. Bind to
+localhost (the `--server-addr` default) until auth lands — see the Sprint 05
+parking lot.
+
+Request body:
+
+```json
+{
+  "train_steps": 1000,
+  "learning_rate": 1e-4,
+  "checkpoint_interval": 100,
+  "eval_interval": 100,
+  "resume_from": "mini_gpt.step-5000"
+}
+```
+
+`resume_from` is optional and named to match `--resume-from` /
+`RUSTY_GPT_RESUME_FROM`: a checkpoint path without `.mpk`, confined to
+`checkpoints/` under the same rules as `--checkpoint`. All other fields are
+required and override the server's base hyperparameters for this run only —
+model shape (`--embed-dim`, `--num-heads`, etc.) is fixed at server startup.
+
+On success, returns `202 Accepted` with `{"run_id": "<uuid>"}` in well under
+100ms; training itself runs on a blocking task, not on the response path.
+
+Only one run is active at a time, process-wide:
+
+- A second `POST /api/train` while a run is active returns `409`
+  `{"error":"run_in_progress","run_id":"<active run>"}` with `Retry-After: 30`.
+- `POST /api/generate` returns `503`
+  `{"error":"training_in_progress","retry_after_seconds":30}` with
+  `Retry-After: 30` for the same reason — the model is mid-training and
+  serving a stale snapshot instead was judged not worth the extra resident
+  copy.
+
+Request validation happens before a run is admitted:
+
+- `train_steps` must be `> 0` and `<= --max-train-steps`, else `400`
+  `{"error":"train_steps_out_of_range","max_allowed":N,"requested":M}`.
+- `learning_rate` must be finite, `> 0`, and `<= --max-train-learning-rate`,
+  else `400`
+  `{"error":"learning_rate_out_of_range","max_allowed":N,"requested":M}`.
+
+The request body is capped at 4096 bytes (route-local, independent of
+`--max-prompt-bytes`).
+
+Each run writes `checkpoints/runs/run-<uuid>.json` immediately on admission
+(so a crashed server's runs are auditable) and again on every progress
+update:
+
+```json
+{
+  "run_id": "...",
+  "status": "running",
+  "request": { "train_steps": 1000, "...": "..." },
+  "started_at_unix": 1750000000,
+  "ended_at_unix": null,
+  "steps_completed": 340,
+  "total_steps": 1000,
+  "training_loss": 2.14,
+  "value_loss": 2.31,
+  "checkpoints": ["mini_gpt.step-100.mpk"],
+  "error": null
+}
+```
+
+`status` is one of `running | completed | interrupted | failed`.
+`checkpoints` lists basenames only, in the order they were written — this API
+never discloses absolute paths, same boundary `/api/health` enforces.
+`error` is present only when `status` is `failed`. There is no status or stop
+endpoint yet (tracked as S5-T2 and S5-T3); read the manifest file directly
+until those land.
+
+Starting the first training run installs the same SIGINT/SIGTERM handler the
+CLI training path uses — a deliberate, one-way exception to "never install
+signal handlers on the serve path." From that point on, Ctrl-C during serving
+stops training gracefully (partial checkpoint saved, manifest marked
+`interrupted`) instead of killing the process; a second Ctrl-C within 2s still
+force-exits. A completed run's weights replace the served model in place —
+`/api/generate`, `/api/info`, and `/api/health` see the new weights on their
+next request, and the model is never swapped mid-training.
 
 ### Checkpoint metadata sidecar
 
