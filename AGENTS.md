@@ -15,7 +15,7 @@ This file gives AI coding agents concise, repo-specific guidance for working in 
 - `src/runtime_config.rs` — CLI/env parsing, validation, `--serve`/`--load-*`/backend selection.
 - `src/runtime_orchestration.rs` and `src/runtime_training.rs` — demo / training / server / interactive dispatch.
 - `src/runtime_assets.rs` — corpus, tokenizer, and checkpoint resolution (including `hf://` URIs via `loader::huggingface`).
-- `src/model/mod.rs` (+ `generation.rs`, `training.rs`, `persistence.rs`) — model progression, sampling, training loops, and checkpoint I/O.
+- `src/model/` — `mod.rs` is a re-export facade over `definitions.rs` (the five model variants), `attention.rs`, `block.rs`, `moe.rs`, `generation.rs`, `training.rs`, and `persistence.rs`: model progression, sampling, training loops, and checkpoint I/O.
 - `src/server/mod.rs` — API routes: `POST /generate`, `GET /info`, and `GET /health`, nested under `/api` by `runtime_orchestration`.
 - `src/tokenizer/` — char-level tokenizer and BPE tokenizer trainer/load logic.
 - `src/observability.rs` — `EventLogger`, `RuntimeEvent`, `LogFormat`; structured stdout events.

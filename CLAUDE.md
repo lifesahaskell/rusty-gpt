@@ -76,10 +76,10 @@ Defaults live in `src/runtime_config.rs`; validation rules in `Hyperparameters::
 What the file tree won't tell you:
 
 - `main.rs` is a thin entry point. The real dispatch is split across `runtime_config.rs` (parse + validate) → `runtime_assets.rs` (corpus / tokenizer / checkpoint resolution, including `hf://`) → `runtime_orchestration.rs` (demo / training / interactive / server / benchmark) → `runtime_training.rs`. Start there, not in `main.rs`.
-- All five model variants live in `src/model/mod.rs`; the per-variant `train(...)` impls were lifted out into `model/training.rs`.
+- `src/model/mod.rs` is a facade: nothing but `pub mod` declarations and `pub use` re-exports, so every `crate::model::X` path resolves regardless of which submodule owns `X`. The five model variants live in `model/definitions.rs`; attention and the KV cache in `model/attention.rs`; `Mlp`/`FeedForward`/`Block` in `model/block.rs`; the per-variant `train(...)` impls in `model/training.rs`.
 - `mini-gpt-ui/` is a separate React app with its own toolchain — **out of scope** for this memo; treat it as a black-box consumer of `/api`.
 
-### The model progression in `src/model/mod.rs`
+### The model progression in `src/model/definitions.rs`
 
 The file builds up a GPT one layer of complexity at a time, and the five trainable `ModelChoice` variants are deliberate teaching steps:
 
@@ -139,7 +139,7 @@ The served model comes from one of three places at startup: a fresh template (de
 
 `GenerateResponse` includes per-layer/per-head attention matrices (`AttentionData { layer, head, weights }`) and, for MoeGPT, optional `routing[]` expert assignments for visualization; the React UI in `mini-gpt-ui/` is the primary consumer.
 
-`POST /api/generate` accepts an optional `top_k` alongside `prompt`, `max_tokens`, and `temperature`. API requests require `temperature > 0` (sampling); `top_k == 0` is rejected. Greedy decoding (`GenerationOptions::greedy()`, temperature 0) stays available internally for benchmarks/tests. Generation entry points have `_with_options` variants in `src/model/mod.rs`.
+`POST /api/generate` accepts an optional `top_k` alongside `prompt`, `max_tokens`, and `temperature`. API requests require `temperature > 0` (sampling); `top_k == 0` is rejected. Greedy decoding (`GenerationOptions::greedy()`, temperature 0) stays available internally for benchmarks/tests. Generation entry points have `_with_options` variants in `src/model/definitions.rs`.
 
 `POST /api/generate` validates `prompt` byte length and `max_tokens` before tokenizer/model work, applies a route-local body-size limit of `max_prompt_bytes + 4096`, then consumes one token from the in-process rate limiter. `GET /api/info` and `GET /api/health` stay exempt. The limiter is per-process; scaled replicas multiply the effective limit.
 
