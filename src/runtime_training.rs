@@ -1,4 +1,6 @@
 use anyhow::{Context, Result, bail};
+use burn::backend::Autodiff;
+use burn::module::AutodiffModule;
 use rusty_gpt::loader::data::DataLoader;
 use rusty_gpt::model::persistence::{
     CheckpointMetadata, CheckpointModelShape, CheckpointTokenizer, CheckpointTrainingMetrics,
@@ -11,6 +13,8 @@ use rusty_gpt::model::{
 };
 use rusty_gpt::observability::{EventLogger, RuntimeEvent};
 use rusty_gpt::runtime_signals::{INTERRUPTED_EXIT_CODE, install_training_signal_handler};
+use rusty_gpt::server::{TrainRequest, TrainingRunOutcome, TrainingRunner};
+use rusty_gpt::tokenizer::RuntimeTokenizer;
 use rusty_gpt::utils::{BenchmarkConfig, benchmark_generation};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,7 +24,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::runtime_assets::{
     load_minigpt_checkpoint, load_moegpt_checkpoint, minigpt_tokenizer_path, tokenizer_for_model,
 };
-use crate::runtime_config::{Hyperparameters, ModelChoice};
+use crate::runtime_config::{Hyperparameters, ModelChoice, validate_checkpoint_path};
 
 pub(crate) fn run_training_demo<B>(
     text: &str,
@@ -107,17 +111,19 @@ struct TrainingRun<'a, B: burn::tensor::backend::AutodiffBackend> {
     resume_from: Option<&'a Path>,
 }
 
-fn train_model<B>(run: TrainingRun<'_, B>) -> Result<()>
+/// Translate a run's [`Hyperparameters`] into the training loop's
+/// [`TrainingParams`]. Model-specific extras (`with_grad_clip_norm`,
+/// `with_start_step`) are layered on by the caller.
+fn base_training_params<B>(run: &TrainingRun<'_, B>) -> TrainingParams
 where
     B: burn::tensor::backend::AutodiffBackend,
-    B::FloatElem: Into<f64>,
 {
     let log_context = TrainingLogContext {
         backend: run.backend_label,
         model: run.model_choice.label(),
         logger: run.logger.clone(),
     };
-    let params = TrainingParams::new(
+    TrainingParams::new(
         run.hyperparameters.learning_rate,
         run.hyperparameters.train_steps,
         run.hyperparameters.eval_interval,
@@ -129,7 +135,78 @@ where
         run.hyperparameters.lr_warmup_steps,
     )
     .with_sampling_policy(run.hyperparameters.sampling_policy)
-    .with_periodic_checkpoint_interval(run.hyperparameters.checkpoint_interval);
+    .with_periodic_checkpoint_interval(run.hyperparameters.checkpoint_interval)
+}
+
+/// The MiniGPT training arm: start event, fresh-or-resumed model, the step
+/// loop with periodic saves, completion event. Shared by the CLI
+/// (`--model minigpt`) and by `POST /api/train`, which needs the outcome back
+/// instead of the CLI's save-then-exit behaviour.
+fn train_minigpt<B>(run: &TrainingRun<'_, B>) -> Result<TrainingOutcome<MiniGpt<B>>>
+where
+    B: burn::tensor::backend::AutodiffBackend,
+    B::FloatElem: Into<f64>,
+{
+    run.logger.log(RuntimeEvent::TrainingStarted {
+        backend: run.backend_label.to_string(),
+        model: run.model_choice.label().to_string(),
+        vocab_size: run.vocab_size,
+        batch_size: run.hyperparameters.batch_size,
+        block_size: run.hyperparameters.block_size,
+        total_steps: run.hyperparameters.train_steps,
+    });
+    let started_at = Instant::now();
+    let interval = run.hyperparameters.checkpoint_interval;
+    let keep = run.hyperparameters.checkpoint_keep;
+    let checkpoint_path = run.checkpoint_path;
+    let logger = run.logger.clone();
+    let metadata_template = checkpoint_metadata(
+        run,
+        rusty_gpt::model::TrainingMetrics {
+            final_value_loss: 0.0,
+            final_perplexity: 0.0,
+            final_aux_loss: None,
+        },
+    )?;
+    // Fresh run builds a template; `--resume-from` loads weights via
+    // the strict metadata loader and reports the step count to continue
+    // from. `--train-steps` is the absolute target in both cases.
+    let (initial_model, start_step) = resolve_minigpt_start_model::<B>(run)?;
+    let train_params = base_training_params(run)
+        .with_grad_clip_norm(run.hyperparameters.minigpt_grad_clip_norm)
+        .with_start_step(start_step);
+    let outcome = MiniGpt::<B>::train_prebuilt_with_periodic_save(
+        initial_model,
+        run.data_loader,
+        run.value_loader,
+        run.device,
+        train_params,
+        |model, step| {
+            save_periodic_minigpt_checkpoint(
+                model,
+                checkpoint_path,
+                step,
+                interval,
+                keep,
+                &metadata_template,
+                &logger,
+            )
+            .map_err(|err| err.to_string())
+        },
+    )
+    .map_err(anyhow::Error::msg)
+    .context("failed to train minigpt model")?;
+    log_training_completed(run, started_at, outcome.metrics);
+
+    Ok(outcome)
+}
+
+fn train_model<B>(run: TrainingRun<'_, B>) -> Result<()>
+where
+    B: burn::tensor::backend::AutodiffBackend,
+    B::FloatElem: Into<f64>,
+{
+    let params = base_training_params(&run);
 
     match run.model_choice {
         ModelChoice::Trivial => {
@@ -201,56 +278,7 @@ where
             log_training_completed(&run, started_at, outcome.metrics);
         }
         ModelChoice::MiniGpt => {
-            run.logger.log(RuntimeEvent::TrainingStarted {
-                backend: run.backend_label.to_string(),
-                model: run.model_choice.label().to_string(),
-                vocab_size: run.vocab_size,
-                batch_size: run.hyperparameters.batch_size,
-                block_size: run.hyperparameters.block_size,
-                total_steps: run.hyperparameters.train_steps,
-            });
-            let started_at = Instant::now();
-            let interval = run.hyperparameters.checkpoint_interval;
-            let keep = run.hyperparameters.checkpoint_keep;
-            let checkpoint_path = run.checkpoint_path;
-            let logger = run.logger.clone();
-            let metadata_template = checkpoint_metadata(
-                &run,
-                rusty_gpt::model::TrainingMetrics {
-                    final_value_loss: 0.0,
-                    final_perplexity: 0.0,
-                    final_aux_loss: None,
-                },
-            )?;
-            // Fresh run builds a template; `--resume-from` loads weights via
-            // the strict metadata loader and reports the step count to continue
-            // from. `--train-steps` is the absolute target in both cases.
-            let (initial_model, start_step) = resolve_minigpt_start_model::<B>(&run)?;
-            let train_params = params
-                .with_grad_clip_norm(run.hyperparameters.minigpt_grad_clip_norm)
-                .with_start_step(start_step);
-            let outcome = MiniGpt::<B>::train_prebuilt_with_periodic_save(
-                initial_model,
-                run.data_loader,
-                run.value_loader,
-                run.device,
-                train_params,
-                |model, step| {
-                    save_periodic_minigpt_checkpoint(
-                        model,
-                        checkpoint_path,
-                        step,
-                        interval,
-                        keep,
-                        &metadata_template,
-                        &logger,
-                    )
-                    .map_err(|err| err.to_string())
-                },
-            )
-            .map_err(anyhow::Error::msg)
-            .context("failed to train minigpt model")?;
-            log_training_completed(&run, started_at, outcome.metrics);
+            let outcome = train_minigpt(&run)?;
             let interrupted = outcome.interrupted;
             let steps_completed = outcome.steps_completed;
             if !interrupted && run.benchmark_generation {
@@ -343,6 +371,145 @@ where
     }
 
     Ok(())
+}
+
+/// Backs `POST /api/train`.
+///
+/// Holds everything a run needs that the HTTP layer has no business knowing:
+/// the corpus, the tokenizer, the base config, and the checkpoint path. Each
+/// request overrides the four training knobs on a copy of the base config and
+/// then walks the same code path as `--model minigpt` on the CLI.
+///
+/// The served backend `B` is inference-only, so training happens on
+/// `Autodiff<B>` and the result is projected back with `AutodiffModule::valid`
+/// before it is handed to the server.
+pub(crate) struct ServerTrainingRunner<B: burn::tensor::backend::Backend> {
+    text: String,
+    tokenizer: RuntimeTokenizer,
+    hyperparameters: Hyperparameters,
+    checkpoint_path: PathBuf,
+    device: B::Device,
+    backend_label: &'static str,
+    input_source: String,
+}
+
+impl<B: burn::tensor::backend::Backend> ServerTrainingRunner<B> {
+    pub(crate) fn new(
+        text: String,
+        tokenizer: RuntimeTokenizer,
+        hyperparameters: Hyperparameters,
+        checkpoint_path: PathBuf,
+        device: B::Device,
+        backend_label: &'static str,
+        input_source: String,
+    ) -> Self {
+        Self {
+            text,
+            tokenizer,
+            hyperparameters,
+            checkpoint_path,
+            device,
+            backend_label,
+            input_source,
+        }
+    }
+
+    fn train(&self, request: &TrainRequest, logger: &EventLogger) -> Result<TrainingRunOutcome<B>>
+    where
+        B::FloatElem: Into<f64>,
+    {
+        // Same handler the CLI training path installs: a SIGINT during a
+        // server-initiated run breaks the step loop at the next boundary and
+        // saves an `.interrupted-step-N` checkpoint.
+        //
+        // ponytail: this is the one place the "never install signals on the
+        // serve path" rule bends, and it is one-way — the handler stays
+        // installed for the life of the process, so from the first training
+        // run onward a single Ctrl-C stops training instead of the server.
+        // The existing escape hatch still applies: a second Ctrl-C within 2s
+        // exits with 130. Upgrade path is axum graceful shutdown.
+        install_training_signal_handler()
+            .context("failed to install SIGINT/SIGTERM handler for training")?;
+
+        let mut hyperparameters = self.hyperparameters;
+        hyperparameters.train_steps = request.train_steps;
+        hyperparameters.learning_rate = request.learning_rate;
+        hyperparameters.eval_interval = request.eval_interval;
+        hyperparameters.checkpoint_interval = request.checkpoint_interval;
+        hyperparameters.validate()?;
+
+        // `resume_from` arrives over HTTP, so it gets the same confinement as
+        // the CLI flag: resolved under `checkpoints/`, traversal rejected.
+        let resume_from = match request.resume_from.as_deref() {
+            Some(raw) => Some(validate_checkpoint_path(
+                raw,
+                Path::new(crate::runtime_assets::DEFAULT_CHECKPOINT_DIR),
+            )?),
+            None => None,
+        };
+
+        let encoded = self.tokenizer.encode(&self.text);
+        let (training_tokens, value_tokens, value_block_size) =
+            split_training_and_value_tokens(&encoded, hyperparameters.block_size)?;
+        let data_loader = DataLoader {
+            tokens: training_tokens,
+            block_size: hyperparameters.block_size,
+            batch_size: hyperparameters.batch_size,
+        };
+        let value_loader = DataLoader {
+            tokens: value_tokens,
+            block_size: value_block_size,
+            batch_size: hyperparameters.batch_size,
+        };
+
+        let run = TrainingRun::<Autodiff<B>> {
+            model_choice: ModelChoice::MiniGpt,
+            data_loader: &data_loader,
+            value_loader: &value_loader,
+            device: &self.device,
+            vocab_size: self.tokenizer.vocab_size(),
+            hyperparameters,
+            checkpoint_path: &self.checkpoint_path,
+            backend_label: self.backend_label,
+            logger: logger.clone(),
+            benchmark_generation: false,
+            benchmark_config: BenchmarkConfig::default(),
+            input_source: &self.input_source,
+            resume_from: resume_from.as_deref(),
+        };
+
+        let outcome = train_minigpt(&run)?;
+        let steps_completed = outcome.steps_completed;
+        let interrupted = outcome.interrupted;
+        // Project the autodiff model down to the inference backend before the
+        // save consumes the outcome.
+        let served = outcome.model.valid();
+        save_minigpt_checkpoint(outcome, &self.checkpoint_path, &run)?;
+
+        Ok(TrainingRunOutcome {
+            model: served.into(),
+            steps_completed,
+            interrupted,
+        })
+    }
+}
+
+impl<B> TrainingRunner<B> for ServerTrainingRunner<B>
+where
+    B: burn::tensor::backend::Backend,
+    B::Device: Send + Sync,
+    B::FloatElem: Into<f64>,
+{
+    fn run(
+        &self,
+        request: &TrainRequest,
+        logger: &EventLogger,
+    ) -> Result<TrainingRunOutcome<B>, String> {
+        // anyhow's `{:#}` keeps the whole context chain, which is what ends up
+        // in the run manifest's `error` field.
+        self.train(request, logger)
+            .map_err(|err| format!("{err:#}"))
+    }
 }
 
 fn log_training_completed<B>(

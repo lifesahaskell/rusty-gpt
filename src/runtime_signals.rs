@@ -105,15 +105,23 @@ pub fn install_training_signal_handler() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-#[doc(hidden)]
-pub fn _test_request_interrupt() {
+/// Request a clean stop at the next training step boundary, exactly as a
+/// SIGINT would. Used by the HTTP stop path and by tests; the signal handler
+/// thread sets the same flag directly (it also records the timestamp that
+/// drives the second-interrupt escape hatch, which this function deliberately
+/// does not touch — a programmatic stop must never abort the process).
+pub fn request_interrupt() {
     INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
 }
 
-#[cfg(test)]
-#[doc(hidden)]
-pub fn _test_reset() {
+/// Clear the interrupt flag and the first-interrupt timestamp.
+///
+/// [`INTERRUPT_REQUESTED`] is process-global and the HTTP server is
+/// long-lived, so every server-initiated training run must call this before
+/// entering its step loop. Without it, one interrupted or stopped run leaves
+/// the flag set forever and every later run on the same process dies at its
+/// first step boundary, silently, until the process restarts.
+pub fn reset_interrupt() {
     INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
     FIRST_INTERRUPT_AT_MS_PLUS_ONE.store(0, Ordering::SeqCst);
 }
@@ -123,12 +131,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_helper_sets_and_resets_interrupt_flag() {
-        _test_reset();
+    fn request_and_reset_toggle_the_interrupt_flag() {
+        reset_interrupt();
         assert!(!interrupt_requested());
-        _test_request_interrupt();
+        request_interrupt();
         assert!(interrupt_requested());
-        _test_reset();
+        reset_interrupt();
         assert!(!interrupt_requested());
     }
 }

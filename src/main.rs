@@ -70,6 +70,8 @@ fn main() -> Result<()> {
             max_output_tokens: config.max_output_tokens,
             rate_limit_rps: config.rate_limit_rps,
             rate_limit_burst: config.rate_limit_burst,
+            max_train_steps: config.max_train_steps,
+            max_train_learning_rate: config.max_train_learning_rate,
         };
         return match config.backend {
             BackendChoice::Cpu => run_http_server_with_runtime::<NdArray<f32, i64>>(
@@ -84,6 +86,7 @@ fn main() -> Result<()> {
                     backend_label: "cpu",
                     logger,
                     limits,
+                    input_source: &input_display,
                 },
                 &NdArrayDevice::Cpu,
             ),
@@ -100,6 +103,7 @@ fn main() -> Result<()> {
                     backend_label: "cuda",
                     logger,
                     limits,
+                    input_source: &input_display,
                 },
                 &CudaDevice::default(),
             ),
