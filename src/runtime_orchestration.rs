@@ -24,7 +24,7 @@ use crate::runtime_assets::{
     load_minigpt_tokenizer, load_moegpt_checkpoint, minigpt_tokenizer_path, tokenizer_for_model,
 };
 use crate::runtime_config::{Hyperparameters, ModelChoice};
-use crate::runtime_training::{TrainingDemoOptions, run_training_demo};
+use crate::runtime_training::{ServerTrainingRunner, TrainingDemoOptions, run_training_demo};
 
 pub(crate) struct CpuDemoOptions<'a> {
     pub(crate) model_choice: ModelChoice,
@@ -95,6 +95,9 @@ pub(crate) struct ServerRuntimeOptions<'a> {
     pub(crate) backend_label: &'static str,
     pub(crate) logger: EventLogger,
     pub(crate) limits: ServerLimits,
+    /// Corpus label recorded in checkpoint metadata written by
+    /// `POST /api/train` runs.
+    pub(crate) input_source: &'a str,
 }
 
 pub(crate) fn run_http_server_with_runtime<B>(
@@ -106,6 +109,9 @@ pub(crate) fn run_http_server_with_runtime<B>(
 where
     B: Backend + Send + Sync + 'static,
     B::Device: Send + Sync + 'static,
+    // `POST /api/train` trains on `Autodiff<B>`, whose loss scalars must be
+    // convertible to the f64 the observability events carry.
+    B::FloatElem: Into<f64>,
 {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -116,7 +122,7 @@ where
 }
 
 async fn run_http_server<B>(
-    _text: &str,
+    text: &str,
     hyperparameters: Hyperparameters,
     options: ServerRuntimeOptions<'_>,
     device: &B::Device,
@@ -124,6 +130,7 @@ async fn run_http_server<B>(
 where
     B: Backend + Send + Sync + 'static,
     B::Device: Send + Sync + 'static,
+    B::FloatElem: Into<f64>,
 {
     let started_at = Instant::now();
     let tokenizer = load_minigpt_tokenizer()?;
@@ -185,14 +192,31 @@ where
         checkpoint_sha256,
         tokenizer_sha256,
     };
-    let state = Arc::new(ServerState::new_with_limits(
+    let mut state = ServerState::new_with_limits(
         model,
-        tokenizer,
+        tokenizer.clone(),
         device.clone(),
         options.logger.clone(),
         provenance,
         options.limits,
-    ));
+    );
+    // `POST /api/train` only trains MiniGPT; serving MoeGPT leaves the route
+    // wired but answering 503.
+    if options.model_choice == ModelChoice::MiniGpt {
+        state = state.with_training_runner(
+            Arc::new(ServerTrainingRunner::<B>::new(
+                text.to_string(),
+                tokenizer,
+                hyperparameters,
+                options.checkpoint_path.to_path_buf(),
+                device.clone(),
+                options.backend_label,
+                options.input_source.to_string(),
+            )),
+            PathBuf::from(server::DEFAULT_RUNS_DIR),
+        );
+    }
+    let state = Arc::new(state);
     let vocab_size = state.model_vocab_size();
     let block_size = state.model_block_size();
     let app = Router::new()

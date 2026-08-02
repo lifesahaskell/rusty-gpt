@@ -18,9 +18,16 @@ pub(crate) const DEFAULT_MAX_PROMPT_BYTES: usize = 8192;
 pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: usize = 512;
 pub(crate) const DEFAULT_RATE_LIMIT_RPS: usize = 5;
 pub(crate) const DEFAULT_RATE_LIMIT_BURST: usize = 10;
+/// `POST /api/train` request caps. Deliberately generous — they exist to stop
+/// a typo (`"train_steps": 1000000000`) from pinning the box, not to express
+/// a training policy.
+pub(crate) const DEFAULT_MAX_TRAIN_STEPS: usize = 100_000;
+pub(crate) const DEFAULT_MAX_TRAIN_LEARNING_RATE: f64 = 1.0;
 const LOG_FORMAT_ENV: &str = "RUSTY_GPT_LOG_FORMAT";
 const MAX_PROMPT_BYTES_ENV: &str = "RUSTY_GPT_MAX_PROMPT_BYTES";
 const MAX_OUTPUT_TOKENS_ENV: &str = "RUSTY_GPT_MAX_OUTPUT_TOKENS";
+const MAX_TRAIN_STEPS_ENV: &str = "RUSTY_GPT_MAX_TRAIN_STEPS";
+const MAX_TRAIN_LEARNING_RATE_ENV: &str = "RUSTY_GPT_MAX_TRAIN_LEARNING_RATE";
 const RATE_LIMIT_RPS_ENV: &str = "RUSTY_GPT_RATE_LIMIT_RPS";
 const RATE_LIMIT_BURST_ENV: &str = "RUSTY_GPT_RATE_LIMIT_BURST";
 const BENCHMARK_PROMPT_LENS_ENV: &str = "RUSTY_GPT_BENCHMARK_PROMPT_LENS";
@@ -224,7 +231,10 @@ impl Hyperparameters {
         Ok(hyperparameters)
     }
 
-    fn validate(&mut self) -> Result<()> {
+    /// Enforce the positivity/divisibility rules and recompute `head_dim`.
+    /// `pub(crate)` because `POST /api/train` re-validates a base config after
+    /// overriding it with request values.
+    pub(crate) fn validate(&mut self) -> Result<()> {
         if self.block_size == 0 {
             bail!("block_size must be greater than zero");
         }
@@ -476,6 +486,8 @@ pub(crate) struct RuntimeConfig {
     pub(crate) max_output_tokens: usize,
     pub(crate) rate_limit_rps: usize,
     pub(crate) rate_limit_burst: usize,
+    pub(crate) max_train_steps: usize,
+    pub(crate) max_train_learning_rate: f64,
     pub(crate) log_format: LogFormat,
     pub(crate) benchmark_config: BenchmarkConfig,
 }
@@ -492,6 +504,8 @@ pub(crate) struct RuntimeEnv {
     pub(crate) max_output_tokens: Option<String>,
     pub(crate) rate_limit_rps: Option<String>,
     pub(crate) rate_limit_burst: Option<String>,
+    pub(crate) max_train_steps: Option<String>,
+    pub(crate) max_train_learning_rate: Option<String>,
     pub(crate) log_format: Option<String>,
     pub(crate) benchmark_prompt_lens: Option<String>,
     pub(crate) benchmark_gen_lens: Option<String>,
@@ -532,6 +546,8 @@ impl RuntimeEnv {
             max_output_tokens: env::var(MAX_OUTPUT_TOKENS_ENV).ok(),
             rate_limit_rps: env::var(RATE_LIMIT_RPS_ENV).ok(),
             rate_limit_burst: env::var(RATE_LIMIT_BURST_ENV).ok(),
+            max_train_steps: env::var(MAX_TRAIN_STEPS_ENV).ok(),
+            max_train_learning_rate: env::var(MAX_TRAIN_LEARNING_RATE_ENV).ok(),
             log_format: env::var(LOG_FORMAT_ENV).ok(),
             benchmark_prompt_lens: env::var(BENCHMARK_PROMPT_LENS_ENV).ok(),
             benchmark_gen_lens: env::var(BENCHMARK_GEN_LENS_ENV).ok(),
@@ -643,6 +659,12 @@ struct Cli {
     /// Generate burst capacity [env: RUSTY_GPT_RATE_LIMIT_BURST] [default: 10]
     #[arg(long)]
     rate_limit_burst: Option<usize>,
+    /// POST /api/train train_steps cap [env: RUSTY_GPT_MAX_TRAIN_STEPS] [default: 100000]
+    #[arg(long)]
+    max_train_steps: Option<usize>,
+    /// POST /api/train learning_rate cap [env: RUSTY_GPT_MAX_TRAIN_LEARNING_RATE] [default: 1.0]
+    #[arg(long)]
+    max_train_learning_rate: Option<f64>,
 
     /// Comma-separated prompt lengths [env: RUSTY_GPT_BENCHMARK_PROMPT_LENS]
     #[arg(long)]
@@ -776,6 +798,8 @@ where
     let arg_max_output_tokens = cli.max_output_tokens;
     let arg_rate_limit_rps = cli.rate_limit_rps;
     let arg_rate_limit_burst = cli.rate_limit_burst;
+    let arg_max_train_steps = cli.max_train_steps;
+    let arg_max_train_learning_rate = cli.max_train_learning_rate;
     let arg_benchmark_prompt_lens = cli.benchmark_prompt_lens.as_deref();
     let arg_benchmark_gen_lens = cli.benchmark_gen_lens.as_deref();
     let arg_benchmark_warmups = cli.benchmark_warmups.as_deref();
@@ -854,12 +878,26 @@ where
         DEFAULT_RATE_LIMIT_BURST,
         RATE_LIMIT_BURST_ENV,
     )?;
-    validate_server_limits(
+    let max_train_steps = parse_config_usize(
+        arg_max_train_steps,
+        env.max_train_steps.as_deref(),
+        DEFAULT_MAX_TRAIN_STEPS,
+        MAX_TRAIN_STEPS_ENV,
+    )?;
+    let max_train_learning_rate = parse_config_f64(
+        arg_max_train_learning_rate,
+        env.max_train_learning_rate.as_deref(),
+        DEFAULT_MAX_TRAIN_LEARNING_RATE,
+        MAX_TRAIN_LEARNING_RATE_ENV,
+    )?;
+    validate_server_limits(ServerLimitValues {
         max_prompt_bytes,
         max_output_tokens,
         rate_limit_rps,
         rate_limit_burst,
-    )?;
+        max_train_steps,
+        max_train_learning_rate,
+    })?;
     let backend = parse_backend_name(arg_backend.or(env.backend.as_deref()).unwrap_or("cpu"))?;
     let log_format = match arg_log_format.or(env.log_format.as_deref()) {
         Some(value) => LogFormat::parse(value)?,
@@ -940,6 +978,8 @@ where
         max_output_tokens,
         rate_limit_rps,
         rate_limit_burst,
+        max_train_steps,
+        max_train_learning_rate,
         log_format,
         benchmark_config,
     })
@@ -962,20 +1002,47 @@ fn parse_config_usize(
     Ok(default)
 }
 
-fn validate_server_limits(
+fn parse_config_f64(
+    arg_value: Option<f64>,
+    env_value: Option<&str>,
+    default: f64,
+    env_name: &str,
+) -> Result<f64> {
+    if let Some(value) = arg_value {
+        return Ok(value);
+    }
+    if let Some(value) = env_value {
+        return value
+            .parse()
+            .with_context(|| format!("invalid {env_name} value: {value}"));
+    }
+    Ok(default)
+}
+
+struct ServerLimitValues {
     max_prompt_bytes: usize,
     max_output_tokens: usize,
     rate_limit_rps: usize,
     rate_limit_burst: usize,
-) -> Result<()> {
-    if max_prompt_bytes == 0 {
+    max_train_steps: usize,
+    max_train_learning_rate: f64,
+}
+
+fn validate_server_limits(limits: ServerLimitValues) -> Result<()> {
+    if limits.max_prompt_bytes == 0 {
         bail!("max_prompt_bytes must be greater than zero");
     }
-    if max_output_tokens == 0 {
+    if limits.max_output_tokens == 0 {
         bail!("max_output_tokens must be greater than zero");
     }
-    if rate_limit_rps != 0 && rate_limit_burst == 0 {
+    if limits.rate_limit_rps != 0 && limits.rate_limit_burst == 0 {
         bail!("rate_limit_burst must be greater than zero when rate_limit_rps is non-zero");
+    }
+    if limits.max_train_steps == 0 {
+        bail!("max_train_steps must be greater than zero");
+    }
+    if !limits.max_train_learning_rate.is_finite() || limits.max_train_learning_rate <= 0.0 {
+        bail!("max_train_learning_rate must be a finite number greater than zero");
     }
     Ok(())
 }

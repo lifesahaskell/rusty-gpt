@@ -19,6 +19,14 @@ use crate::model::{GenerationOptions, MiniGpt, MoeForwardAux, MoeGpt};
 use crate::observability::{EventLogger, RuntimeEvent};
 use crate::tokenizer::RuntimeTokenizer;
 
+pub mod training;
+
+pub use training::{
+    DEFAULT_RUNS_DIR, TrainRequest, TrainRunRecord, TrainRunStatus, TrainingRunOutcome,
+    TrainingRunner,
+};
+use training::{TRAIN_REQUEST_BODY_LIMIT_BYTES, TRAINING_RETRY_AFTER_SECONDS, TrainingState};
+
 pub type SharedServerState<B> = Arc<ServerState<B>>;
 
 pub enum ServedModel<B: Backend> {
@@ -126,21 +134,34 @@ impl<B: Backend> ServedModel<B> {
 }
 
 pub struct ServerState<B: Backend> {
-    model: ServedModel<B>,
+    /// The served weights. Behind a lock because a completed `POST /api/train`
+    /// run swaps a freshly trained model in underneath live traffic.
+    ///
+    /// ponytail: one global lock held for the length of a single generation.
+    /// Generation is single-model and already serialized by the GPU/CPU it
+    /// runs on, so contention here costs nothing today. If concurrent
+    /// generation ever matters, swap this for an `ArcSwap`-style pointer so
+    /// readers never block on the swap.
+    model: Mutex<ServedModel<B>>,
     tokenizer: RuntimeTokenizer,
     device: B::Device,
     logger: EventLogger,
     provenance: ServerProvenance,
     limits: ServerLimits,
     rate_limiter: Mutex<RateLimiter>,
+    training: TrainingState<B>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ServerLimits {
     pub max_prompt_bytes: usize,
     pub max_output_tokens: usize,
     pub rate_limit_rps: usize,
     pub rate_limit_burst: usize,
+    /// `POST /api/train` `train_steps` cap.
+    pub max_train_steps: usize,
+    /// `POST /api/train` `learning_rate` cap.
+    pub max_train_learning_rate: f64,
 }
 
 impl Default for ServerLimits {
@@ -150,6 +171,8 @@ impl Default for ServerLimits {
             max_output_tokens: 512,
             rate_limit_rps: 5,
             rate_limit_burst: 10,
+            max_train_steps: 100_000,
+            max_train_learning_rate: 1.0,
         }
     }
 }
@@ -294,22 +317,63 @@ impl<B: Backend> ServerState<B> {
         M: Into<ServedModel<B>>,
     {
         Self {
-            model: model.into(),
+            model: Mutex::new(model.into()),
             tokenizer,
             device,
             logger,
             provenance,
             limits,
             rate_limiter: Mutex::new(RateLimiter::new()),
+            training: TrainingState::default(),
         }
     }
 
+    /// Enable `POST /api/train` with the runner that performs the actual
+    /// training, and the directory its run manifests are written to. Without
+    /// this the route answers `503`.
+    pub fn with_training_runner(
+        mut self,
+        runner: Arc<dyn TrainingRunner<B>>,
+        runs_dir: std::path::PathBuf,
+    ) -> Self {
+        self.training = TrainingState::with_runner(runner, runs_dir);
+        self
+    }
+
+    /// Read access to the served model.
+    ///
+    /// Lock poisoning is recovered rather than propagated: the model is only
+    /// ever *replaced* (a single assignment), never mutated in place, so a
+    /// panic elsewhere cannot leave it half-written — and `/api/health` must
+    /// keep answering after an unrelated handler panics.
+    fn model(&self) -> std::sync::MutexGuard<'_, ServedModel<B>> {
+        self.model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Swap in newly trained weights. Called once, at the end of a successful
+    /// training run — never while the training loop is running.
+    pub fn replace_model(&self, model: ServedModel<B>) {
+        *self.model() = model;
+    }
+
+    /// The most recent training run's record, running or finished. `None`
+    /// until the first `POST /api/train` of this process.
+    pub fn training_run(&self) -> Option<TrainRunRecord> {
+        self.training.current()
+    }
+
+    pub fn training_in_progress(&self) -> bool {
+        self.training.is_running()
+    }
+
     pub fn model_vocab_size(&self) -> usize {
-        self.model.vocab_size()
+        self.model().vocab_size()
     }
 
     pub fn model_block_size(&self) -> usize {
-        self.model.block_size()
+        self.model().block_size()
     }
 
     pub fn tokenizer_vocab_size(&self) -> usize {
@@ -317,7 +381,7 @@ impl<B: Backend> ServerState<B> {
     }
 
     pub fn model_tokenizer_vocab_match(&self) -> bool {
-        self.model.vocab_size() == self.tokenizer.vocab_size()
+        self.model().vocab_size() == self.tokenizer.vocab_size()
     }
 }
 
@@ -330,6 +394,14 @@ where
         .route(
             "/generate",
             post(generate::<B>).layer(RequestBodyLimitLayer::new(limits.max_request_body_bytes())),
+        )
+        // SECURITY: no authentication on this route. It starts a job that
+        // consumes the whole box and overwrites `checkpoints/mini_gpt`, so
+        // this server is safe on localhost only until auth lands.
+        .route(
+            "/train",
+            post(training::train::<B>)
+                .layer(RequestBodyLimitLayer::new(TRAIN_REQUEST_BODY_LIMIT_BYTES)),
         )
         .route("/info", get(info::<B>))
         // NOTE: S2-T1 (rate limit) must exempt this route — monitoring probes hit it.
@@ -396,6 +468,18 @@ where
         prompt_chars: request.prompt.chars().count(),
     });
 
+    // A training run owns the model for its duration. Rejecting outright is
+    // deliberate: snapshotting a pre-training copy would double the resident
+    // model just to keep a degraded endpoint alive.
+    if state.training_in_progress() {
+        return Err(logged_error(
+            &state.logger,
+            GenerateError::TrainingInProgress {
+                retry_after_seconds: TRAINING_RETRY_AFTER_SECONDS,
+            },
+            started_at,
+        ));
+    }
     if request.prompt.is_empty() {
         return Err(logged_bad_request(
             &state.logger,
@@ -470,7 +554,7 @@ where
     }
 
     let generated_tokens = state
-        .model
+        .model()
         .generate_with_cache_options(
             &prompt_tokens,
             request.max_tokens,
@@ -478,7 +562,7 @@ where
             generation_options,
         )
         .map_err(|err| logged_bad_request(&state.logger, err, started_at))?;
-    let attention_tokens = context_window(&generated_tokens, state.model.block_size());
+    let attention_tokens = context_window(&generated_tokens, state.model().block_size());
     let (attention, routing) = attention_for_tokens(&state, attention_tokens)?;
     let generated = state.tokenizer.decode(&generated_tokens);
     let tokens = generated_tokens
@@ -514,6 +598,9 @@ enum GenerateErrorBody {
     RateLimited {
         retry_after_seconds: u64,
     },
+    TrainingInProgress {
+        retry_after_seconds: u64,
+    },
     BadRequest {
         message: String,
     },
@@ -536,6 +623,10 @@ enum GenerateError {
     RateLimited {
         retry_after_seconds: u64,
     },
+    /// A training run holds the model; try again once it finishes.
+    TrainingInProgress {
+        retry_after_seconds: u64,
+    },
     Internal(String),
 }
 
@@ -546,6 +637,7 @@ impl GenerateError {
             | Self::PromptTooLarge { .. }
             | Self::MaxTokensOutOfRange { .. } => StatusCode::BAD_REQUEST,
             Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+            Self::TrainingInProgress { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -566,6 +658,9 @@ impl GenerateError {
             Self::RateLimited {
                 retry_after_seconds,
             } => format!("rate_limited retry_after_seconds={retry_after_seconds}"),
+            Self::TrainingInProgress {
+                retry_after_seconds,
+            } => format!("training_in_progress retry_after_seconds={retry_after_seconds}"),
             Self::Internal(message) => message.clone(),
         }
     }
@@ -594,6 +689,11 @@ impl GenerateError {
             } => GenerateErrorBody::RateLimited {
                 retry_after_seconds: *retry_after_seconds,
             },
+            Self::TrainingInProgress {
+                retry_after_seconds,
+            } => GenerateErrorBody::TrainingInProgress {
+                retry_after_seconds: *retry_after_seconds,
+            },
             Self::Internal(message) => GenerateErrorBody::Internal {
                 message: message.clone(),
             },
@@ -606,6 +706,9 @@ impl IntoResponse for GenerateError {
         let status = self.status();
         let retry_after = match self {
             Self::RateLimited {
+                retry_after_seconds,
+            }
+            | Self::TrainingInProgress {
                 retry_after_seconds,
             } => Some(retry_after_seconds),
             _ => None,
@@ -646,16 +749,17 @@ async fn info<B>(State(state): State<SharedServerState<B>>) -> Json<InfoResponse
 where
     B: Backend,
 {
+    let model = state.model();
     Json(InfoResponse {
-        model_kind: state.model.kind(),
-        vocab_size: state.model.vocab_size(),
-        num_layers: state.model.num_layers(),
-        num_heads: state.model.num_heads(),
-        block_size: state.model.block_size(),
-        num_experts: state.model.num_experts(),
-        moe_top_k: state.model.moe_top_k(),
+        model_kind: model.kind(),
+        vocab_size: model.vocab_size(),
+        num_layers: model.num_layers(),
+        num_heads: model.num_heads(),
+        block_size: model.block_size(),
+        num_experts: model.num_experts(),
+        moe_top_k: model.moe_top_k(),
         tokenizer_vocab_size: state.tokenizer.vocab_size(),
-        model_tokenizer_vocab_match: state.model_tokenizer_vocab_match(),
+        model_tokenizer_vocab_match: model.vocab_size() == state.tokenizer.vocab_size(),
     })
 }
 
@@ -699,18 +803,19 @@ where
     B: Backend,
 {
     let provenance = &state.provenance;
+    let model = state.model();
     Json(HealthResponse {
         status: "ok",
         uptime_seconds: provenance.started_at.elapsed().as_secs(),
         model: HealthModel {
-            kind: state.model.kind(),
-            embed_dim: state.model.d_model(),
-            num_heads: state.model.num_heads(),
-            num_layers: state.model.num_layers(),
-            block_size: state.model.block_size(),
-            vocab_size: state.model.vocab_size(),
-            num_experts: state.model.num_experts(),
-            moe_top_k: state.model.moe_top_k(),
+            kind: model.kind(),
+            embed_dim: model.d_model(),
+            num_heads: model.num_heads(),
+            num_layers: model.num_layers(),
+            block_size: model.block_size(),
+            vocab_size: model.vocab_size(),
+            num_experts: model.num_experts(),
+            moe_top_k: model.moe_top_k(),
         },
         checkpoint: HealthCheckpoint {
             loaded: provenance.checkpoint_source != CheckpointSource::None,
@@ -737,7 +842,7 @@ fn attention_for_tokens<B: Backend>(
     let input: Vec<i64> = tokens.iter().map(|&token| token as i64).collect();
     let token_tensor: Tensor<B, 2, Int> =
         Tensor::from_data(TensorData::new(input, [1, tokens.len()]), &state.device);
-    let (attentions, routing) = match &state.model {
+    let (attentions, routing) = match &*state.model() {
         ServedModel::MiniGpt(model) => {
             let (_logits, attentions) = model.forward_tokens_with_attention(token_tensor);
             (attentions, None)
@@ -1257,10 +1362,10 @@ mod tests {
             ServerProvenance::fresh(),
         );
 
-        assert_eq!(7, state.model.vocab_size());
-        assert_eq!(2, state.model.num_layers());
-        assert_eq!(2, state.model.num_heads());
-        assert_eq!(6, state.model.block_size());
+        assert_eq!(7, state.model().vocab_size());
+        assert_eq!(2, state.model().num_layers());
+        assert_eq!(2, state.model().num_heads());
+        assert_eq!(6, state.model().block_size());
         assert_eq!(7, state.tokenizer_vocab_size());
         assert!(state.model_tokenizer_vocab_match());
     }
